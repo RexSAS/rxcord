@@ -42,12 +42,20 @@ impl Inflater {
         let start = self.z.total_in();
         loop {
             let consumed = (self.z.total_in() - start) as usize;
+            let before = out.len();
             self.z.decompress_vec(&input[consumed..], &mut out, FlushDecompress::Sync)?;
-            // Spare output room means zlib has flushed everything it had.
-            if out.len() < out.capacity() {
+            let done = (self.z.total_in() - start) as usize == input.len();
+            // Finished only when all input is consumed and zlib had output room to spare (it can stop
+            // early with room left while input remains: stopping then truncates this message and
+            // corrupts every later one on the shared stream).
+            if done && out.len() < out.capacity() {
                 break;
             }
-            out.reserve(out.capacity());
+            let progressed = out.len() > before || (self.z.total_in() - start) as usize > consumed;
+            if !progressed && out.len() < out.capacity() {
+                break; // no progress with room to spare: nothing more will come
+            }
+            out.reserve(out.capacity().max(64 * 1024));
         }
         Ok(String::from_utf8(out)?)
     }
@@ -82,5 +90,20 @@ mod tests {
         let mut i = Inflater::new();
         assert!(i.push(a).is_none());
         assert_eq!(i.push(b).unwrap().unwrap().len(), 10_000);
+    }
+
+    /// A big READY-like message (≈1 MB of varied JSON, compresses far better than 4:1), then a small one
+    /// on the same stream: both must come out whole.
+    #[test]
+    fn large_message_then_next() {
+        let mut c = Compress::new(Compression::default(), true);
+        let mut i = Inflater::new();
+        let big: String = (0..12_000)
+            .map(|n| format!(r#"{{"id":"{}","name":"member {}","roles":["{}","{}"],"flags":0}},"#, 100_000 + n, n % 97, n * 7, n * 13))
+            .collect();
+        let big = format!("[{}]", big.trim_end_matches(','));
+        assert_eq!(i.push(&compress(&mut c, &big)).unwrap().unwrap(), big);
+        let small = r#"{"op":11}"#;
+        assert_eq!(i.push(&compress(&mut c, small)).unwrap().unwrap(), small);
     }
 }
