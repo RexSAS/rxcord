@@ -31,6 +31,9 @@ export component AppWindow inherits Window {
     in property <string> channel-title;
     callback select-guild(string);
     callback select-channel(string);
+    // shown instead of messages when the first load failed
+    in property <string> messages-error;
+    callback retry();
     callback load-older();
     callback bottom-visible(bool);
     callback thumb-visible(string);
@@ -88,6 +91,8 @@ export component AppWindow inherits Window {
                 }
                 msgs := MessageList {
                     messages: root.messages;
+                    error: root.messages-error;
+                    retry => { root.retry(); }
                     load-older => { root.load-older(); }
                     bottom-visible(b) => { root.bottom-visible(b); }
                     thumb-visible(u) => { root.thumb-visible(u); }

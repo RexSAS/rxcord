@@ -1,5 +1,6 @@
 //! How data reaches the UI: view rows -> Slint structs/models, pushed via `invoke_from_event_loop`.
 use crate::markdown::{Block, Span};
+use crate::nav::Nav;
 use crate::view::{self, ChannelRow, GuildRow, MessageRow};
 use crate::{AppWindow, BlockItem, ChannelItem, GuildItem, MessageItem};
 use rxcord_api::id::Id;
@@ -33,6 +34,7 @@ pub fn clear(ui: &Weak<AppWindow>) {
         ui.set_selected_channel("".into());
         ui.set_guild_title("".into());
         ui.set_channel_title("".into());
+        ui.set_messages_error("".into());
     });
 }
 
@@ -61,14 +63,25 @@ pub fn push_selection(ui: &Weak<AppWindow>, s: &Store, guild: Option<Id>, select
     set_selection(ui, guild, ch.map(|c| c.id.to_string()).unwrap_or_default(), guild_title, title);
 }
 
-/// Sends the selected channel's rows as a minimal splice against `shown` (what the UI holds).
-pub fn push_messages(ui: &Weak<AppWindow>, s: &Store, selected: Option<Id>, shown: &mut Vec<MessageRow>) {
-    let rows = selected.map(|c| view::message_rows(s, c)).unwrap_or_default();
-    let (start, old_end, new_end) = splice(shown, &rows);
-    if (start, start) != (old_end, new_end) {
-        set_messages(ui, start, old_end - start, rows[start..new_end].to_vec());
+/// Sends the selected channel's rows: a full replace for another channel or a first fill, else row edits.
+pub fn push_messages(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
+    let rows = nav.selected.map(|c| view::message_rows(s, c)).unwrap_or_default();
+    let reset = nav.shown_channel != nav.selected || nav.shown.is_empty();
+    let edits: Vec<_> = if reset {
+        vec![(0, 0, rows.clone())]
+    } else {
+        diff(&nav.shown, &rows).into_iter().map(|(at, remove, r)| (at, remove, rows[r].to_vec())).collect()
+    };
+    if reset || !edits.is_empty() {
+        set_messages(ui, reset, edits);
     }
-    *shown = rows;
+    nav.shown = rows;
+    nav.shown_channel = nav.selected;
+}
+
+/// One-line notice in the message pane (empty hides it).
+pub fn set_error(ui: &Weak<AppWindow>, msg: String) {
+    with_ui(ui, move |ui| ui.set_messages_error(msg.into()));
 }
 
 /// `dms` = (any DM unread, total DM mentions) for the "Direct Messages" entry on top.
@@ -111,24 +124,25 @@ fn set_selection(ui: &Weak<AppWindow>, guild: String, channel: String, guild_tit
     });
 }
 
-/// Replaces `remove` rows at `start` with `rows`, touching only those rows of the message model.
-fn set_messages(ui: &Weak<AppWindow>, start: usize, remove: usize, rows: Vec<MessageRow>) {
+/// `reset`: replace everything and scroll to the newest row. Otherwise apply the `(start, remove, rows)`
+/// edits in order, touching only those rows.
+fn set_messages(ui: &Weak<AppWindow>, reset: bool, edits: Vec<(usize, usize, Vec<MessageRow>)>) {
     with_ui(ui, move |ui| {
         let m = ui.get_messages();
         let Some(vm) = m.as_any().downcast_ref::<VecModel<MessageItem>>() else { return };
-        let items = rows.into_iter().map(message_item);
-        if start == 0 && remove == vm.row_count() {
-            // other channel (or first fill): start at the newest message
-            vm.set_vec(items.collect::<Vec<_>>());
+        if reset {
+            vm.set_vec(edits.into_iter().flat_map(|e| e.2).map(message_item).collect::<Vec<_>>());
             ui.invoke_scroll_to_bottom();
             return;
         }
-        for _ in 0..remove {
-            vm.remove(start);
-        }
-        let n = items.enumerate().map(|(i, it)| vm.insert(start + i, it)).count();
-        if start == 0 && remove == 0 {
-            ui.invoke_messages_prepended(n as i32);
+        for (start, remove, rows) in edits {
+            for _ in 0..remove {
+                vm.remove(start);
+            }
+            let n = rows.into_iter().map(message_item).enumerate().map(|(i, it)| vm.insert(start + i, it)).count();
+            if start == 0 && remove == 0 {
+                ui.invoke_messages_prepended(n as i32);
+            }
         }
     });
 }
@@ -158,10 +172,26 @@ fn styled(spans: &[Span]) -> StyledText {
 }
 
 /// Smallest replaced range: `old[start..old_end]` becomes `new[start..new_end]`.
-pub fn splice(old: &[MessageRow], new: &[MessageRow]) -> (usize, usize, usize) {
+fn splice(old: &[MessageRow], new: &[MessageRow]) -> (usize, usize, usize) {
     let p = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let s = old[p..].iter().rev().zip(new[p..].iter().rev()).take_while(|(a, b)| a == b).count();
     (p, old.len() - s, new.len() - s)
+}
+
+/// Edits turning `old` into `new`, applied in order: `(start, remove, new[range])`.
+/// Rows evicted from the head (store cap) and the rest are separate edits, so the tail stays a small splice.
+fn diff(old: &[MessageRow], new: &[MessageRow]) -> Vec<(usize, usize, std::ops::Range<usize>)> {
+    let same = |a: &MessageRow, b: &MessageRow| a.id == b.id && a.nonce == b.nonce;
+    let head = new.first().and_then(|f| old.iter().position(|o| same(o, f))).unwrap_or(0);
+    let (p, old_end, new_end) = splice(&old[head..], new);
+    let mut edits = vec![];
+    if head > 0 {
+        edits.push((0, head, 0..0));
+    }
+    if (p, p) != (old_end, new_end) {
+        edits.push((p, old_end - p, p..new_end));
+    }
+    edits
 }
 
 /// Spans as CommonMark for `StyledText::from_markdown`; every literal punctuation char is escaped.
@@ -179,16 +209,27 @@ fn to_markdown(spans: &[Span]) -> String {
             out.push(c);
         }
     }
+    // One span per line: a styled span must not straddle a line break (a blank line ends a CommonMark
+    // paragraph, and code spans would turn newlines into spaces).
+    let lines = spans.iter().flat_map(|sp| {
+        sp.text.split('\n').enumerate().flat_map(move |(i, l)| {
+            let nl = (i > 0).then(|| Span { text: "\n".into(), ..Default::default() });
+            nl.into_iter().chain([Span { text: l.into(), ..sp.clone() }])
+        })
+    });
     let mut out = String::new();
-    for sp in spans {
-        let body = sp.text.trim();
-        if body.is_empty() || !(sp.bold || sp.italic || sp.strike || sp.code || sp.link.is_some()) {
+    for sp in lines {
+        if sp.text.trim().is_empty() || !(sp.bold || sp.italic || sp.strike || sp.code || sp.link.is_some()) {
             esc(&mut out, &sp.text);
             continue;
         }
         // Delimiters must touch non-space text (CommonMark flanking rules), so keep whitespace outside.
+        // Code keeps its spaces: the padded fence below preserves them.
+        let body = if sp.code { sp.text.as_str() } else { sp.text.trim() };
+        let lead = if sp.code { "" } else { &sp.text[..sp.text.len() - sp.text.trim_start().len()] };
+        let trail = if sp.code { "" } else { &sp.text[sp.text.trim_end().len()..] };
         let open = [(sp.strike, "~~"), (sp.bold, "**"), (sp.italic, "*")];
-        esc(&mut out, &sp.text[..sp.text.len() - sp.text.trim_start().len()]);
+        esc(&mut out, lead);
         open.iter().filter(|d| d.0).for_each(|d| out.push_str(d.1));
         if sp.link.is_some() {
             out.push('[');
@@ -215,7 +256,7 @@ fn to_markdown(spans: &[Span]) -> String {
             out.push_str(">)");
         }
         open.iter().rev().filter(|d| d.0).for_each(|d| out.push_str(d.1));
-        esc(&mut out, &sp.text[sp.text.trim_end().len()..]);
+        esc(&mut out, trail);
     }
     out
 }
@@ -311,6 +352,19 @@ mod tests {
         assert_eq!(splice(&[], &old), (0, 0, 3));
     }
 
+    #[test]
+    fn diff_edits() {
+        let old: Vec<_> = (1..6).map(|i| row(i, "x")).collect();
+        let capped: Vec<_> = (2..7).map(|i| row(i, "x")).collect(); // head evicted at the cap, one appended
+        assert_eq!(diff(&old, &capped), vec![(0, 1, 0..0), (4, 0, 4..5)]);
+        let mut edited = old.clone();
+        edited[0] = row(1, "y");
+        assert_eq!(diff(&old, &edited), vec![(0, 1, 0..1)]);
+        let prepended: Vec<_> = (0..6).map(|i| row(i, "x")).collect();
+        assert_eq!(diff(&old, &prepended), vec![(0, 0, 0..1)]);
+        assert_eq!(diff(&old, &old), vec![]);
+    }
+
     fn md(s: &str) -> String {
         match &crate::markdown::parse(s)[..] {
             [crate::markdown::Block::Para(spans)] => to_markdown(spans),
@@ -329,6 +383,11 @@ mod tests {
         let tick = Span { text: "a`b".into(), code: true, ..Default::default() };
         assert_eq!(to_markdown(&[tick]), "`` a`b ``");
         assert_eq!(md("l1\nl2"), "l1\nl2");
+        let code = |t: &str| to_markdown(&[Span { text: t.into(), code: true, ..Default::default() }]);
+        assert_eq!(code(" a  b "), "`  a  b  `"); // inner spaces kept (one pad space stripped per side)
+        assert_eq!(code("a\nb"), "` a `\n` b `");
+        let evil = code("x\n\n[Official](https://evil) **y**");
+        assert_eq!(evil, "` x `\n\n` [Official](https://evil) **y** `");
         assert_eq!(md("  x\n\ty"), "\u{a0}\u{a0}x\n\u{a0}y");
         assert_eq!(md("see https://e.com/a_b"), r"see [https\:\/\/e\.com\/a\_b](<https://e.com/a_b>)");
     }
@@ -339,5 +398,9 @@ mod tests {
             let m = md(s);
             assert!(slint::StyledText::from_markdown(&m).is_ok(), "{s:?} -> {m:?}");
         }
+        let evil = Span { text: "x\n\n[Official](https://evil) **y**".into(), code: true, ..Default::default() };
+        let m = to_markdown(&[evil]);
+        let st = slint::StyledText::from_markdown(&m).unwrap();
+        assert!(!format!("{st:?}").contains("Link"), "{st:?}");
     }
 }

@@ -1,8 +1,8 @@
 //! Plain `Send` view structs built from the store on the runtime thread.
-use crate::markdown::{Block, parse};
+use crate::markdown::{Block, Mention, parse};
 use chrono::{DateTime, FixedOffset, Local};
 use rxcord_api::id::Id;
-use rxcord_api::model::{Channel, Message};
+use rxcord_api::model::{Channel, Message, User};
 use rxcord_store::Store;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +98,28 @@ pub fn dm_rows(s: &Store) -> Vec<ChannelRow> {
     s.dms().into_iter().map(|c| channel_row(s, c)).collect()
 }
 
+/// Mention spans show names: `@user` (from the message's `mentions`, then the store), `#channel`, `@role`.
+fn resolve_mentions(s: &Store, known: &[User], mut blocks: Vec<Block>) -> Vec<Block> {
+    for b in &mut blocks {
+        let Block::Para(spans) = b else { continue };
+        for sp in spans {
+            sp.text = match sp.mention {
+                Some(Mention::User(id)) => known
+                    .iter()
+                    .chain(s.user(id))
+                    .find(|u| u.id == id)
+                    .map_or("@unknown-user".into(), |u| format!("@{}", u.display_name())),
+                Some(Mention::Channel(id)) => {
+                    s.channel(id).and_then(|c| c.name.as_deref()).map_or("#unknown-channel".into(), |n| format!("#{n}"))
+                }
+                Some(Mention::Role(_)) => "@role".into(), // shortcut: roles aren't stored yet; show names once they are
+                Some(Mention::Everyone) | None => continue,
+            };
+        }
+    }
+    blocks
+}
+
 fn preview(m: &Message) -> String {
     let text: String = m.content.chars().take(100).collect();
     format!("{}: {text}", m.author.display_name())
@@ -118,7 +140,7 @@ pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
                 nonce: None,
                 author: m.author.display_name().to_string(),
                 time: format_time(&m.timestamp, offset),
-                blocks: parse(&m.content),
+                blocks: resolve_mentions(s, &m.mentions, parse(&m.content)),
                 thumbs: img.into_iter().map(|a| a.proxy_url.clone()).collect(),
                 files: other.into_iter().map(|a| (a.filename.clone(), a.url.clone())).collect(),
                 reply_preview: m.referenced_message.as_deref().map(preview),
@@ -134,7 +156,7 @@ pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
         nonce: Some(p.nonce.clone()),
         author: me.map(|u| u.display_name().to_string()).unwrap_or_default(),
         time: String::new(),
-        blocks: parse(&p.content),
+        blocks: resolve_mentions(s, &[], parse(&p.content)),
         thumbs: vec![],
         files: vec![],
         reply_preview: p.reply_to.and_then(|r| msgs.iter().find(|m| m.id == r)).map(preview),
@@ -183,6 +205,20 @@ mod tests {
         let p = &rows[1];
         assert_eq!((p.id, p.nonce.as_deref(), p.pending, p.mine), (None, Some("n1"), true, true));
         assert_eq!(p.author, "me");
+    }
+
+    #[test]
+    fn mentions_resolved() {
+        let mut s = store();
+        let ch = Id(100);
+        s.open_channel(ch);
+        let m = json!({"id": "500", "channel_id": "100", "author": {"id": "2", "username": "bob"},
+            "content": "<@1> <@3> <@!9> <#100> <#7> <@&4> @here", "timestamp": "2026-11-07T12:00:00+00:00",
+            "mentions": [{"id": "3", "username": "carl", "global_name": "Carl"}]});
+        s.apply(&Event::MessageCreate(Box::new(serde_json::from_value(m).unwrap())));
+        let Block::Para(spans) = &message_rows(&s, ch)[0].blocks[0] else { panic!() };
+        let text: String = spans.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(text, "@me @Carl @unknown-user #general #unknown-channel @role @here");
     }
 
     #[test]

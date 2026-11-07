@@ -3,6 +3,8 @@ import { MessageRow, MessageItem } from "message_row.slint";
 
 export component MessageList inherits Rectangle {
     in property <[MessageItem]> messages;
+    in property <string> error;
+    callback retry();
     callback load-older();
     // true while the newest message is on screen
     callback bottom-visible(bool);
@@ -37,6 +39,19 @@ export component MessageList inherits Rectangle {
         scrolled => {
             root.stick = self.content-y <= self.visible-height - self.content-height + 8px;
             if self.content-y > -200px { root.load-older(); }
+        }
+    }
+
+    if root.error != "": TouchArea {
+        clicked => { root.retry(); }
+        accessible-role: button;
+        accessible-label: root.error;
+        accessible-action-default => { root.retry(); }
+        Text {
+            text: root.error;
+            opacity: 0.7;
+            wrap: word-wrap;
+            horizontal-alignment: center;
         }
     }
 }

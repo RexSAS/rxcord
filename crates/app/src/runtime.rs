@@ -1,5 +1,5 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
-use crate::nav::{Ack, HISTORY_PAGE, Nav, ack_decision, history_exhausted, should_load_older};
+use crate::nav::{Ack, HISTORY_PAGE, Nav};
 use crate::{AppWindow, bridge, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
@@ -10,6 +10,7 @@ use rxcord_api::remote_auth::{QrStatus, qr_login};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
@@ -24,6 +25,8 @@ pub enum Command {
     SelectGuild(Option<Id>),
     OpenChannel(Id),
     BottomVisible(bool),
+    /// The window gained or lost focus (state is in the shared `focused` flag).
+    FocusChanged,
     LoadOlder(Id),
     Send { channel: Id, content: String, reply_to: Option<Id> },
     Retry(String /*nonce*/),
@@ -35,7 +38,7 @@ pub enum Command {
 /// Results of tasks spawned on the runtime, handled back on the loop.
 enum Done {
     Nothing,
-    History(Id, Option<Id> /*before*/, Result<Vec<Message>, ApiError>),
+    History { channel: Id, generation: u64, before: Option<Id>, result: Result<Vec<Message>, ApiError> },
     Acked(Id, Id, Result<(), ApiError>),
     AckDue(Id),
     Sent(String, Result<Box<Message>, ApiError>),
@@ -50,13 +53,14 @@ enum Input {
     Done(Done),
 }
 
-pub fn spawn_runtime(ui: slint::Weak<AppWindow>) -> UnboundedSender<Command> {
+/// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
+pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>) -> UnboundedSender<Command> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("rxcord-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
-            rt.block_on(Runtime::new(ui).run(rx));
+            rt.block_on(Runtime::new(ui, focused).run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -71,6 +75,7 @@ struct Runtime {
     /// Session tasks; replacing the set aborts them all (logout, new login).
     tasks: JoinSet<Done>,
     nav: Nav,
+    focused: Arc<AtomicBool>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -81,17 +86,21 @@ async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
 }
 
 impl Runtime {
-    fn new(ui: slint::Weak<AppWindow>) -> Self {
-        Self { ui, store: Store::new(), rest: None, gw: None, qr: None, tasks: JoinSet::new(), nav: Nav::default() }
+    fn new(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>) -> Self {
+        let (store, tasks, nav) = (Store::new(), JoinSet::new(), Nav::default());
+        Self { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused }
     }
 
     async fn run(mut self, mut cmds: UnboundedReceiver<Command>) {
         if cfg!(debug_assertions) && std::env::var_os("RXCORD_DEMO").is_some() {
-            let (ready, msgs) = crate::demo::events();
-            self.event(ready);
-            self.command(Command::SelectGuild(Some(Id(crate::demo::GUILD)))).await;
-            self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
-            msgs.into_iter().for_each(|m| self.event(m));
+            #[cfg(debug_assertions)]
+            {
+                let (ready, msgs) = crate::demo::events();
+                self.event(ready);
+                self.command(Command::SelectGuild(Some(Id(crate::demo::GUILD)))).await;
+                self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
+                msgs.into_iter().for_each(|m| self.event(m));
+            }
         } else {
             match tokio::task::spawn_blocking(token::load).await.ok().flatten() {
                 Some(t) => self.start_session(t),
@@ -186,7 +195,12 @@ impl Runtime {
                 bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
             }
             Command::OpenChannel(id) => {
+                bridge::set_error(&self.ui, String::new());
                 if self.nav.selected == Some(id) {
+                    // re-click: retry a failed first load
+                    if self.store.messages(id).is_empty() {
+                        self.fetch(id, None);
+                    }
                     return;
                 }
                 if let Some(prev) = self.nav.selected.replace(id) {
@@ -197,18 +211,21 @@ impl Runtime {
                     self.fetch(id, None);
                 }
                 bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
-                bridge::push_messages(&self.ui, &self.store, self.nav.selected, &mut self.nav.shown);
+                bridge::push_messages(&self.ui, &self.store, &mut self.nav);
                 self.maybe_ack(id);
             }
             Command::LoadOlder(id) => {
-                let front = self.store.messages(id).front().map(|m| m.id);
-                let end = self.nav.history_end.get(&id).copied();
-                if should_load_older(front, end, self.nav.in_flight.contains(&id)) {
-                    self.fetch(id, front);
+                if let Some(before) = self.nav.older_before(&self.store, id) {
+                    self.fetch(id, Some(before));
                 }
             }
             Command::BottomVisible(b) => {
                 self.nav.at_bottom = b;
+                if let Some(c) = self.nav.selected {
+                    self.maybe_ack(c);
+                }
+            }
+            Command::FocusChanged => {
                 if let Some(c) = self.nav.selected {
                     self.maybe_ack(c);
                 }
@@ -247,56 +264,34 @@ impl Runtime {
         if let Some(rest) = self.rest.clone()
             && self.nav.in_flight.insert(channel)
         {
+            let generation = self.nav.generation;
             self.tasks.spawn(async move {
-                Done::History(channel, before, rest.messages(channel, before, HISTORY_PAGE).await)
+                let result = rest.messages(channel, before, HISTORY_PAGE).await;
+                Done::History { channel, generation, before, result }
             });
         }
     }
 
     fn maybe_ack(&mut self, ch: Id) {
-        if self.nav.selected != Some(ch) || self.store.messages(ch).is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        match ack_decision(self.store.is_unread(ch), self.nav.at_bottom, self.nav.acked.get(&ch).copied(), now) {
+        match self.nav.plan_ack(&self.store, ch, self.focused.load(Ordering::Relaxed), Instant::now()) {
             Ack::No => {}
             Ack::Now => {
                 // The channel's last id, not our newest row: that one may have been deleted.
-                let Some(last) = self.store.channel(ch).and_then(|c| c.last_message_id) else { return };
-                let Some(rest) = self.rest.clone() else { return };
-                self.nav.acked.insert(ch, now);
-                self.tasks.spawn(async move { Done::Acked(ch, last, rest.ack(ch, last).await) });
-            }
-            Ack::At(t) => {
-                if self.nav.ack_later.insert(ch) {
-                    self.tasks.spawn(async move {
-                        tokio::time::sleep_until(t).await;
-                        Done::AckDue(ch)
-                    });
+                let last = self.store.channel(ch).and_then(|c| c.last_message_id);
+                if let (Some(rest), Some(last)) = (self.rest.clone(), last) {
+                    self.tasks.spawn(async move { Done::Acked(ch, last, rest.ack(ch, last).await) });
                 }
             }
+            Ack::At(t) => drop(self.tasks.spawn(async move {
+                tokio::time::sleep_until(t).await;
+                Done::AckDue(ch)
+            })),
         }
     }
 
     /// Pushes only the UI models a batch of store changes affects.
     fn changed(&mut self, changes: Vec<Change>) {
-        let (mut guilds, mut chans, mut msgs) = (false, false, false);
-        let sel = self.nav.selected;
-        for c in changes {
-            match c {
-                Change::Me => {}
-                Change::GuildList => guilds = true,
-                Change::Channels { guild } => {
-                    chans |= self.nav.guild.is_some() && (guild.is_none() || guild == self.nav.guild)
-                }
-                Change::DmList => chans |= self.nav.guild.is_none(),
-                Change::Messages(c) => msgs |= Some(c) == sel,
-                Change::Unread(c) => {
-                    guilds = true;
-                    chans |= self.store.channel(c).is_some_and(|c| c.guild_id == self.nav.guild);
-                }
-            }
-        }
+        let (guilds, chans, msgs) = self.nav.affected(&self.store, &changes);
         if guilds {
             bridge::push_guilds(&self.ui, &self.store);
         }
@@ -304,9 +299,9 @@ impl Runtime {
             bridge::push_channels(&self.ui, &self.store, self.nav.guild);
         }
         if msgs {
-            bridge::push_messages(&self.ui, &self.store, self.nav.selected, &mut self.nav.shown);
+            bridge::push_messages(&self.ui, &self.store, &mut self.nav);
         }
-        if let Some(c) = sel {
+        if let Some(c) = self.nav.selected {
             self.maybe_ack(c);
         }
     }
@@ -329,15 +324,14 @@ impl Runtime {
             tracing::info!(guilds = self.store.guilds().len(), "READY");
             self.with_ui(|ui| ui.set_logged_in(true));
             // READY drops stored messages; refetch the open channel. Older pages still in flight are stale.
-            self.nav.in_flight.clear();
-            self.nav.history_end.clear();
+            self.nav.reset_history();
             if let Some(id) = self.nav.selected
                 && self.store.open_channel(id)
             {
                 self.fetch(id, None);
             }
             bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
-            bridge::push_messages(&self.ui, &self.store, self.nav.selected, &mut self.nav.shown);
+            bridge::push_messages(&self.ui, &self.store, &mut self.nav);
         }
         self.changed(changes);
     }
@@ -356,23 +350,21 @@ impl Runtime {
     async fn done(&mut self, d: Done) {
         let err = match d {
             Done::Nothing => return,
-            Done::History(ch, before, Ok(msgs)) => {
-                self.nav.in_flight.remove(&ch);
-                let front = self.store.messages(ch).front().map(|m| m.id);
-                if before.is_some() && before != front {
-                    return; // stale page: the store was reset (READY) since the request
-                }
-                let got = msgs.len();
-                let changes = self.store.prepend_history(ch, msgs);
-                if history_exhausted(got)
-                    && let Some(f) = self.store.messages(ch).front()
-                {
-                    self.nav.history_end.insert(ch, f.id);
-                }
-                return self.changed(changes);
+            Done::History { channel, generation, before, result: Ok(msgs) } => {
+                let changes = self.nav.history_page(&mut self.store, channel, generation, before, msgs);
+                return self.changed(changes.unwrap_or_default());
             }
-            Done::History(ch, _, Err(e)) => {
-                self.nav.in_flight.remove(&ch);
+            Done::History { channel, generation, result: Err(e), .. } => {
+                if self.nav.finish_request(channel, generation)
+                    && self.nav.selected == Some(channel)
+                    && self.store.messages(channel).is_empty()
+                {
+                    let msg = match e {
+                        ApiError::Http { status: 403, .. } => "You don't have access to this channel",
+                        _ => "Couldn't load messages — click to retry",
+                    };
+                    bridge::set_error(&self.ui, msg.into());
+                }
                 e
             }
             Done::Acked(channel_id, message_id, Ok(())) => {
