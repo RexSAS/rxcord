@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -34,8 +34,10 @@ pub struct Playback {
     resampler: Option<Resampler>,
     channels: usize,
     ring: rtrb::Producer<f32>,
-    /// Device samples kept queued ahead of the callback.
-    target: usize,
+    /// Device samples kept queued ahead of the callback, at least (40 ms).
+    min_target: usize,
+    /// Samples the device asked for in its last callback.
+    period: Arc<AtomicUsize>,
     resampled: Vec<f32>,
     failed: Arc<AtomicBool>,
     _stream: cpal::Stream,
@@ -63,13 +65,16 @@ impl Playback {
             None => device.default_output_config()?.config(),
         };
         let channels = config.channels as usize;
-        let (ring, mut consumer) = rtrb::RingBuffer::new(config.sample_rate as usize * channels / 5); // 200 ms
+        let (ring, mut consumer) = rtrb::RingBuffer::new(config.sample_rate as usize * channels * 2 / 5); // 400 ms
         let failed = Arc::new(AtomicBool::new(false));
         let flag = failed.clone();
+        let period = Arc::new(AtomicUsize::new(0));
+        let last = period.clone();
         let stream = device.build_output_stream(
             config,
             // real-time: no locks, no allocation; underrun plays silence
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                last.store(data.len(), Ordering::Relaxed);
                 for s in data {
                     *s = consumer.pop().unwrap_or(0.0);
                 }
@@ -84,7 +89,8 @@ impl Playback {
             resampler: (config.sample_rate != RATE).then(|| Resampler::new(config.sample_rate)),
             channels,
             ring,
-            target: config.sample_rate as usize * channels / 25, // 40 ms
+            min_target: config.sample_rate as usize * channels / 25, // 40 ms
+            period,
             resampled: Vec::new(),
             failed,
             _stream: stream,
@@ -118,7 +124,9 @@ impl Playback {
     pub fn tick(&mut self) {
         let now = Instant::now();
         let mut chunk = [0.0; CHUNK];
-        while self.ring.buffer().capacity() - self.ring.slots() < self.target {
+        let capacity = self.ring.buffer().capacity();
+        let target = fill_target(self.min_target, self.period.load(Ordering::Relaxed), capacity);
+        while capacity - self.ring.slots() < target {
             self.engine.render(now, &mut chunk);
             let stereo: &[f32] = match &mut self.resampler {
                 Some(r) => {
@@ -140,6 +148,12 @@ impl Playback {
             }
         }
     }
+}
+
+/// Queue depth to keep: two device periods (a device with large periods drains a 40 ms queue at once),
+/// at least `min`, at most half the ring so a top-up always fits.
+fn fill_target(min: usize, period: usize, capacity: usize) -> usize {
+    min.max(2 * period).min(capacity / 2)
 }
 
 /// Linear resampler from 48 kHz stereo interleaved to another rate.
@@ -254,7 +268,7 @@ impl Engine {
     }
 
     pub(crate) fn set_gain(&mut self, user_id: u64, gain: f32) {
-        self.gains.insert(user_id, gain.clamp(0.0, 2.0));
+        self.gains.insert(user_id, if gain.is_nan() { 1.0 } else { gain.clamp(0.0, 2.0) });
     }
 
     pub(crate) fn set_deafened(&mut self, deafened: bool) {
@@ -370,5 +384,36 @@ mod tests {
         assert_eq!(e.levels(t0 + Duration::from_millis(300)), vec![(7, false)]);
         e.render(t0 + Duration::from_secs(6), &mut chunk);
         assert!(e.levels(t0 + Duration::from_secs(6)).is_empty(), "unseen 5 s: dropped");
+    }
+
+    #[test]
+    fn nan_gain_is_unity() {
+        let mut e = Engine::default();
+        e.set_gain(7, f32::NAN);
+        assert_eq!(e.gains[&7], 1.0);
+    }
+
+    #[test]
+    fn undecodable_frames_play_silence() {
+        let mut e = Engine::default();
+        let now = Instant::now();
+        for seq in 0..6 {
+            e.push(7, seq, vec![0xff; 3], now);
+        }
+        let mut chunk = [1.0; CHUNK];
+        for _ in 0..8 {
+            e.render(now, &mut chunk);
+            assert_eq!(rms(&chunk), 0.0);
+        }
+        assert_eq!(e.levels(now), vec![(7, false)]);
+    }
+
+    #[test]
+    fn fill_target_covers_two_device_periods() {
+        let (min, cap) = (3840, 38400); // 40 ms and 400 ms of 48 kHz stereo
+        assert_eq!(fill_target(min, 0, cap), min, "before the first callback");
+        assert_eq!(fill_target(min, 512, cap), min, "small period: 40 ms floor");
+        assert_eq!(fill_target(min, 4800, cap), 9600, "50 ms period: 100 ms queued");
+        assert_eq!(fill_target(min, 30000, cap), cap / 2, "never more than the ring can hold");
     }
 }
