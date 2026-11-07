@@ -195,16 +195,18 @@ fn retry_pending_only_failed() {
 }
 
 #[test]
-fn guild_and_channel_delete_clean_up() {
+fn guild_and_channel_delete_clean_up_but_keep_pending() {
     let mut s = ready_store();
     let g = s.guilds()[0].id;
     s.open_channel(GCH);
     create(&mut s, msg(1, GCH, Id(7)));
     s.add_pending(pend("a", GCH));
-    s.apply(&Event::GuildDelete { id: g });
+    s.apply(&Event::GuildDelete { id: g, unavailable: false });
     assert!(s.channels_of(g).is_empty());
-    assert!(s.messages(GCH).is_empty() && s.pending(GCH).is_empty());
+    assert!(s.messages(GCH).is_empty());
     assert_eq!(s.mention_count(GCH), 0);
+    // unsent text is never dropped silently: it stays until the session ends (then it becomes a draft)
+    assert_eq!(s.all_pending(), [pend("a", GCH)]);
 
     let mut s = ready_store();
     let ch = s.channel(GCH).unwrap().clone();
@@ -213,7 +215,20 @@ fn guild_and_channel_delete_clean_up() {
     s.add_pending(pend("a", GCH));
     s.apply(&Event::ChannelDelete(ch));
     assert!(s.channel(GCH).is_none());
-    assert!(s.messages(GCH).is_empty() && s.pending(GCH).is_empty());
+    assert!(s.messages(GCH).is_empty());
+    assert_eq!(s.all_pending(), [pend("a", GCH)]);
+}
+
+#[test]
+fn unavailable_guild_delete_ignored() {
+    let mut s = ready_store();
+    let g = s.guilds()[0].id;
+    s.open_channel(GCH);
+    create(&mut s, msg(1, GCH, Id(7)));
+    assert_eq!(s.apply(&Event::GuildDelete { id: g, unavailable: true }), vec![]);
+    assert_eq!(s.guilds().len(), 1);
+    assert_eq!(s.channels_of(g).len(), 2);
+    assert_eq!(s.messages(GCH).len(), 1);
 }
 
 #[test]

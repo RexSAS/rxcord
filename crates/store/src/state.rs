@@ -149,7 +149,9 @@ impl Store {
                 }
                 vec![Change::GuildList, Change::Channels { guild: None }]
             }
-            Event::GuildDelete { id } => {
+            // An outage, not a leave: keep everything; GUILD_CREATE follows when it is back.
+            Event::GuildDelete { unavailable: true, .. } => vec![],
+            Event::GuildDelete { id, .. } => {
                 self.guilds.retain(|g| g.id != *id);
                 let gone: Vec<Id> = self.channels.values().filter(|c| c.guild_id == Some(*id)).map(|c| c.id).collect();
                 for c in gone {
@@ -202,11 +204,11 @@ impl Store {
         }
     }
 
+    /// Pending messages of `id` are kept: the app turns them into drafts when the session ends.
     fn drop_channel(&mut self, id: Id) {
         self.channels.remove(&id);
         self.read.remove(&id);
         self.msgs.remove(&id);
-        self.pending.retain(|p| p.channel != id);
     }
 
     fn chg(&self, c: &Channel) -> Change {
