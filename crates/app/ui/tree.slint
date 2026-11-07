@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { CheckBox, ListView, Palette, Slider } from "std-widgets.slint";
 import { Badge, Dot } from "widgets.slint";
 
@@ -37,7 +38,7 @@ export component Tree inherits Rectangle {
     callback set-volume(string, float);
     callback set-muted-for-me(string, bool);
 
-    background: Palette.alternate-background;
+    background: Theme.panel;
     ListView {
         for it in root.items: Rectangle {
             property <bool> header: it.kind == 4 && !it.node;
@@ -46,8 +47,15 @@ export component Tree inherits Rectangle {
             // collapsed nodes summarise what's inside
             property <bool> show-totals: it.node && !it.expanded;
             height: 22px;
-            background: it.id == root.active && !it.node ? Palette.selection-background
-                : ta.has-hover && clickable ? Palette.background : transparent;
+            background: it.id == root.active && !it.node ? Theme.accent-soft
+                : ta.has-hover && clickable ? Theme.hover : transparent;
+            // neon bar on the open channel
+            Rectangle {
+                x: 0;
+                width: 3px;
+                visible: it.id == root.active && !it.node;
+                background: Theme.accent;
+            }
             accessible-role: list-item;
             accessible-label: it.name;
             accessible-enabled: clickable;
@@ -70,8 +78,8 @@ export component Tree inherits Rectangle {
                     text: "●";
                     vertical-alignment: center;
                     font-size: 9px;
-                    color: it.speaking ? #3ba55c : Palette.foreground;
-                    opacity: it.speaking ? 1.0 : 0.25;
+                    color: it.speaking ? Theme.glow : Theme.dim;
+                    opacity: it.speaking ? 1.0 : 0.5;
                 }
                 if it.member: Text {
                     horizontal-stretch: 1;
@@ -87,14 +95,15 @@ export component Tree inherits Rectangle {
                     text: it.node || header || it.kind == 1 || it.kind == 3 ? it.name : (voice ? "♪ " : "# ") + it.name;
                     vertical-alignment: center;
                     overflow: elide;
-                    font-size: header ? 11px : 13px;
+                    font-size: header || it.node ? 11px : 13px;
+                    letter-spacing: header || it.node ? 1px : 0px;
                     font-weight: it.node || header || (it.unread && it.enabled && (!it.node || show-totals)) ? 700 : 400;
-                    color: it.id == root.active && !it.node ? Palette.selection-foreground : Palette.foreground;
+                    color: it.node ? Theme.accent : header ? Theme.dim : Theme.text;
                     opacity: !it.enabled ? 0.4 : it.node || header || it.unread || it.id == root.active ? 1.0 : 0.7;
                 }
                 if show-totals && it.unread && it.mentions == 0: Dot {
                     y: (parent.height - self.height) / 2;
-                    background: Palette.foreground;
+                    background: Theme.text;
                 }
                 Badge {
                     y: (parent.height - self.height) / 2;
@@ -123,9 +132,9 @@ export component Tree inherits Rectangle {
                 width: 190px;
                 close-policy: PopupClosePolicy.close-on-click-outside;
                 Rectangle {
-                    background: Palette.background;
+                    background: Theme.bg;
                     border-width: 1px;
-                    border-color: Palette.border;
+                    border-color: Theme.line;
                     VerticalLayout {
                         padding: 6px;
                         spacing: 2px;

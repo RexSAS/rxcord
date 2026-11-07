@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { Button, Palette } from "std-widgets.slint";
 import { LoginScreen } from "login.slint";
 import { Tree, TreeItem } from "tree.slint";
@@ -10,12 +11,13 @@ import { VoiceSettings } from "voice_settings.slint";
 export { TreeItem, TabItem, MessageItem, ThumbItem, FileItem }
 
 export component AppWindow inherits Window {
+    init => { Palette.color-scheme = ColorScheme.dark; }
     title: "rxcord";
     preferred-width: 360px;
     preferred-height: 640px;
     min-width: 280px;
     min-height: 400px;
-    background: Palette.background;
+    background: Theme.bg;
 
     in property <bool> logged-in;
     in property <image> qr;
@@ -132,8 +134,8 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Section borders: visible in both color schemes (Palette.border blends into the backgrounds).
-    property <color> line: Palette.color-scheme == ColorScheme.dark ? #ffffff30 : #00000030;
+    // Section borders: visible in both color schemes (Theme.line blends into the backgrounds).
+    property <color> line: Theme.line;
 
     public function focus-composer() { composer.focus-input(); }
     public function scroll-to-bottom() { msgs.scroll-to-bottom(); }
@@ -161,7 +163,7 @@ export component AppWindow inherits Window {
                 height: 5px;
                 Rectangle {
                     height: divider.has-hover || divider.pressed ? 3px : 2px;
-                    background: divider.has-hover || divider.pressed ? Palette.accent-background : root.line;
+                    background: divider.has-hover || divider.pressed ? Theme.accent : root.line;
                 }
                 divider := TouchArea {
                     mouse-cursor: row-resize;
@@ -227,7 +229,7 @@ export component AppWindow inherits Window {
             Rectangle { height: 1px; background: root.line; }
             if root.voice != "": Rectangle {
                 height: 22px;
-                background: Palette.alternate-background;
+                background: Theme.panel;
                 HorizontalLayout {
                     padding-left: 8px;
                     padding-right: 4px;
@@ -243,7 +245,7 @@ export component AppWindow inherits Window {
                         text: "●";
                         vertical-alignment: center;
                         font-size: 9px;
-                        color: root.voice-level ? #3ba55c : Palette.foreground;
+                        color: root.voice-level ? Theme.ok : Theme.text;
                         opacity: root.voice-level ? 1.0 : 0.25;
                     }
                     mic := TouchArea {
@@ -253,8 +255,10 @@ export component AppWindow inherits Window {
                         accessible-action-default => { root.toggle-mute(); }
                         clicked => { root.toggle-mute(); }
                         Rectangle {
-                            border-radius: 3px;
-                            background: root.voice-muted ? #ed424570 : transparent;
+                            border-radius: 9px;
+                            border-width: 1px;
+                            border-color: root.voice-muted ? Theme.danger : Theme.accent;
+                            background: root.voice-muted ? Theme.danger-soft : Theme.accent-soft;
                             Text {
                                 text: "Mic"; // the software renderer has no color emoji
                                 horizontal-alignment: center;
@@ -271,8 +275,10 @@ export component AppWindow inherits Window {
                         accessible-action-default => { root.toggle-deafen(); }
                         clicked => { root.toggle-deafen(); }
                         Rectangle {
-                            border-radius: 3px;
-                            background: root.voice-deafened ? #ed424570 : transparent;
+                            border-radius: 9px;
+                            border-width: 1px;
+                            border-color: root.voice-deafened ? Theme.danger : Theme.accent;
+                            background: root.voice-deafened ? Theme.danger-soft : Theme.accent-soft;
                             Text {
                                 text: "Audio";
                                 horizontal-alignment: center;
@@ -291,7 +297,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "✖";
                             vertical-alignment: center;
-                            color: #ed4245;
+                            color: Theme.danger;
                             opacity: hang.has-hover ? 1.0 : 0.7;
                         }
                     }
@@ -300,7 +306,7 @@ export component AppWindow inherits Window {
             if root.voice != "": Rectangle { height: 1px; background: root.line; }
             if root.call-prompt != "": Rectangle {
                 height: 22px;
-                background: Palette.alternate-background;
+                background: Theme.panel;
                 HorizontalLayout {
                     padding-left: 8px;
                     padding-right: 4px;
@@ -322,7 +328,7 @@ export component AppWindow inherits Window {
                         clicked => { root.accept-call(); }
                         accept-text := Text {
                             text: "Accept";
-                            color: #3ba55c;
+                            color: Theme.ok;
                             font-size: 12px;
                             vertical-alignment: center;
                             opacity: accept.has-hover ? 1.0 : 0.8;
@@ -337,7 +343,7 @@ export component AppWindow inherits Window {
                         clicked => { root.decline-call(); }
                         decline-text := Text {
                             text: "Decline";
-                            color: #ed4245;
+                            color: Theme.danger;
                             font-size: 12px;
                             vertical-alignment: center;
                             opacity: decline.has-hover ? 1.0 : 0.8;
@@ -349,7 +355,7 @@ export component AppWindow inherits Window {
             // status bar
             Rectangle {
                 height: 22px;
-                background: root.banner != "" ? #b0602a : Palette.alternate-background;
+                background: root.banner != "" ? Theme.warn : Theme.panel;
                 HorizontalLayout {
                     padding-left: 8px;
                     padding-right: 4px;
@@ -357,13 +363,13 @@ export component AppWindow inherits Window {
                     Text {
                         text: "●";
                         vertical-alignment: center;
-                        color: root.banner != "" ? white : #3ba55c;
+                        color: root.banner != "" ? white : Theme.ok;
                         font-size: 10px;
                     }
                     Text {
                         horizontal-stretch: 1;
                         text: root.banner != "" ? root.banner : root.notice != "" ? root.notice : "Connected · " + root.me-name;
-                        color: root.banner != "" ? white : Palette.foreground;
+                        color: root.banner != "" ? white : Theme.text;
                         vertical-alignment: center;
                         overflow: elide;
                         font-size: 12px;
@@ -378,7 +384,7 @@ export component AppWindow inherits Window {
                         clicked => { root.update-clicked(root.update-action); }
                         upd-text := Text {
                             text: root.update-label;
-                            color: #3ba55c;
+                            color: Theme.ok;
                             font-size: 12px;
                             vertical-alignment: center;
                         }
@@ -401,9 +407,9 @@ export component AppWindow inherits Window {
                     y: -66px;
                     width: 140px;
                     Rectangle {
-                        background: Palette.background;
+                        background: Theme.bg;
                         border-width: 1px;
-                        border-color: Palette.border;
+                        border-color: Theme.line;
                         VerticalLayout {
                             Button {
                                 text: "Voice settings…";
@@ -439,7 +445,7 @@ export component AppWindow inherits Window {
         if !root.logged-in: LoginScreen {
             width: parent.width;
             height: parent.height;
-            background: Palette.background;
+            background: Theme.bg;
             qr: root.qr;
             status: root.login-status;
             error: root.login-error;

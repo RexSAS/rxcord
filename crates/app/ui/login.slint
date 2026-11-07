@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { Button, LineEdit, VerticalBox } from "std-widgets.slint";
 
 export component LoginScreen inherits Rectangle {
@@ -20,7 +21,7 @@ export component LoginScreen inherits Rectangle {
         }
         if root.error != "": Text {
             text: root.error;
-            color: #e05050;
+            color: Theme.danger;
             horizontal-alignment: center;
             wrap: word-wrap;
         }

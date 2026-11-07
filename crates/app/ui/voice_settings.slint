@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { CheckBox, ComboBox, Slider, Palette } from "std-widgets.slint";
 
 // ⚙ → "Voice settings…": devices, speech threshold, noise suppression. Changes apply at once.
@@ -16,9 +17,9 @@ export component VoiceSettings inherits Rectangle {
     callback threshold-changed(float);
     callback noise-changed(bool);
 
-    background: Palette.background;
+    background: Theme.bg;
     border-width: 1px;
-    border-color: Palette.border;
+    border-color: Theme.line;
     VerticalLayout {
         padding: 8px;
         spacing: 4px;

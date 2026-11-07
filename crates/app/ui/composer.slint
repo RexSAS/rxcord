@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { Button, TextEdit, Palette } from "std-widgets.slint";
 
 // Message input. Enter sends, Shift+Enter adds a newline, Up on an empty composer edits your last
@@ -48,13 +49,13 @@ export component Composer inherits VerticalLayout {
             Text {
                 text: "✕ Cancel";
                 font-size: 12px;
-                color: Palette.accent-background;
+                color: Theme.accent;
             }
         }
     }
     if root.error != "": Text {
         text: root.error;
-        color: #da373c;
+        color: Theme.danger;
         font-size: 12px;
         wrap: word-wrap;
     }
@@ -87,11 +88,12 @@ export component Composer inherits VerticalLayout {
             spacing: 4px;
             if root.count > 1800: Text {
                 text: root.count + "/2000";
-                color: root.count > 2000 ? #da373c : Palette.foreground;
+                color: root.count > 2000 ? Theme.danger : Theme.text;
                 font-size: 12px;
                 horizontal-alignment: center;
             }
             Button {
+                primary: true;
                 text: root.edit-id != "" ? "Save" : "Send";
                 enabled: root.text != "" && root.count <= 2000;
                 clicked => { root.send(root.text); }

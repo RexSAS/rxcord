@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { Palette } from "std-widgets.slint";
 import { Badge } from "widgets.slint";
 
@@ -22,16 +23,20 @@ export component Tabs inherits Rectangle {
     callback hang-up();
 
     height: 26px;
-    background: Palette.alternate-background;
+    background: Theme.panel;
     Flickable {
         content-width: max(self.width, row.preferred-width);
         row := HorizontalLayout {
             alignment: start;
             for t in root.tabs: Rectangle {
                 property <bool> on: t.id == root.active;
-                background: on ? Palette.background : ta.has-hover ? Palette.control-background : transparent;
-                border-width: on ? 1px : 0;
-                border-color: Palette.border;
+                background: on ? Theme.bg : ta.has-hover ? Theme.hover : transparent;
+                Rectangle {
+                    y: parent.height - 2px;
+                    height: 2px;
+                    visible: on;
+                    background: Theme.accent;
+                }
                 accessible-role: tab;
                 accessible-label: t.name;
                 accessible-item-selected: on;
@@ -67,7 +72,7 @@ export component Tabs inherits Rectangle {
                         clicked => { if in-it { root.hang-up(); } else { root.call(t.id); } }
                         Text {
                             text: in-it ? "✖" : "☎";
-                            color: in-it ? #ed4245 : Palette.foreground;
+                            color: in-it ? Theme.danger : Theme.text;
                             opacity: ph.has-hover ? 1.0 : 0.7;
                             vertical-alignment: center;
                         }

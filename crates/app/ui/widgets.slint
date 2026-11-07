@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 // Small shared pieces.
 export component Badge inherits Rectangle {
     in property <int> count;
@@ -5,7 +6,7 @@ export component Badge inherits Rectangle {
     width: max(16px, label.preferred-width + 8px);
     height: 16px;
     border-radius: 8px;
-    background: #da373c;
+    background: Theme.danger;
     label := Text {
         text: count;
         color: white;

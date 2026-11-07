@@ -1,3 +1,4 @@
+import { Theme } from "theme.slint";
 import { Palette } from "std-widgets.slint";
 
 export struct ThumbItem {
@@ -35,7 +36,7 @@ export struct MessageItem {
 
 component Action inherits TouchArea {
     in property <string> text;
-    in property <color> color: Palette.accent-background;
+    in property <color> color: Theme.accent;
     accessible-role: button;
     accessible-label: root.text;
     accessible-action-default => { root.clicked(); }
@@ -73,8 +74,18 @@ export component MessageRow inherits VerticalLayout {
     padding-top: 3px;
     padding-bottom: 3px;
     Rectangle {
-        background: root.msg.failed ? #da373c20 : Palette.alternate-background;
-        border-radius: 6px;
+        background: root.msg.failed ? Theme.danger-tint : Theme.card;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: root.msg.mine ? Theme.accent-soft : Theme.line;
+        // own messages: a neon edge on the left
+        Rectangle {
+            x: 0;
+            width: 3px;
+            visible: root.msg.mine;
+            border-radius: 1px;
+            background: Theme.accent;
+        }
         lay := VerticalLayout {
             padding-left: 10px;
             padding-right: 10px;
@@ -92,8 +103,8 @@ export component MessageRow inherits VerticalLayout {
             StyledText {
                 text: root.msg.body;
                 opacity: root.msg.pending && !root.msg.failed ? 0.5 : 1.0;
-                default-color: root.msg.failed ? #da373c : Palette.foreground;
-                link-color: Palette.color-scheme == ColorScheme.dark ? #6cb4f5 : #1a6bc4;
+                default-color: root.msg.failed ? Theme.danger : Theme.text;
+                link-color: Theme.link;
             link-clicked(url) => { root.open-url(url); }
             }
             for f in root.msg.files: HorizontalLayout {
@@ -132,7 +143,7 @@ export component MessageRow inherits VerticalLayout {
                     Rectangle {
                         border-radius: 3px;
                         clip: true;
-                        background: Palette.background; // darker than the card
+                        background: Theme.bg; // darker than the card
                         Image {
                             source: t.image;
                             width: 100%;
@@ -147,7 +158,7 @@ export component MessageRow inherits VerticalLayout {
                 spacing: 8px;
                 Text {
                     text: "Failed to send";
-                    color: #da373c;
+                    color: Theme.danger;
                     font-size: 11px;
                 }
                 Action {
@@ -164,7 +175,7 @@ export component MessageRow inherits VerticalLayout {
                 }
                 Action {
                     text: "Delete";
-                    color: #da373c;
+                    color: Theme.danger;
                     clicked => {
                         root.confirm = false;
                         root.delete(root.msg.id);
@@ -177,7 +188,7 @@ export component MessageRow inherits VerticalLayout {
             }
             if root.error != "": Text {
                 text: root.error;
-                color: root.error-ok ? #3ba55c : #da373c;
+                color: root.error-ok ? Theme.ok : Theme.danger;
                 font-size: 11px;
             }
         }

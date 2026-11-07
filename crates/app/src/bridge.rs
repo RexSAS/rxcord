@@ -220,7 +220,7 @@ fn tree_item(r: TreeRow) -> TreeItem {
         volume: m.map_or(1.0, |m| m.volume),
         muted_for_me: m.is_some_and(|m| m.muted_for_me),
         id: r.row.id.to_string().into(),
-        name: if r.row.kind == 4 && !r.node { r.row.name.to_uppercase() } else { r.row.name }.into(),
+        name: if r.node || r.row.kind == 4 { r.row.name.to_uppercase() } else { r.row.name }.into(),
         node: r.node,
         expanded: r.expanded,
         depth: r.depth.into(),
