@@ -8,3 +8,7 @@ pub mod client_props;
 pub mod gateway;
 pub mod scrub;
 pub use scrub::scrub;
+pub mod nonce;
+pub mod ratelimit;
+pub mod rest;
+pub use rest::{ApiError, Rest};
