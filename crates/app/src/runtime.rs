@@ -169,10 +169,11 @@ fn queue_op4(tx: Option<&mpsc::Sender<GatewayCmd>>, unsent: &mut Option<GatewayC
     let Some(tx) = tx else { return };
     if unsent.is_some() {
         *unsent = Some(c);
-    } else if let Err(e) = tx.try_send(c) {
+    } else if let Err(mpsc::error::TrySendError::Full(c)) = tx.try_send(c) {
         tracing::debug!("voice state queued: gateway busy");
-        *unsent = Some(e.into_inner());
-    }
+        *unsent = Some(c);
+    } // Closed: the gateway task ended, nothing will ever take it
+
 }
 
 /// Room in the gateway's queue for the unsent op 4; never resolves when there's nothing to send.
@@ -292,6 +293,7 @@ impl Runtime {
                     bridge::push_tree(&self.ui, &self.store, &mut self.nav);
                 }
                 Input::Op4Room(p) => {
+                    // None: the gateway is gone; dropping the op 4 stops this arm from firing again
                     if let (Some(p), Some(c)) = (p, self.op4_unsent.take()) {
                         p.send(c);
                     }
@@ -1070,6 +1072,17 @@ mod tests {
         assert_eq!(ch(rx.recv().await.unwrap()), Some(Id(3)), "retried; 2 never goes out after 3");
         let idle = tokio::time::timeout(Duration::from_millis(50), op4_room(Some(tx), false)).await;
         assert!(idle.is_err(), "nothing unsent: the arm never fires");
+    }
+
+    #[tokio::test]
+    async fn op4_dropped_when_gateway_gone() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut unsent = None;
+        queue_op4(Some(&tx), &mut unsent, op4(1));
+        assert!(unsent.is_none(), "closed: not kept, so op4_room stays pending and the loop can't spin");
+        let idle = tokio::time::timeout(Duration::from_millis(50), op4_room(Some(tx), unsent.is_some())).await;
+        assert!(idle.is_err());
     }
 
     #[tokio::test]
