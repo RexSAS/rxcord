@@ -1,0 +1,82 @@
+import { ListView, Palette } from "std-widgets.slint";
+import { Badge, Dot } from "widgets.slint";
+
+export struct TreeItem {
+    id: string,
+    name: string,
+    // DMs node and guilds
+    node: bool,
+    expanded: bool,
+    depth: int,
+    // channel type: 4 = category, 1/3 = DM, 2/13 = voice
+    kind: int,
+    unread: bool,
+    mentions: int,
+    enabled: bool,
+}
+
+// DMs and guilds as collapsible nodes; channels under expanded nodes. Clicking a node toggles it,
+// clicking a text channel or DM opens its tab.
+export component Tree inherits Rectangle {
+    in property <[TreeItem]> items;
+    // the active tab's channel
+    in property <string> active;
+    callback toggle(string);
+    callback open(string);
+
+    background: Palette.alternate-background;
+    ListView {
+        for it in root.items: Rectangle {
+            property <bool> header: it.kind == 4 && !it.node;
+            property <bool> voice: it.kind == 2 || it.kind == 13;
+            property <bool> clickable: it.node || (it.enabled && !header);
+            // collapsed nodes summarise what's inside
+            property <bool> show-totals: it.node && !it.expanded;
+            height: 22px;
+            background: it.id == root.active && !it.node ? Palette.selection-background
+                : ta.has-hover && clickable ? Palette.background : transparent;
+            accessible-role: list-item;
+            accessible-label: it.name;
+            accessible-enabled: clickable;
+            accessible-expandable: it.node;
+            accessible-expanded: it.expanded;
+            accessible-action-default => { ta.clicked(); }
+            HorizontalLayout {
+                padding-left: 6px + it.depth * 14px;
+                padding-right: 6px;
+                spacing: 4px;
+                Text {
+                    width: 12px;
+                    text: it.node ? (it.expanded ? "▾" : "▸") : "";
+                    vertical-alignment: center;
+                    opacity: 0.7;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: it.node || header || it.kind == 1 || it.kind == 3 ? it.name : (voice ? "♪ " : "# ") + it.name;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    font-size: header ? 11px : 13px;
+                    font-weight: it.node || header || (it.unread && it.enabled && (!it.node || show-totals)) ? 700 : 400;
+                    color: it.id == root.active && !it.node ? Palette.selection-foreground : Palette.foreground;
+                    opacity: !it.enabled ? 0.4 : it.node || header || it.unread || it.id == root.active ? 1.0 : 0.7;
+                }
+                if show-totals && it.unread && it.mentions == 0: Dot {
+                    y: (parent.height - self.height) / 2;
+                    background: Palette.foreground;
+                }
+                Badge {
+                    y: (parent.height - self.height) / 2;
+                    count: it.node && it.expanded ? 0 : it.mentions;
+                }
+            }
+            ta := TouchArea {
+                enabled: clickable;
+                mouse-cursor: self.enabled ? pointer : default;
+                clicked => {
+                    if it.node { root.toggle(it.id); } else { root.open(it.id); }
+                }
+            }
+        }
+    }
+}

@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 
 pub const IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest side of a thumbnail, in px.
-pub const THUMB_MAX: u32 = 400;
+pub const THUMB_MAX: u32 = 200;
 const MAX_FETCHES: usize = 4;
 /// Download cap: thumbnails are requested at <= 400 px, so this only stops a hostile or broken server.
 const MAX_DOWNLOAD: usize = 20 * 1024 * 1024;

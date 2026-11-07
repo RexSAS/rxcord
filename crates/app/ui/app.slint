@@ -1,16 +1,19 @@
 import { Button, Palette } from "std-widgets.slint";
 import { LoginScreen } from "login.slint";
-import { GuildList, ChannelList, GuildItem, ChannelItem } from "sidebar.slint";
+import { Tree, TreeItem } from "tree.slint";
+import { Tabs, TabItem } from "tabs.slint";
 import { MessageList } from "messages.slint";
 import { Composer } from "composer.slint";
-import { MessageItem, BlockItem, ThumbItem, FileItem } from "message_row.slint";
+import { MessageItem, ThumbItem, FileItem } from "message_row.slint";
 
-export { GuildItem, ChannelItem, MessageItem, BlockItem, ThumbItem, FileItem }
+export { TreeItem, TabItem, MessageItem, ThumbItem, FileItem }
 
 export component AppWindow inherits Window {
     title: "rxcord";
-    preferred-width: 1000px;
-    preferred-height: 700px;
+    preferred-width: 360px;
+    preferred-height: 640px;
+    min-width: 280px;
+    min-height: 400px;
     background: Palette.background;
 
     in property <bool> logged-in;
@@ -25,16 +28,24 @@ export component AppWindow inherits Window {
     callback start-qr();
     callback logout();
 
-    in property <[GuildItem]> guilds;
-    in property <[ChannelItem]> channels;
+    in property <[TreeItem]> tree;
+    in property <[TabItem]> tabs;
     in property <[MessageItem]> messages;
-    // "@me" selects Direct Messages.
-    in property <string> selected-guild;
+    // the active tab
     in property <string> selected-channel;
-    in property <string> guild-title;
-    in property <string> channel-title;
-    callback select-guild(string);
+    // your display name, for the status bar
+    in property <string> me-name;
+    // height of the tree above the divider (saved in settings.json)
+    in-out property <length> tree-height: 280px;
+    // expand/collapse a tree node (guild id or "0" for DMs)
+    callback toggle-node(string);
+    // open a channel's tab, or activate it
     callback select-channel(string);
+    callback close-tab(string);
+    // Set (by Rust) together with `selected-channel` when the active channel was deleted: the composer
+    // text moves to the next tab instead of being saved as the dead channel's draft.
+    in-out property <bool> carry-draft;
+    callback carry(string /*text*/, string /*to*/) -> string;
     // shown instead of messages when the first load failed
     in property <string> messages-error;
     callback retry();
@@ -70,61 +81,59 @@ export component AppWindow inherits Window {
     changed selected-channel => {
         composer.cancel();
         root.row-error-id = "";
-        root.composer-text = root.switch-draft(root.composer-text, root.selected-channel);
+        if root.carry-draft {
+            root.carry-draft = false;
+            if root.composer-text != "" { root.composer-error = "Channel was deleted — unsent text moved here"; }
+            root.composer-text = root.carry(root.composer-text, root.selected-channel);
+        } else {
+            root.composer-text = root.switch-draft(root.composer-text, root.selected-channel);
+        }
     }
+
+    // Section borders: visible in both color schemes (Palette.border blends into the backgrounds).
+    property <color> line: Palette.color-scheme == ColorScheme.dark ? #ffffff30 : #00000030;
 
     public function focus-composer() { composer.focus-input(); }
     public function scroll-to-bottom() { msgs.scroll-to-bottom(); }
     public function messages-prepended(n: int) { msgs.prepended(n); }
 
     VerticalLayout {
-        if root.banner != "": Rectangle {
-            height: 28px;
-            background: #b0602a;
-            Text {
-                text: root.banner;
-                color: white;
-            }
-        }
         Rectangle {
         // `visible` instead of `if`: the message list must exist for the public functions above.
-        HorizontalLayout {
+        VerticalLayout {
             width: parent.width;
             height: parent.height;
             visible: root.logged-in;
-            GuildList {
-                guilds: root.guilds;
-                selected: root.selected-guild;
-                select(id) => { root.select-guild(id); }
+            Tree {
+                height: root.tree-height;
+                items: root.tree;
+                active: root.selected-channel;
+                toggle(id) => { root.toggle-node(id); }
+                open(id) => { root.select-channel(id); }
             }
-            VerticalLayout {
-                ChannelList {
-                    vertical-stretch: 1;
-                    channels: root.channels;
-                    title: root.guild-title;
-                    selected: root.selected-channel;
-                    select(id) => { root.select-channel(id); }
-                }
-                HorizontalLayout {
-                    padding: 8px;
-                    Button {
-                        text: "Log out";
-                        clicked => { root.logout(); }
-                    }
-                }
-            }
-            VerticalLayout {
-                horizontal-stretch: 1;
+            // divider: drag to resize the tree (5px to grab, drawn as a 2px line)
+            Rectangle {
+                height: 5px;
                 Rectangle {
-                    height: 48px;
-                    Text {
-                        x: 16px;
-                        text: root.channel-title;
-                        font-weight: 700;
-                        overflow: elide;
-                        width: parent.width - 32px;
+                    height: divider.has-hover || divider.pressed ? 3px : 2px;
+                    background: divider.has-hover || divider.pressed ? Palette.accent-background : root.line;
+                }
+                divider := TouchArea {
+                    mouse-cursor: row-resize;
+                    moved => {
+                        root.tree-height = clamp(root.tree-height + self.mouse-y - self.pressed-y, 60px, max(60px, root.height - 220px));
                     }
                 }
+            }
+            Tabs {
+                tabs: root.tabs;
+                active: root.selected-channel;
+                activate(id) => { root.select-channel(id); }
+                close(id) => { root.close-tab(id); }
+            }
+            Rectangle { height: 1px; background: root.line; }
+            Rectangle {
+                vertical-stretch: 1;
                 msgs := MessageList {
                     messages: root.messages;
                     error: root.messages-error;
@@ -148,15 +157,72 @@ export component AppWindow inherits Window {
                     }
                     retry-send(nonce) => { root.retry-send(nonce); }
                 }
-                composer := Composer {
-                    text <=> root.composer-text;
-                    reply-id <=> root.reply-id;
-                    reply-author: root.reply-author;
-                    edit-id <=> root.edit-id;
-                    stash <=> root.edit-stash;
-                    error <=> root.composer-error;
-                    send(t) => { root.send(t); }
-                    edit-last => { root.start-edit(""); }
+                if root.selected-channel == "": Text {
+                    text: "Pick a channel or DM above";
+                    opacity: 0.5;
+                }
+            }
+            Rectangle { height: 1px; background: root.line; }
+            composer := Composer {
+                visible: root.selected-channel != "";
+                text <=> root.composer-text;
+                reply-id <=> root.reply-id;
+                reply-author: root.reply-author;
+                edit-id <=> root.edit-id;
+                stash <=> root.edit-stash;
+                error <=> root.composer-error;
+                send(t) => { root.send(t); }
+                edit-last => { root.start-edit(""); }
+            }
+            Rectangle { height: 1px; background: root.line; }
+            // status bar
+            Rectangle {
+                height: 22px;
+                background: root.banner != "" ? #b0602a : Palette.alternate-background;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 4px;
+                    spacing: 6px;
+                    Text {
+                        text: "●";
+                        vertical-alignment: center;
+                        color: root.banner != "" ? white : #3ba55c;
+                        font-size: 10px;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.banner != "" ? root.banner : "Connected · " + root.me-name;
+                        color: root.banner != "" ? white : Palette.foreground;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        font-size: 12px;
+                    }
+                    gear := TouchArea {
+                        width: 20px;
+                        accessible-role: button;
+                        accessible-label: "Menu";
+                        accessible-action-default => { menu.show(); }
+                        clicked => { menu.show(); }
+                        Text {
+                            text: "⚙";
+                            vertical-alignment: center;
+                            opacity: gear.has-hover ? 1.0 : 0.7;
+                        }
+                    }
+                }
+                menu := PopupWindow {
+                    x: parent.width - 110px;
+                    y: -34px;
+                    width: 100px;
+                    Rectangle {
+                        background: Palette.background;
+                        border-width: 1px;
+                        border-color: Palette.border;
+                        Button {
+                            text: "Log out";
+                            clicked => { root.logout(); }
+                        }
+                    }
                 }
             }
         }

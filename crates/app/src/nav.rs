@@ -1,5 +1,5 @@
 //! Per-session navigation state and the pure rules for history paging and read acks.
-use crate::view::MessageRow;
+use crate::view::{MessageRow, TreeRow};
 use rxcord_api::ApiError;
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
@@ -9,6 +9,53 @@ use tokio::time::{Duration, Instant};
 
 pub const HISTORY_PAGE: u8 = 50;
 pub const ACK_EVERY: Duration = Duration::from_secs(3);
+pub const MAX_TABS: usize = 8;
+/// Tree node id of "Direct Messages" (guild ids are never 0).
+pub const DMS_NODE: Id = Id(0);
+
+/// Open chat tabs in display order, with least-recently-used eviction.
+#[derive(Default)]
+pub struct Tabs {
+    open: Vec<Id>,
+    used: HashMap<Id, u64>,
+    tick: u64,
+}
+
+impl Tabs {
+    pub fn ids(&self) -> &[Id] {
+        &self.open
+    }
+
+    /// Adds `id` (if new) and marks it used; returns the tab closed to stay within `MAX_TABS`.
+    pub fn open(&mut self, id: Id) -> Option<Id> {
+        self.tick += 1;
+        self.used.insert(id, self.tick);
+        if self.open.contains(&id) {
+            return None;
+        }
+        self.open.push(id);
+        if self.open.len() <= MAX_TABS {
+            return None;
+        }
+        let lru = *self.open.iter().min_by_key(|t| self.used.get(t).copied().unwrap_or(0))?;
+        self.remove(lru);
+        Some(lru)
+    }
+
+    /// The tab shown after `id` closes: its right neighbour, else its left one.
+    pub fn neighbour(&self, id: Id) -> Option<Id> {
+        let i = self.open.iter().position(|t| *t == id)?;
+        self.open.get(i + 1).or(i.checked_sub(1).and_then(|j| self.open.get(j))).copied()
+    }
+
+    /// True when `id` was open.
+    pub fn remove(&mut self, id: Id) -> bool {
+        self.used.remove(&id);
+        let before = self.open.len();
+        self.open.retain(|t| *t != id);
+        self.open.len() != before
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Ack {
@@ -40,9 +87,13 @@ pub fn should_load_older(front: Option<Id>, end: Option<Id>, in_flight: bool) ->
 /// Navigation state of one session.
 #[derive(Default)]
 pub struct Nav {
-    pub guild: Option<Id>, // None = Direct Messages
+    pub tabs: Tabs,
+    /// Expanded tree nodes: guild ids and `DMS_NODE`.
+    pub expanded: HashSet<Id>,
+    /// The active tab.
     pub selected: Option<Id>,
     pub at_bottom: bool,
+    pub tree: Vec<TreeRow>, // what the UI's tree model holds
     pub shown: Vec<MessageRow>, // what the UI's message model holds
     pub shown_channel: Option<Id>,
     /// Bumped on READY: history responses from an older generation are ignored entirely.
@@ -56,27 +107,25 @@ pub struct Nav {
 }
 
 impl Nav {
-    /// Which UI models a batch of store changes touches: (guilds, channels, messages).
-    pub fn affected(&self, s: &Store, changes: &[Change]) -> (bool, bool, bool) {
-        let (mut guilds, mut chans, mut msgs) = (false, false, false);
+    /// Which UI models a batch of store changes touches: (tree and tabs, messages).
+    pub fn affected(&self, changes: &[Change]) -> (bool, bool) {
+        let (mut tree, mut msgs) = (false, false);
         for c in changes {
             match *c {
                 Change::Me => {}
-                Change::GuildList => guilds = true,
-                Change::Channels { guild } => chans |= self.guild.is_some() && (guild.is_none() || guild == self.guild),
-                Change::DmList => chans |= self.guild.is_none(),
                 Change::Messages(c) => msgs |= Some(c) == self.selected,
-                Change::Unread(c) => {
-                    guilds = true;
-                    chans |= s.channel(c).is_some_and(|c| c.guild_id == self.guild);
-                }
+                Change::GuildList | Change::Channels { .. } | Change::DmList | Change::Unread(_) => tree = true,
             }
         }
-        (guilds, chans, msgs)
+        (tree, msgs)
     }
 
-    /// Selects another channel `id` (the previous one is trimmed); true when its history must be fetched.
+    /// Activates channel `id`'s tab, opening it if needed (the previous one is trimmed, an evicted one
+    /// forgotten); true when its history must be fetched.
     pub fn open(&mut self, s: &mut Store, id: Id) -> bool {
+        if let Some(gone) = self.tabs.open(id) {
+            self.forget(s, gone);
+        }
         if let Some(prev) = self.selected.replace(id) {
             s.close_channel(prev);
         }
@@ -142,13 +191,35 @@ impl Nav {
         })
     }
 
-    /// The selected channel is gone (deleted, or its guild left): deselect it. True when it was cleared.
-    pub fn drop_missing_selection(&mut self, s: &Store) -> bool {
-        let gone = self.selected.is_some_and(|c| s.channel(c).is_none());
-        if gone {
-            self.selected = None;
+    fn forget(&mut self, s: &mut Store, id: Id) {
+        s.forget_channel(id);
+        self.history_end.remove(&id);
+    }
+
+    /// Closes `id`'s tab. When it was the active one, nothing is selected afterwards and the tab to
+    /// activate next is returned as `Some(next)`.
+    pub fn close_tab(&mut self, s: &mut Store, id: Id) -> Option<Option<Id>> {
+        let next = self.tabs.neighbour(id);
+        if !self.tabs.remove(id) {
+            return None;
         }
-        gone
+        self.forget(s, id);
+        (self.selected == Some(id)).then(|| {
+            self.selected = None;
+            next
+        })
+    }
+
+    /// Closes the tabs of channels that no longer exist (deleted, or their guild left). Same return as
+    /// `close_tab` for the active tab.
+    pub fn drop_missing_tabs(&mut self, s: &mut Store) -> Option<Option<Id>> {
+        let gone: Vec<Id> = self.tabs.ids().iter().copied().filter(|c| s.channel(*c).is_none()).collect();
+        let active = self.selected.filter(|c| gone.contains(c));
+        for c in gone.into_iter().filter(|c| Some(*c) != active) {
+            self.tabs.remove(c);
+            self.forget(s, c);
+        }
+        self.close_tab(s, active?)
     }
 
     /// Decides (and records) an ack for `ch`. Needs the channel selected, loaded, on screen and the window focused.
@@ -242,17 +313,48 @@ mod tests {
 
     #[test]
     fn affected_models() {
-        let s = store();
-        let mut n = Nav { guild: Some(Id(10)), selected: Some(Id(100)), ..Default::default() };
-        assert_eq!(n.affected(&s, &[Change::Messages(Id(100))]), (false, false, true));
-        assert_eq!(n.affected(&s, &[Change::Messages(Id(101))]), (false, false, false));
-        assert_eq!(n.affected(&s, &[Change::Unread(Id(100))]), (true, true, false));
-        assert_eq!(n.affected(&s, &[Change::Unread(Id(200))]), (true, false, false));
-        assert_eq!(n.affected(&s, &[Change::DmList]), (false, false, false));
-        assert_eq!(n.affected(&s, &[Change::Channels { guild: None }]), (false, true, false));
-        n.guild = None;
-        assert_eq!(n.affected(&s, &[Change::DmList, Change::Unread(Id(200))]), (true, true, false));
-        assert_eq!(n.affected(&s, &[Change::Channels { guild: Some(Id(10)) }]), (false, false, false));
+        let n = Nav { selected: Some(Id(100)), ..Default::default() };
+        assert_eq!(n.affected(&[Change::Messages(Id(100))]), (false, true));
+        assert_eq!(n.affected(&[Change::Messages(Id(101))]), (false, false));
+        assert_eq!(n.affected(&[Change::Unread(Id(200))]), (true, false));
+        assert_eq!(n.affected(&[Change::DmList, Change::Me]), (true, false));
+        assert_eq!(n.affected(&[Change::Me]), (false, false));
+    }
+
+    #[test]
+    fn tabs_lru_eviction_and_neighbours() {
+        let mut t = Tabs::default();
+        for i in 1..=MAX_TABS as u64 {
+            assert_eq!(t.open(Id(i)), None);
+        }
+        assert_eq!(t.open(Id(1)), None, "reopen: no new tab, marks 1 used");
+        assert_eq!(t.open(Id(99)), Some(Id(2)), "least recently used is closed");
+        assert_eq!(t.ids().len(), MAX_TABS);
+        assert_eq!(t.ids()[0], Id(1), "display order kept");
+        assert_eq!(t.neighbour(Id(3)), Some(Id(4)));
+        assert_eq!(t.neighbour(Id(99)), Some(Id(8)), "last tab: left neighbour");
+        assert!(t.remove(Id(3)) && !t.remove(Id(3)));
+        let mut one = Tabs::default();
+        one.open(Id(5));
+        assert_eq!(one.neighbour(Id(5)), None);
+    }
+
+    #[test]
+    fn close_and_open_tabs() {
+        let (mut s, mut n) = (store(), Nav::default());
+        assert!(n.open(&mut s, Id(100)), "first open fetches");
+        s.prepend_history(Id(100), msgs(1..3));
+        n.open(&mut s, Id(200));
+        assert!(!n.open(&mut s, Id(100)), "background tab kept its messages");
+        assert_eq!(n.close_tab(&mut s, Id(200)), None, "inactive tab: no switch");
+        assert_eq!(n.tabs.ids(), &[Id(100)]);
+        n.open(&mut s, Id(200));
+        assert_eq!(n.close_tab(&mut s, Id(200)), Some(Some(Id(100))), "active tab: left neighbour next");
+        assert_eq!(n.selected, None);
+        n.open(&mut s, Id(100));
+        assert_eq!(n.close_tab(&mut s, Id(100)), Some(None), "last tab: nothing to show");
+        assert!(s.messages(Id(100)).is_empty(), "closing forgets loaded messages");
+        assert_eq!(n.close_tab(&mut s, Id(100)), None, "not open");
     }
 
     #[test]
@@ -266,15 +368,20 @@ mod tests {
     }
 
     #[test]
-    fn deleted_selection_cleared() {
+    fn deleted_tabs_closed() {
         let mut s = store();
-        let mut n = Nav { selected: Some(Id(100)), ..Default::default() };
-        assert!(!n.drop_missing_selection(&s));
+        let mut n = Nav::default();
+        n.open(&mut s, Id(200));
+        n.open(&mut s, Id(100));
+        assert_eq!(n.drop_missing_tabs(&mut s), None);
         let Some(c) = s.channel(Id(100)).cloned() else { panic!() };
         s.apply(&Event::ChannelDelete(c));
-        assert!(n.drop_missing_selection(&s));
-        assert_eq!(n.selected, None);
-        assert!(!n.drop_missing_selection(&s));
+        assert_eq!(n.drop_missing_tabs(&mut s), Some(Some(Id(200))));
+        assert_eq!((n.selected, n.tabs.ids()), (None, &[Id(200)][..]));
+        n.open(&mut s, Id(200));
+        let Some(c) = s.channel(Id(200)).cloned() else { panic!() };
+        s.apply(&Event::ChannelDelete(c));
+        assert_eq!(n.drop_missing_tabs(&mut s), Some(None), "last tab gone");
     }
 
     #[test]
