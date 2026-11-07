@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const GIVE_UP: Duration = Duration::from_secs(30);
@@ -102,12 +102,14 @@ async fn run_voice_at(
     let mut attempt = 0u32;
     let mut down_since = Instant::now();
     loop {
+        // connect, handshake and backoff share one budget: down for 30 s -> give up
+        let deadline = down_since + GIVE_UP;
         let _ = v
             .events
             .send(VoiceEvent::Status(VoiceStatus::Connecting))
             .await;
         let ws = tokio::select! {
-            r = timeout(Duration::from_secs(10), connect_async(url.as_str())) => match r {
+            r = timeout_at(deadline.min(Instant::now() + Duration::from_secs(10)), connect_async(url.as_str())) => match r {
                 Ok(Ok((ws, _))) => Some(ws),
                 Ok(Err(e)) => { tracing::warn!("voice connect failed: {e}"); None }
                 Err(_) => { tracing::warn!("voice connect timed out"); None }
@@ -115,7 +117,7 @@ async fn run_voice_at(
             _ = stopped(&mut cmds, &v.events) => return,
         };
         let outcome = match ws {
-            Some(ws) => v.connection(ws, &mut cmds).await,
+            Some(ws) => v.connection(ws, &mut cmds, deadline).await,
             None => Outcome::Reconnect,
         };
         if outcome == Outcome::Done {
@@ -125,7 +127,8 @@ async fn run_voice_at(
             attempt = 0;
             down_since = Instant::now();
         }
-        if down_since.elapsed() >= GIVE_UP {
+        let deadline = down_since + GIVE_UP;
+        if Instant::now() >= deadline {
             tracing::warn!("voice reconnect gave up");
             let _ = v.events.send(VoiceEvent::Left(LeaveReason::Fatal(0))).await;
             return;
@@ -137,7 +140,7 @@ async fn run_voice_at(
             .await;
         tokio::select! {
             // the session picks Resume vs Identify on reopen, so the delay ignores the resume flag
-            _ = sleep(reconnect_delay(attempt - 1, true, rand::random(), rand::random())) => {}
+            _ = sleep_until(deadline.min(Instant::now() + reconnect_delay(attempt - 1, true, rand::random(), rand::random()))) => {}
             _ = stopped(&mut cmds, &v.events) => return,
         }
     }
@@ -178,6 +181,8 @@ enum Outcome {
 
 enum In {
     Stop,
+    /// No Ready/Resumed before the reconnect budget ran out.
+    Stalled,
     Cmd(VoiceCmd),
     Beat,
     Ws(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
@@ -216,7 +221,13 @@ struct Voice {
 }
 
 impl Voice {
-    async fn connection(&mut self, mut ws: Ws, cmds: &mut mpsc::Receiver<VoiceCmd>) -> Outcome {
+    /// Until Ready/Resumed the socket must get there by `deadline`, or it counts as a failed attempt.
+    async fn connection(
+        &mut self,
+        mut ws: Ws,
+        cmds: &mut mpsc::Receiver<VoiceCmd>,
+        deadline: Instant,
+    ) -> Outcome {
         let mut queue: VecDeque<Action> = self.session.on_open().into();
         let mut next_hb: Option<Instant> = None;
         let mut period = Duration::from_secs(40);
@@ -236,7 +247,7 @@ impl Voice {
                     }
                     Action::Discover { ip, port, ssrc } => {
                         let found = tokio::select! {
-                            r = discover(&ip, port, ssrc) => r,
+                            r = timeout_at(deadline, discover(&ip, port, ssrc)) => r.ok().flatten(),
                             _ = stopped(cmds, &self.events) => {
                                 let _ = ws.close(None).await;
                                 return Outcome::Done;
@@ -306,6 +317,7 @@ impl Voice {
             }
             let input = tokio::select! {
                 _ = self.events.closed() => In::Stop,
+                _ = sleep_until(deadline), if !self.healthy => In::Stalled,
                 c = cmds.recv() => c.map_or(In::Stop, In::Cmd),
                 _ = async { sleep_until(next_hb.unwrap()).await }, if next_hb.is_some() => In::Beat,
                 m = ws.next() => In::Ws(m),
@@ -318,6 +330,11 @@ impl Voice {
                 },
             };
             match input {
+                In::Stalled => {
+                    tracing::warn!("voice handshake stalled");
+                    let _ = ws.close(None).await;
+                    return Outcome::Reconnect;
+                }
                 In::Stop | In::Cmd(VoiceCmd::Leave) => {
                     let _ = ws.close(None).await;
                     return Outcome::Done;
@@ -853,6 +870,51 @@ mod tests {
         .unwrap();
         assert!(matches!(ev, VoiceEvent::Left(LeaveReason::Fatal(0))));
         assert!(t0.elapsed() >= Duration::from_secs(30));
+        assert!(
+            t0.elapsed() <= Duration::from_secs(31),
+            "backoff must not overshoot the budget"
+        );
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_when_handshake_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (etx, mut events) = mpsc::channel(64);
+        let (_cmds, crx) = mpsc::channel(8);
+        let t0 = Instant::now();
+        let task = tokio::spawn(run_voice_at(conn(), 3, etx, crx, Some(url)));
+        // accepts and reads Identify, then never answers (sockets kept open)
+        let (idents_tx, mut idents) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut open = vec![];
+            while let Ok((s, _)) = listener.accept().await {
+                let mut ws = accept_async(s).await.unwrap();
+                if recv_json(&mut ws).await["op"] == 0 {
+                    let _ = idents_tx.send(());
+                }
+                open.push(ws);
+            }
+        });
+        let ev = timeout(Duration::from_secs(300), async {
+            loop {
+                if let ev @ VoiceEvent::Left(_) = events.recv().await.unwrap() {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("stalled handshake must give up");
+        assert!(matches!(ev, VoiceEvent::Left(LeaveReason::Fatal(0))));
+        assert!(t0.elapsed() <= Duration::from_secs(31));
+        assert!(
+            idents.try_recv().is_ok(),
+            "a socket was opened and identified, then stalled"
+        );
         timeout(Duration::from_secs(1), task)
             .await
             .unwrap()
