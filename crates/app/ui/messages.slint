@@ -1,0 +1,42 @@
+import { ListView } from "std-widgets.slint";
+import { MessageRow, MessageItem } from "message_row.slint";
+
+export component MessageList inherits Rectangle {
+    in property <[MessageItem]> messages;
+    callback load-older();
+    // true while the newest message is on screen
+    callback bottom-visible(bool);
+    callback thumb-visible(string);
+
+    // Follow new messages while the user is at the bottom.
+    property <bool> stick: true;
+    changed stick => { root.bottom-visible(self.stick); }
+
+    public function scroll-to-bottom() {
+        root.stick = true;
+        list.content-y = min(0px, list.visible-height - list.content-height);
+    }
+
+    // Older rows were inserted above: keep the visible rows roughly in place.
+    public function prepended(n: int) {
+        list.content-y -= n * list.content-height / max(1, root.messages.length);
+    }
+
+    list := ListView {
+        for m in root.messages: MessageRow {
+            msg: m;
+            thumb-visible(u) => { root.thumb-visible(u); }
+        }
+        changed content-height => {
+            if root.stick { root.scroll-to-bottom(); }
+        }
+        changed visible-height => {
+            if root.stick { root.scroll-to-bottom(); }
+        }
+        // user scrolling only (wheel, drag, scrollbar); programmatic scrolls don't count
+        scrolled => {
+            root.stick = self.content-y <= self.visible-height - self.content-height + 8px;
+            if self.content-y > -200px { root.load-older(); }
+        }
+    }
+}

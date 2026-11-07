@@ -1,5 +1,6 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
-use crate::{AppWindow, token};
+use crate::nav::{Ack, HISTORY_PAGE, Nav, ack_decision, history_exhausted, should_load_older};
+use crate::{AppWindow, bridge, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
 use rxcord_api::id::Id;
@@ -7,21 +8,22 @@ use rxcord_api::model::Message;
 use rxcord_api::nonce::make_nonce;
 use rxcord_api::remote_auth::{QrStatus, qr_login};
 use rxcord_api::{ApiError, Rest};
-use rxcord_store::{Pending, Store};
-use slint::{Rgba8Pixel, SharedPixelBuffer};
+use rxcord_store::{Change, Pending, Store};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
-const HISTORY_PAGE: u8 = 50;
-
-#[allow(dead_code)] // channel/message variants are sent by the UI from Task 10
+#[allow(dead_code)] // Send/Retry/Edit/Delete are sent by the UI from Task 11
 pub enum Command {
     LoginToken(String),
     StartQr,
     Logout,
+    /// `None` = Direct Messages
+    SelectGuild(Option<Id>),
     OpenChannel(Id),
+    BottomVisible(bool),
     LoadOlder(Id),
     Send { channel: Id, content: String, reply_to: Option<Id> },
     Retry(String /*nonce*/),
@@ -33,7 +35,9 @@ pub enum Command {
 /// Results of tasks spawned on the runtime, handled back on the loop.
 enum Done {
     Nothing,
-    History(Id, Result<Vec<Message>, ApiError>),
+    History(Id, Option<Id> /*before*/, Result<Vec<Message>, ApiError>),
+    Acked(Id, Id, Result<(), ApiError>),
+    AckDue(Id),
     Sent(String, Result<Box<Message>, ApiError>),
     Op(Result<(), ApiError>),
     QrToken(Result<String, ApiError>),
@@ -66,7 +70,7 @@ struct Runtime {
     qr: Option<mpsc::Receiver<QrStatus>>,
     /// Session tasks; replacing the set aborts them all (logout, new login).
     tasks: JoinSet<Done>,
-    selected: Option<Id>,
+    nav: Nav,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -78,13 +82,21 @@ async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
 
 impl Runtime {
     fn new(ui: slint::Weak<AppWindow>) -> Self {
-        Self { ui, store: Store::new(), rest: None, gw: None, qr: None, tasks: JoinSet::new(), selected: None }
+        Self { ui, store: Store::new(), rest: None, gw: None, qr: None, tasks: JoinSet::new(), nav: Nav::default() }
     }
 
     async fn run(mut self, mut cmds: UnboundedReceiver<Command>) {
-        match tokio::task::spawn_blocking(token::load).await.ok().flatten() {
-            Some(t) => self.start_session(t),
-            None => self.show_login(""),
+        if cfg!(debug_assertions) && std::env::var_os("RXCORD_DEMO").is_some() {
+            let (ready, msgs) = crate::demo::events();
+            self.event(ready);
+            self.command(Command::SelectGuild(Some(Id(crate::demo::GUILD)))).await;
+            self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
+            msgs.into_iter().for_each(|m| self.event(m));
+        } else {
+            match tokio::task::spawn_blocking(token::load).await.ok().flatten() {
+                Some(t) => self.start_session(t),
+                None => self.show_login(""),
+            }
         }
         loop {
             let input = tokio::select! {
@@ -101,7 +113,7 @@ impl Runtime {
                 Input::Gw(Some(GatewayEvent::Event(ev))) => self.event(ev),
                 Input::Gw(Some(GatewayEvent::Status(s))) => self.status(s).await,
                 Input::Gw(None) => self.gw = None,
-                Input::Qr(Some(s)) => self.qr_status(s),
+                Input::Qr(Some(s)) => bridge::qr_status(&self.ui, s),
                 Input::Qr(None) => self.qr = None,
                 Input::Done(d) => self.done(d).await,
             }
@@ -109,12 +121,7 @@ impl Runtime {
     }
 
     fn with_ui(&self, f: impl FnOnce(AppWindow) + Send + 'static) {
-        let ui = self.ui.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui.upgrade() {
-                f(ui);
-            }
-        });
+        bridge::with_ui(&self.ui, f);
     }
 
     fn start_session(&mut self, token: String) {
@@ -135,7 +142,8 @@ impl Runtime {
         self.qr = None;
         self.rest = None;
         self.store = Store::new();
-        self.selected = None;
+        self.nav = Nav::default();
+        bridge::clear(&self.ui);
     }
 
     fn show_login(&mut self, status: &str) {
@@ -172,18 +180,37 @@ impl Runtime {
             }
             Command::StartQr => self.show_login(""),
             Command::Logout => self.logout("").await,
+            Command::SelectGuild(g) => {
+                self.nav.guild = g;
+                bridge::push_channels(&self.ui, &self.store, self.nav.guild);
+                bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
+            }
             Command::OpenChannel(id) => {
-                if let Some(prev) = self.selected.replace(id) {
+                if self.nav.selected == Some(id) {
+                    return;
+                }
+                if let Some(prev) = self.nav.selected.replace(id) {
                     self.store.close_channel(prev);
                 }
+                self.nav.at_bottom = true; // the UI scrolls a newly shown channel to the bottom
                 if self.store.open_channel(id) {
                     self.fetch(id, None);
                 }
+                bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
+                bridge::push_messages(&self.ui, &self.store, self.nav.selected, &mut self.nav.shown);
+                self.maybe_ack(id);
             }
             Command::LoadOlder(id) => {
-                let before = self.store.messages(id).front().map(|m| m.id);
-                if before.is_some() {
-                    self.fetch(id, before);
+                let front = self.store.messages(id).front().map(|m| m.id);
+                let end = self.nav.history_end.get(&id).copied();
+                if should_load_older(front, end, self.nav.in_flight.contains(&id)) {
+                    self.fetch(id, front);
+                }
+            }
+            Command::BottomVisible(b) => {
+                self.nav.at_bottom = b;
+                if let Some(c) = self.nav.selected {
+                    self.maybe_ack(c);
                 }
             }
             Command::Send { channel, content, reply_to } => {
@@ -215,16 +242,80 @@ impl Runtime {
         self.start_session(token);
     }
 
+    /// One history request per channel at a time.
     fn fetch(&mut self, channel: Id, before: Option<Id>) {
-        if let Some(rest) = self.rest.clone() {
-            self.tasks.spawn(async move { Done::History(channel, rest.messages(channel, before, HISTORY_PAGE).await) });
+        if let Some(rest) = self.rest.clone()
+            && self.nav.in_flight.insert(channel)
+        {
+            self.tasks.spawn(async move {
+                Done::History(channel, before, rest.messages(channel, before, HISTORY_PAGE).await)
+            });
+        }
+    }
+
+    fn maybe_ack(&mut self, ch: Id) {
+        if self.nav.selected != Some(ch) || self.store.messages(ch).is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        match ack_decision(self.store.is_unread(ch), self.nav.at_bottom, self.nav.acked.get(&ch).copied(), now) {
+            Ack::No => {}
+            Ack::Now => {
+                // The channel's last id, not our newest row: that one may have been deleted.
+                let Some(last) = self.store.channel(ch).and_then(|c| c.last_message_id) else { return };
+                let Some(rest) = self.rest.clone() else { return };
+                self.nav.acked.insert(ch, now);
+                self.tasks.spawn(async move { Done::Acked(ch, last, rest.ack(ch, last).await) });
+            }
+            Ack::At(t) => {
+                if self.nav.ack_later.insert(ch) {
+                    self.tasks.spawn(async move {
+                        tokio::time::sleep_until(t).await;
+                        Done::AckDue(ch)
+                    });
+                }
+            }
+        }
+    }
+
+    /// Pushes only the UI models a batch of store changes affects.
+    fn changed(&mut self, changes: Vec<Change>) {
+        let (mut guilds, mut chans, mut msgs) = (false, false, false);
+        let sel = self.nav.selected;
+        for c in changes {
+            match c {
+                Change::Me => {}
+                Change::GuildList => guilds = true,
+                Change::Channels { guild } => {
+                    chans |= self.nav.guild.is_some() && (guild.is_none() || guild == self.nav.guild)
+                }
+                Change::DmList => chans |= self.nav.guild.is_none(),
+                Change::Messages(c) => msgs |= Some(c) == sel,
+                Change::Unread(c) => {
+                    guilds = true;
+                    chans |= self.store.channel(c).is_some_and(|c| c.guild_id == self.nav.guild);
+                }
+            }
+        }
+        if guilds {
+            bridge::push_guilds(&self.ui, &self.store);
+        }
+        if chans {
+            bridge::push_channels(&self.ui, &self.store, self.nav.guild);
+        }
+        if msgs {
+            bridge::push_messages(&self.ui, &self.store, self.nav.selected, &mut self.nav.shown);
+        }
+        if let Some(c) = sel {
+            self.maybe_ack(c);
         }
     }
 
     fn send(&mut self, p: Pending) {
         let Some(rest) = self.rest.clone() else { return };
         let (channel, nonce, content, reply_to) = (p.channel, p.nonce.clone(), p.content.clone(), p.reply_to);
-        self.store.add_pending(p);
+        let c = self.store.add_pending(p);
+        self.changed(vec![c]);
         self.tasks.spawn(async move {
             let r = rest.send_message(channel, &content, &nonce, reply_to).await.map(Box::new);
             Done::Sent(nonce, r)
@@ -233,17 +324,22 @@ impl Runtime {
 
     fn event(&mut self, ev: Event) {
         let ready = matches!(ev, Event::Ready(_));
-        let _changes = self.store.apply(&ev); // pushed to the UI from Task 10
+        let changes = self.store.apply(&ev);
         if ready {
             tracing::info!(guilds = self.store.guilds().len(), "READY");
             self.with_ui(|ui| ui.set_logged_in(true));
-            // READY drops stored messages; refetch the open channel.
-            if let Some(id) = self.selected
+            // READY drops stored messages; refetch the open channel. Older pages still in flight are stale.
+            self.nav.in_flight.clear();
+            self.nav.history_end.clear();
+            if let Some(id) = self.nav.selected
                 && self.store.open_channel(id)
             {
                 self.fetch(id, None);
             }
+            bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
+            bridge::push_messages(&self.ui, &self.store, self.nav.selected, &mut self.nav.shown);
         }
+        self.changed(changes);
     }
 
     async fn status(&mut self, s: ConnStatus) {
@@ -257,42 +353,46 @@ impl Runtime {
         self.with_ui(move |ui| ui.set_banner(banner.into()));
     }
 
-    fn qr_status(&mut self, s: QrStatus) {
-        match s {
-            QrStatus::Qr(url) => {
-                let buf = qr_pixels(&url);
-                self.with_ui(move |ui| {
-                    ui.set_qr(slint::Image::from_rgba8(buf));
-                    ui.set_login_status("Scan with the Discord mobile app".into());
-                });
-            }
-            QrStatus::Scanned(name) => {
-                self.with_ui(move |ui| ui.set_login_status(format!("Scanned by {name}. Confirm on your phone.").into()));
-            }
-            QrStatus::Expired => {
-                self.with_ui(|ui| {
-                    ui.set_qr(slint::Image::default());
-                    ui.set_login_status("QR code expired. Press \"New QR code\".".into());
-                });
-            }
-        }
-    }
-
     async fn done(&mut self, d: Done) {
         let err = match d {
             Done::Nothing => return,
-            Done::History(ch, Ok(msgs)) => {
-                let _changes = self.store.prepend_history(ch, msgs);
-                return;
+            Done::History(ch, before, Ok(msgs)) => {
+                self.nav.in_flight.remove(&ch);
+                let front = self.store.messages(ch).front().map(|m| m.id);
+                if before.is_some() && before != front {
+                    return; // stale page: the store was reset (READY) since the request
+                }
+                let got = msgs.len();
+                let changes = self.store.prepend_history(ch, msgs);
+                if history_exhausted(got)
+                    && let Some(f) = self.store.messages(ch).front()
+                {
+                    self.nav.history_end.insert(ch, f.id);
+                }
+                return self.changed(changes);
+            }
+            Done::History(ch, _, Err(e)) => {
+                self.nav.in_flight.remove(&ch);
+                e
+            }
+            Done::Acked(channel_id, message_id, Ok(())) => {
+                // Clear the unread state now instead of waiting for the gateway's MESSAGE_ACK.
+                let changes = self.store.apply(&Event::MessageAck { channel_id, message_id });
+                return self.changed(changes);
+            }
+            Done::AckDue(ch) => {
+                self.nav.ack_later.remove(&ch);
+                return self.maybe_ack(ch);
             }
             Done::Sent(nonce, Ok(m)) => {
                 // Don't wait for the gateway echo; apply dedupes the later MESSAGE_CREATE.
                 self.store.take_pending(&nonce);
-                self.store.apply(&Event::MessageCreate(m));
-                return;
+                let changes = self.store.apply(&Event::MessageCreate(m));
+                return self.changed(changes);
             }
             Done::Sent(nonce, Err(e)) => {
-                self.store.fail_pending(&nonce);
+                let c = self.store.fail_pending(&nonce);
+                self.changed(c.into_iter().collect());
                 e
             }
             Done::Op(Ok(())) => return,
@@ -301,48 +401,11 @@ impl Runtime {
                 tracing::warn!("QR login failed: {e}");
                 return;
             }
-            Done::History(_, Err(e)) | Done::Op(Err(e)) => e,
+            Done::Acked(_, _, Err(e)) | Done::Op(Err(e)) => e,
         };
         match err {
             ApiError::Unauthorized => self.logout("Session expired. Please log in again.").await,
             e => tracing::warn!("request failed: {e}"),
         }
-    }
-}
-
-/// QR modules scaled up with a 4-module quiet zone, black on white.
-fn qr_pixels(url: &str) -> SharedPixelBuffer<Rgba8Pixel> {
-    const SCALE: usize = 6;
-    const QUIET: usize = 4;
-    let Ok(code) = qrcode::QrCode::new(url) else { return SharedPixelBuffer::new(1, 1) };
-    let w = code.width();
-    let colors = code.to_colors();
-    let side = (w + 2 * QUIET) * SCALE;
-    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(side as u32, side as u32);
-    for (i, px) in buf.make_mut_slice().iter_mut().enumerate() {
-        let (x, y) = ((i % side) / SCALE, (i / side) / SCALE);
-        let dark = x >= QUIET
-            && y >= QUIET
-            && x < w + QUIET
-            && y < w + QUIET
-            && colors[(y - QUIET) * w + (x - QUIET)] == qrcode::Color::Dark;
-        let v = if dark { 0 } else { 255 };
-        *px = Rgba8Pixel { r: v, g: v, b: v, a: 255 };
-    }
-    buf
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn qr_has_quiet_zone_and_finder() {
-        let buf = qr_pixels("https://discord.com/ra/abc");
-        let side = buf.width() as usize;
-        assert_eq!(buf.height() as usize, side);
-        let px = buf.as_slice();
-        assert_eq!(px[0].r, 255); // quiet zone
-        assert_eq!(px[24 * side + 24].r, 0); // first module of the top-left finder (4 * 6 px)
     }
 }

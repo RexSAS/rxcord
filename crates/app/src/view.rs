@@ -43,7 +43,7 @@ pub fn format_time(ts: &str, offset: FixedOffset) -> String {
     DateTime::parse_from_rfc3339(ts).map(|t| t.with_timezone(&offset).format("%H:%M").to_string()).unwrap_or_default()
 }
 
-fn channel_row(s: &Store, c: &Channel) -> ChannelRow {
+pub fn channel_row(s: &Store, c: &Channel) -> ChannelRow {
     let name = c.name.clone().unwrap_or_else(|| {
         let names: Vec<_> = c.recipient_ids.iter().filter_map(|u| s.user(*u)).map(|u| u.display_name()).collect();
         names.join(", ")
@@ -73,8 +73,25 @@ pub fn guild_rows(s: &Store) -> Vec<GuildRow> {
         .collect()
 }
 
+/// Discord order: uncategorized channels, then each category followed by its children; text before voice.
 pub fn channel_rows(s: &Store, guild: Id) -> Vec<ChannelRow> {
-    s.channels_of(guild).into_iter().map(|c| channel_row(s, c)).collect()
+    let all = s.channels_of(guild); // (position, id) order
+    let cats: Vec<&Channel> = all.iter().copied().filter(|c| c.kind == 4).collect();
+    let under = |p: Option<Id>| {
+        let mut v: Vec<&Channel> = all
+            .iter()
+            .copied()
+            .filter(|c| c.kind != 4 && c.parent_id.filter(|id| cats.iter().any(|k| k.id == *id)) == p)
+            .collect();
+        v.sort_by_key(|c| matches!(c.kind, 2 | 13)); // stable sort keeps position order
+        v
+    };
+    let mut out = under(None);
+    for k in &cats {
+        out.push(k);
+        out.extend(under(Some(k.id)));
+    }
+    out.into_iter().map(|c| channel_row(s, c)).collect()
 }
 
 pub fn dm_rows(s: &Store) -> Vec<ChannelRow> {
@@ -174,6 +191,25 @@ mod tests {
         let v = rows.iter().find(|r| r.id == Id(101)).unwrap();
         assert_eq!((v.kind, v.enabled), (2, false));
         assert!(rows.iter().find(|r| r.id == Id(100)).unwrap().enabled);
+    }
+
+    #[test]
+    fn channels_grouped_under_categories() {
+        let ready = json!({
+            "user": {"id": "1", "username": "me"},
+            "guilds": [{"id": "10", "name": "G", "channels": [
+                {"id": "50", "type": 4, "name": "Cat", "position": 0},
+                {"id": "51", "type": 0, "name": "a", "position": 1, "parent_id": "50"},
+                {"id": "52", "type": 0, "name": "b", "position": 0},
+                {"id": "53", "type": 2, "name": "v", "position": 0, "parent_id": "50"},
+                {"id": "54", "type": 0, "name": "c", "position": 2, "parent_id": "50"},
+                {"id": "55", "type": 0, "name": "orphan", "position": 5, "parent_id": "99"}
+            ]}],
+        });
+        let mut s = Store::new();
+        s.apply(&Event::Ready(Box::new(serde_json::from_value(ready).unwrap())));
+        let names: Vec<_> = channel_rows(&s, Id(10)).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["b", "orphan", "Cat", "a", "c", "v"]);
     }
 
     #[test]

@@ -1,0 +1,96 @@
+import { Palette } from "std-widgets.slint";
+
+export struct BlockItem {
+    code: bool,
+    // `Para` blocks
+    text: styled-text,
+    // `Code` blocks
+    raw: string,
+}
+
+export struct MessageItem {
+    id: string,
+    author: string,
+    time: string,
+    blocks: [BlockItem],
+    reply: string,
+    thumbs: [string],
+    files: [string],
+    edited: bool,
+    pending: bool,
+    failed: bool,
+}
+
+export component MessageRow inherits Rectangle {
+    in property <MessageItem> msg;
+    callback thumb-visible(string);
+
+    VerticalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 2px;
+        if root.msg.reply != "": Text {
+            text: "↪ " + root.msg.reply;
+            font-size: 12px;
+            opacity: 0.6;
+            overflow: elide;
+        }
+        HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Text {
+                text: root.msg.author;
+                font-weight: 700;
+            }
+            Text {
+                text: root.msg.time + (root.msg.edited ? "  (edited)" : "");
+                font-size: 11px;
+                opacity: 0.6;
+                vertical-alignment: center;
+            }
+        }
+        for b in root.msg.blocks: VerticalLayout {
+            opacity: root.msg.pending ? 0.5 : 1.0;
+            if !b.code: StyledText {
+                text: b.text;
+                default-color: Palette.foreground;
+            }
+            if b.code: Rectangle {
+                background: Palette.alternate-background;
+                border-width: 1px;
+                border-color: Palette.border;
+                border-radius: 4px;
+                VerticalLayout {
+                    padding: 8px;
+                    Text {
+                        text: b.raw;
+                        // `Text` only takes a named family, no generic "monospace"
+                        font-family: Platform.os == OperatingSystemType.windows ? "Consolas" : "DejaVu Sans Mono";
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+        for f in root.msg.files: Text {
+            text: "📎 " + f;
+            color: Palette.accent-background;
+        }
+        for t in root.msg.thumbs: HorizontalLayout {
+            alignment: start;
+            Rectangle {
+                width: 200px;
+                height: 120px;
+                border-radius: 4px;
+                background: Palette.alternate-background;
+                init => { root.thumb-visible(t); }
+            }
+        }
+        if root.msg.failed: Text {
+            text: "Failed to send";
+            color: #da373c;
+            font-size: 12px;
+        }
+    }
+}

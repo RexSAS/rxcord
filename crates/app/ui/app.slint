@@ -1,10 +1,16 @@
-import { Button, VerticalBox } from "std-widgets.slint";
+import { Button, Palette } from "std-widgets.slint";
 import { LoginScreen } from "login.slint";
+import { GuildList, ChannelList, GuildItem, ChannelItem } from "sidebar.slint";
+import { MessageList } from "messages.slint";
+import { MessageItem, BlockItem } from "message_row.slint";
+
+export { GuildItem, ChannelItem, MessageItem, BlockItem }
 
 export component AppWindow inherits Window {
     title: "rxcord";
     preferred-width: 1000px;
     preferred-height: 700px;
+    background: Palette.background;
 
     in property <bool> logged-in;
     in property <image> qr;
@@ -15,6 +21,23 @@ export component AppWindow inherits Window {
     callback start-qr();
     callback logout();
 
+    in property <[GuildItem]> guilds;
+    in property <[ChannelItem]> channels;
+    in property <[MessageItem]> messages;
+    // "@me" selects Direct Messages.
+    in property <string> selected-guild;
+    in property <string> selected-channel;
+    in property <string> guild-title;
+    in property <string> channel-title;
+    callback select-guild(string);
+    callback select-channel(string);
+    callback load-older();
+    callback bottom-visible(bool);
+    callback thumb-visible(string);
+
+    public function scroll-to-bottom() { msgs.scroll-to-bottom(); }
+    public function messages-prepended(n: int) { msgs.prepended(n); }
+
     VerticalLayout {
         if root.banner != "": Rectangle {
             height: 28px;
@@ -24,22 +47,62 @@ export component AppWindow inherits Window {
                 color: white;
             }
         }
+        Rectangle {
+        // `visible` instead of `if`: the message list must exist for the public functions above.
+        HorizontalLayout {
+            width: parent.width;
+            height: parent.height;
+            visible: root.logged-in;
+            GuildList {
+                guilds: root.guilds;
+                selected: root.selected-guild;
+                select(id) => { root.select-guild(id); }
+            }
+            VerticalLayout {
+                ChannelList {
+                    vertical-stretch: 1;
+                    channels: root.channels;
+                    title: root.guild-title;
+                    selected: root.selected-channel;
+                    select(id) => { root.select-channel(id); }
+                }
+                HorizontalLayout {
+                    padding: 8px;
+                    Button {
+                        text: "Log out";
+                        clicked => { root.logout(); }
+                    }
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Rectangle {
+                    height: 48px;
+                    Text {
+                        x: 16px;
+                        text: root.channel-title;
+                        font-weight: 700;
+                        overflow: elide;
+                        width: parent.width - 32px;
+                    }
+                }
+                msgs := MessageList {
+                    messages: root.messages;
+                    load-older => { root.load-older(); }
+                    bottom-visible(b) => { root.bottom-visible(b); }
+                    thumb-visible(u) => { root.thumb-visible(u); }
+                }
+            }
+        }
         if !root.logged-in: LoginScreen {
+            width: parent.width;
+            height: parent.height;
+            background: Palette.background;
             qr: root.qr;
             status: root.login-status;
             login-token(t) => { root.login-token(t); }
             start-qr => { root.start-qr(); }
         }
-        // Main frame: filled in by Task 10.
-        if root.logged-in: VerticalBox {
-            alignment: start;
-            HorizontalLayout {
-                alignment: end;
-                Button {
-                    text: "Log out";
-                    clicked => { root.logout(); }
-                }
-            }
         }
     }
 }

@@ -13,9 +13,7 @@ slint.workspace = true
 keyring.workspace = true
 qrcode.workspace = true
 chrono.workspace = true
+serde_json.workspace = true # demo fixtures (RXCORD_DEMO)
 
 [build-dependencies]
 slint-build.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
