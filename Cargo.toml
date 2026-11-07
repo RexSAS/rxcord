@@ -28,3 +28,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 lru = "0.16"
 opener = "0.8"
 notify-rust = { version = "4", default-features = false, features = ["z"] }
+cpal = "0.18"
+opus = "0.4"
+rtrb = "0.4"
