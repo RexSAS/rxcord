@@ -74,3 +74,14 @@ fn small_events() {
         Event::MessageAck { channel_id, message_id } if channel_id.0 == 2 && message_id.0 == 3));
     assert!(matches!(parse("MESSAGE_UPDATE", r#"{"id":"1","channel_id":"2","content":"x"}"#).unwrap(), Event::MessageUpdate(u) if u.content.as_deref() == Some("x")));
 }
+
+#[test]
+fn captured_fixtures_parse() {
+    let Ok(rd) = std::fs::read_dir("tests/fixtures/captured") else { return };
+    for f in rd.map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "json")) {
+        let stem = f.file_stem().unwrap().to_str().unwrap();
+        let name = stem.split_once('_').unwrap().1;
+        let s = std::fs::read_to_string(&f).unwrap();
+        parse(name, &s).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+    }
+}

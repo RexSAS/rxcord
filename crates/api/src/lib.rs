@@ -6,3 +6,5 @@ pub use inflate::{InflateError, Inflater};
 pub mod backoff;
 pub mod client_props;
 pub mod gateway;
+pub mod scrub;
+pub use scrub::scrub;
