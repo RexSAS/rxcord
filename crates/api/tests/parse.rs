@@ -67,7 +67,8 @@ fn malformed_known_event_errs() {
 #[test]
 fn small_events() {
     assert!(matches!(parse("RESUMED", "{}").unwrap(), Event::Resumed));
-    assert!(matches!(parse("GUILD_DELETE", r#"{"id":"7"}"#).unwrap(), Event::GuildDelete { id } if id.0 == 7));
+    assert!(matches!(parse("GUILD_DELETE", r#"{"id":"7"}"#).unwrap(), Event::GuildDelete { id, unavailable: false } if id.0 == 7));
+    assert!(matches!(parse("GUILD_DELETE", r#"{"id":"7","unavailable":true}"#).unwrap(), Event::GuildDelete { unavailable: true, .. }));
     assert!(matches!(parse("MESSAGE_DELETE", r#"{"id":"1","channel_id":"2"}"#).unwrap(),
         Event::MessageDelete { id, channel_id } if id.0 == 1 && channel_id.0 == 2));
     assert!(matches!(parse("MESSAGE_ACK", r#"{"channel_id":"2","message_id":"3","version":9}"#).unwrap(),
@@ -84,4 +85,19 @@ fn captured_fixtures_parse() {
         let s = std::fs::read_to_string(&f).unwrap();
         parse(name, &s).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
     }
+}
+
+#[test]
+fn ready_null_collections_parse() {
+    let r = r#"{"user":{"id":"1","username":"u"},"guilds":null,"private_channels":null,"read_state":null,"users":null}"#;
+    let Event::Ready(r) = parse("READY", r).unwrap() else { panic!() };
+    assert!(r.guilds.is_empty() && r.private_channels.is_empty() && r.read_state.is_empty() && r.users.is_empty());
+    let r = r#"{"user":{"id":"1","username":"u"},"read_state":{"entries":null},
+        "guilds":[{"id":"2","name":"g","channels":null}],
+        "private_channels":[{"id":"3","type":1,"recipient_ids":null}]}"#;
+    let Event::Ready(r) = parse("READY", r).unwrap() else { panic!() };
+    assert!(r.guilds[0].channels.is_empty() && r.private_channels[0].recipient_ids.is_empty() && r.read_state.is_empty());
+    let m = r#"{"id":"1","channel_id":"2","author":{"id":"3"},"timestamp":"t","mentions":null,"attachments":null}"#;
+    let Event::MessageCreate(m) = parse("MESSAGE_CREATE", m).unwrap() else { panic!() };
+    assert!(m.mentions.is_empty() && m.attachments.is_empty());
 }

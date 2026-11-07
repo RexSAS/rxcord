@@ -1,6 +1,6 @@
 //! Async websocket driver around the sans-IO `Session`. Never logs the token or Send payloads.
 use super::session::{Action, Session};
-use crate::{backoff::backoff, client_props, event::Event, inflate::Inflater};
+use crate::{backoff::reconnect_delay, client_props, event::Event, inflate::Inflater};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -30,15 +30,20 @@ pub enum ConnStatus {
     Connected,
     Reconnecting { attempt: u32 },
     AuthFailed,
+    /// Discord closed with a code that reconnecting won't fix; the gateway has stopped.
+    Fatal(u16),
+    /// READY could not be parsed; the connection stays up.
+    ReadyFailed,
 }
 
 enum Outcome {
-    Reconnect,
+    Reconnect { resume: bool },
     AuthFailed,
+    Fatal(u16),
     Closed, // receiver dropped
 }
 
-/// Typed gateway loop; runs until `AuthFailed` or `tx` is closed.
+/// Typed gateway loop; runs until `AuthFailed`, `Fatal` or `tx` is closed.
 pub async fn run_gateway(token: String, tx: Sender<GatewayEvent>) {
     run(token, tx, |_| {}, DEFAULT_URL).await;
 }
@@ -85,7 +90,7 @@ async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&st
                 }
                 connection(ws, &mut session, &tx, &mut on_raw, &mut got_dispatch).await
             }
-            None => Outcome::Reconnect,
+            None => Outcome::Reconnect { resume: true },
         };
         if got_dispatch {
             attempt = 0;
@@ -96,14 +101,19 @@ async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&st
                 emit(&tx, GatewayEvent::Status(ConnStatus::AuthFailed)).await;
                 return;
             }
-            Outcome::Reconnect => {
+            Outcome::Fatal(code) => {
+                tracing::warn!(code, "gateway closed with a fatal code");
+                emit(&tx, GatewayEvent::Status(ConnStatus::Fatal(code))).await;
+                return;
+            }
+            Outcome::Reconnect { resume } => {
                 attempt += 1;
                 if !emit(&tx, GatewayEvent::Status(ConnStatus::Reconnecting { attempt })).await {
                     return;
                 }
                 // Op 7 also backs off (attempt is 0 after a healthy session, so the delay is the minimum).
                 tokio::select! {
-                    _ = sleep(backoff(attempt - 1, rand::random())) => {}
+                    _ = sleep(reconnect_delay(attempt - 1, resume, rand::random(), rand::random())) => {}
                     _ = tx.closed() => return,
                 }
             }
@@ -156,7 +166,7 @@ async fn connection(
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => {
                             tracing::warn!("inflate failed: {e}");
-                            return Outcome::Reconnect;
+                            return Outcome::Reconnect { resume: true };
                         }
                     },
                     Some(Ok(Message::Close(f))) => Err(session.on_close(f.map(|f| u16::from(f.code)))),
@@ -183,7 +193,7 @@ async fn connection(
             match a {
                 Action::Send(s) => {
                     if ws.send(Message::text(s)).await.is_err() {
-                        return Outcome::Reconnect;
+                        return Outcome::Reconnect { resume: true };
                     }
                 }
                 Action::Dispatch(e) => {
@@ -192,11 +202,17 @@ async fn connection(
                         return Outcome::Closed;
                     }
                 }
-                Action::Reconnect { .. } => {
+                Action::Reconnect { resume } => {
                     let _ = ws.close(None).await;
-                    return Outcome::Reconnect;
+                    return Outcome::Reconnect { resume };
                 }
                 Action::AuthFailed => return Outcome::AuthFailed,
+                Action::Fatal(c) => return Outcome::Fatal(c),
+                Action::ReadyFailed => {
+                    if !emit(tx, GatewayEvent::Status(ConnStatus::ReadyFailed)).await {
+                        return Outcome::Closed;
+                    }
+                }
             }
         }
     }

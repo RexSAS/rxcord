@@ -10,6 +10,10 @@ pub enum Action {
     Dispatch(Event),
     Reconnect { resume: bool },
     AuthFailed,
+    /// Close code that reconnecting won't fix (bad shard/intents/version).
+    Fatal(u16),
+    /// READY arrived but couldn't be parsed: the account data is missing.
+    ReadyFailed,
 }
 
 // Send carries Identify/Resume (with the token), so its payload is never printed.
@@ -20,6 +24,8 @@ impl fmt::Debug for Action {
             Action::Dispatch(e) => f.debug_tuple("Dispatch").field(e).finish(),
             Action::Reconnect { resume } => f.debug_struct("Reconnect").field("resume", resume).finish(),
             Action::AuthFailed => f.write_str("AuthFailed"),
+            Action::Fatal(c) => write!(f, "Fatal({c})"),
+            Action::ReadyFailed => f.write_str("ReadyFailed"),
         }
     }
 }
@@ -94,6 +100,7 @@ impl Session {
     pub fn on_close(&mut self, code: Option<u16>) -> Action {
         match code {
             Some(4004) => Action::AuthFailed,
+            Some(c @ 4010..=4014) => Action::Fatal(c),
             Some(4007 | 4009) => {
                 self.clear();
                 Action::Reconnect { resume: false }
@@ -183,7 +190,7 @@ impl Session {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("malformed {name}: {e}");
-                return vec![];
+                return if name == "READY" { vec![Action::ReadyFailed] } else { vec![] };
             }
         };
         vec![Action::Dispatch(event)]
@@ -277,7 +284,7 @@ mod tests {
         let a = s.on_text(&json!({"op":1,"d":null}).to_string());
         assert_eq!(sent(&a, 0), json!({"op":1,"d":5}));
         assert!(s.on_text("garbage").is_empty());
-        assert!(s.on_text(&json!({"op":0,"t":"READY","s":6,"d":"bad"}).to_string()).is_empty());
+        assert!(s.on_text(&json!({"op":0,"t":"GUILD_CREATE","s":6,"d":"bad"}).to_string()).is_empty());
     }
 
     #[test]
@@ -287,6 +294,10 @@ mod tests {
         assert!(matches!(s.on_close(None), Action::Reconnect { resume: true }));
         assert!(matches!(s.on_close(Some(4007)), Action::Reconnect { resume: false }));
         assert_eq!(s.resume_url(), None);
+        for code in 4010..=4014 {
+            assert!(matches!(s.on_close(Some(code)), Action::Fatal(c) if c == code));
+        }
+        assert!(matches!(s.on_close(Some(4015)), Action::Reconnect { resume: true }));
     }
 
     #[test]
@@ -309,7 +320,7 @@ mod tests {
     fn ready_session_info_survives_bad_ready_body() {
         let mut s = Session::new(TOKEN.into());
         let r = json!({"op":0,"t":"READY","s":3,"d":{"user":"bad","session_id":"sess","resume_gateway_url":"wss://r"}});
-        assert!(s.on_text(&r.to_string()).is_empty());
+        assert!(matches!(s.on_text(&r.to_string()).as_slice(), [Action::ReadyFailed]));
         assert_eq!(s.resume_url(), Some("wss://r"));
         let v = sent(&s.on_text(&hello()), 0);
         assert_eq!((v["op"].as_u64(), v["d"]["seq"].as_u64()), (Some(6), Some(3)));

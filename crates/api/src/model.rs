@@ -1,6 +1,11 @@
 use crate::id::Id;
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Discord sometimes sends `null` for an empty list; treat it like a missing field.
+pub(crate) fn null_as_default<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 fn unknown_user() -> String {
     "Unknown user".into()
 }
@@ -35,7 +40,7 @@ pub struct Channel {
     pub position: i32,
     #[serde(default)]
     pub parent_id: Option<Id>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub recipient_ids: Vec<Id>,
     #[serde(default)]
     pub last_message_id: Option<Id>,
@@ -56,7 +61,7 @@ struct RawGuild {
     name: Option<String>,
     icon: Option<String>,
     properties: Option<GuildProps>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     channels: Vec<Channel>,
 }
 
@@ -111,9 +116,9 @@ pub struct Message {
     pub timestamp: String,
     #[serde(default)]
     pub edited_timestamp: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub attachments: Vec<Attachment>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub mentions: Vec<User>,
     #[serde(default)]
     pub mention_everyone: bool,
@@ -162,13 +167,13 @@ pub struct ReadStateEntry {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Ready {
     pub user: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub guilds: Vec<Guild>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub private_channels: Vec<Channel>,
     #[serde(default, deserialize_with = "read_state")]
     pub read_state: Vec<ReadStateEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub users: Vec<User>,
     #[serde(default)]
     pub session_id: String,
@@ -181,9 +186,13 @@ fn read_state<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ReadStateEntry>, D:
     #[serde(untagged)]
     enum R {
         List(Vec<ReadStateEntry>),
-        Wrapped { entries: Vec<ReadStateEntry> },
+        Wrapped {
+            #[serde(default, deserialize_with = "null_as_default")]
+            entries: Vec<ReadStateEntry>,
+        },
     }
-    Ok(match R::deserialize(d)? {
-        R::List(v) | R::Wrapped { entries: v } => v,
+    Ok(match Option::<R>::deserialize(d)? {
+        Some(R::List(v) | R::Wrapped { entries: v }) => v,
+        None => vec![],
     })
 }

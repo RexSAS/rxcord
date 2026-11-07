@@ -2,7 +2,9 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
-pub const CAPABILITIES: u64 = 30717; // UPDATE FROM OFFICIAL CLIENT
+// Bits 256 (auth token refresh) and 16384 (passive guild update v2) are cleared: rxcord implements
+// neither. Re-enable only with support.
+pub const CAPABILITIES: u64 = 30717 & !(256 | 16384); // UPDATE FROM OFFICIAL CLIENT
 pub const CLIENT_BUILD_NUMBER: u64 = 380000; // UPDATE FROM OFFICIAL CLIENT
 pub const CLIENT_VERSION: &str = "1.0.9200"; // UPDATE FROM OFFICIAL CLIENT
 const ELECTRON_VERSION: &str = "37.6.0"; // UPDATE FROM OFFICIAL CLIENT
@@ -59,5 +61,7 @@ mod tests {
         assert_eq!(v["client_build_number"], CLIENT_BUILD_NUMBER);
         assert!(user_agent().contains("Electron/"));
         assert_eq!(base_headers().len(), 3);
+        assert_eq!(CAPABILITIES & (256 | 16384), 0);
+        assert_eq!(CAPABILITIES, 14077);
     }
 }

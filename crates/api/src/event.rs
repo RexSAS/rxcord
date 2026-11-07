@@ -8,7 +8,8 @@ pub enum Event {
     Ready(Box<Ready>),
     Resumed,
     GuildCreate(Guild),
-    GuildDelete { id: Id },
+    /// `unavailable`: an outage, not a leave; the guild comes back with GUILD_CREATE.
+    GuildDelete { id: Id, unavailable: bool },
     ChannelCreate(Channel),
     ChannelUpdate(Channel),
     ChannelDelete(Channel),
@@ -20,8 +21,10 @@ pub enum Event {
 }
 
 #[derive(Deserialize)]
-struct IdOnly {
+struct GuildGone {
     id: Id,
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
+    unavailable: bool,
 }
 
 #[derive(Deserialize)]
@@ -42,7 +45,10 @@ pub fn parse_dispatch(name: &str, data: &RawValue) -> Result<Event, serde_json::
         "READY" => Event::Ready(Box::new(serde_json::from_str(d)?)),
         "RESUMED" => Event::Resumed,
         "GUILD_CREATE" => Event::GuildCreate(serde_json::from_str(d)?),
-        "GUILD_DELETE" => Event::GuildDelete { id: serde_json::from_str::<IdOnly>(d)?.id },
+        "GUILD_DELETE" => {
+            let x: GuildGone = serde_json::from_str(d)?;
+            Event::GuildDelete { id: x.id, unavailable: x.unavailable }
+        }
         "CHANNEL_CREATE" => Event::ChannelCreate(serde_json::from_str(d)?),
         "CHANNEL_UPDATE" => Event::ChannelUpdate(serde_json::from_str(d)?),
         "CHANNEL_DELETE" => Event::ChannelDelete(serde_json::from_str(d)?),
