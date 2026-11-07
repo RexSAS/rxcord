@@ -89,7 +89,7 @@ async fn join_invite_sends_session_and_context() {
         .await;
     let r = Rest::with_base("tok".into(), s.uri());
     let ctx = InviteContext { guild: None, channel: Id(5), channel_type: 1, message: Id(6) };
-    let g = r.join_invite("abc-1", "sess", ctx).await.unwrap();
+    let g = r.join_invite("abc-1", "sess", ctx, None).await.unwrap();
     assert_eq!(g, Some(JoinedGuild { id: Id(77), name: "Cool".into() }));
     let req = &s.received_requests().await.unwrap()[0];
     let props = req.headers.get("X-Context-Properties").unwrap().to_str().unwrap();
@@ -97,7 +97,7 @@ async fn join_invite_sends_session_and_context() {
     assert_eq!(v, json!({"location": "Invite Button Embed", "location_guild_id": null, "location_channel_id": "5",
         "location_channel_type": 1, "location_message_id": "6"}));
     // a code that isn't URL-safe never reaches the network
-    assert!(r.join_invite("../users/@me", "sess", ctx).await.is_err());
+    assert!(r.join_invite("../users/@me", "sess", ctx, None).await.is_err());
 }
 
 #[tokio::test]
@@ -110,7 +110,24 @@ async fn captcha_is_recognised() {
         .await;
     let r = Rest::with_base("tok".into(), s.uri());
     let ctx = InviteContext { guild: Some(Id(1)), channel: Id(5), channel_type: 0, message: Id(6) };
-    let e = r.join_invite("abc", "sess", ctx).await.unwrap_err();
+    let e = r.join_invite("abc", "sess", ctx, None).await.unwrap_err();
     assert!(e.is_captcha());
     assert!(!ApiError::Http { status: 400, body: "{}".into() }.is_captcha());
+}
+
+#[tokio::test]
+async fn join_invite_sends_captcha_answer() {
+    use rxcord_api::rest::{CaptchaAnswer, InviteContext};
+    let s = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("X-Captcha-Key", "solved"))
+        .and(header("X-Captcha-Rqtoken", "rq"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"guild":{"id":"1"}}"#, "application/json"))
+        .expect(1)
+        .mount(&s)
+        .await;
+    let r = Rest::with_base("tok".into(), s.uri());
+    let ctx = InviteContext { guild: None, channel: Id(5), channel_type: 1, message: Id(6) };
+    let a = CaptchaAnswer { key: "solved".into(), rqtoken: Some("rq".into()), session_id: None };
+    assert!(r.join_invite("abc", "sess", ctx, Some(&a)).await.is_ok());
 }

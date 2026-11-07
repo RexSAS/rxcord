@@ -102,6 +102,11 @@ fn row_error(ui: &AppWindow, id: Id, msg: &str) {
     ui.set_row_error_ok(false);
 }
 
+/// Opens an http(s) URL in the default browser (through the UI's open-url handler, which checks the scheme).
+pub fn open_url(ui: &Weak<AppWindow>, url: String) {
+    with_ui(ui, move |ui| ui.invoke_open_url(url.into()));
+}
+
 /// A note under message `id` (`ok`: green), e.g. the result of joining an invite. `open`: also open
 /// this https URL in the browser.
 pub fn row_note(ui: &Weak<AppWindow>, id: Id, msg: String, ok: bool, open: Option<String>) {

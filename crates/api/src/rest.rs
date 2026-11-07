@@ -17,6 +17,14 @@ pub struct InviteContext {
     pub message: Id,
 }
 
+/// A solved captcha, sent back with the retried request.
+#[derive(Debug, Clone, Default)]
+pub struct CaptchaAnswer {
+    pub key: String,
+    pub rqtoken: Option<String>,
+    pub session_id: Option<String>,
+}
+
 /// The guild joined via an invite (only what the app shows).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct JoinedGuild {
@@ -83,7 +91,13 @@ impl Rest {
     }
 
     /// Joins the guild of invite `code`. `None` guild: Discord didn't say which (the gateway will).
-    pub async fn join_invite(&self, code: &str, session_id: &str, ctx: InviteContext) -> Result<Option<JoinedGuild>, ApiError> {
+    pub async fn join_invite(
+        &self,
+        code: &str,
+        session_id: &str,
+        ctx: InviteContext,
+        captcha: Option<&CaptchaAnswer>,
+    ) -> Result<Option<JoinedGuild>, ApiError> {
         if !valid_invite_code(code) {
             return Err(ApiError::Http { status: 404, body: "invalid invite code".into() });
         }
@@ -94,7 +108,12 @@ impl Rest {
             "location_channel_type": ctx.channel_type,
             "location_message_id": ctx.message.to_string(),
         });
-        let extra = [("X-Context-Properties", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, props.to_string()))];
+        let mut extra = vec![("X-Context-Properties", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, props.to_string()))];
+        if let Some(c) = captcha {
+            extra.push(("X-Captcha-Key", c.key.clone()));
+            extra.extend(c.rqtoken.clone().map(|t| ("X-Captcha-Rqtoken", t)));
+            extra.extend(c.session_id.clone().map(|t| ("X-Captcha-Session-Id", t)));
+        }
         let body = self.send_with(Method::POST, "POST /invites".into(), format!("/invites/{code}"), Some(json!({"session_id": session_id})), &extra).await?;
         Ok(serde_json::from_slice::<InviteJoin>(&body)?.guild)
     }

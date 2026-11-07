@@ -49,7 +49,10 @@ enum Done {
     Edited(Id, Result<Box<Message>, ApiError>),
     Deleted { channel_id: Id, id: Id, result: Result<(), ApiError> },
     QrToken(Result<String, ApiError>),
-    Joined { message: Id, code: String, result: Result<Option<JoinedGuild>, ApiError> },
+    /// `captcha`: this attempt already carried a solved captcha (don't ask again).
+    Joined { message: Id, code: String, ctx: InviteContext, captcha: bool, result: Result<Option<JoinedGuild>, ApiError> },
+    /// The local captcha page failed or nobody solved it.
+    CaptchaFailed { message: Id, code: String, error: String },
 }
 
 enum Input {
@@ -292,8 +295,8 @@ impl Runtime {
                 let session = self.session_id.clone();
                 bridge::row_note(&self.ui, message, "Joining…".into(), true, None);
                 self.tasks.spawn(async move {
-                    let result = rest.join_invite(&code, &session, ctx).await;
-                    Done::Joined { message, code, result }
+                    let result = rest.join_invite(&code, &session, ctx, None).await;
+                    Done::Joined { message, code, ctx, captcha: false, result }
                 });
             }
             Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
@@ -313,6 +316,21 @@ impl Runtime {
         if let Some(id) = next {
             self.maybe_ack(id);
         }
+    }
+
+    /// Last resort for a captcha: the invite in a Firefox private window, where the user logs in as this
+    /// account (a normal window would join with whatever account is logged in there).
+    async fn captcha_fallback(&mut self, message: Id, code: &str, why: &str) {
+        let me = self.store.me().map(|u| u.username.clone()).unwrap_or_default();
+        let url = crate::invite::invite_url(code);
+        let u = url.clone();
+        let private = tokio::task::spawn_blocking(move || crate::invite::open_private(&u)).await.unwrap_or(false);
+        let (msg, open) = if private {
+            (format!("{why} In the private window that opened, log in as {me}, then join."), None)
+        } else {
+            (format!("{why} Open the invite in a private window, log in as {me}, then join."), Some(url))
+        };
+        bridge::row_note(&self.ui, message, msg, false, open);
     }
 
     fn used_guild(&self, g: Id) {
@@ -496,19 +514,31 @@ impl Runtime {
                 let msg = name.map_or("Joined the server".into(), |n| format!("Joined {n}"));
                 return bridge::row_note(&self.ui, message, msg, true, None);
             }
-            Done::Joined { message, code, result: Err(e) } if e.is_captcha() => {
-                // rxcord can't show a captcha. Joining in a normal browser window would use whatever
-                // account is logged in there, so a private window, where the user logs in as this account.
-                let me = self.store.me().map(|u| u.username.clone()).unwrap_or_default();
-                let url = crate::invite::invite_url(&code);
-                let u = url.clone();
-                let private = tokio::task::spawn_blocking(move || crate::invite::open_private(&u)).await.unwrap_or(false);
-                let (msg, open) = if private {
-                    (format!("Discord wants a captcha. In the private window that opened, log in as {me}, then join."), None)
-                } else {
-                    (format!("Discord wants a captcha. Open the invite in a private window, log in as {me}, then join."), Some(url))
-                };
-                return bridge::row_note(&self.ui, message, msg, false, open);
+            Done::Joined { message, code, ctx, captcha: false, result: Err(ApiError::Http { status: 400, body }) }
+                if let Some(ch) = crate::captcha::parse_challenge(&body) =>
+            {
+                // Shown on a local page in the browser; the solved token comes back here and the join is retried.
+                let (Some(rest), ui, session) = (self.rest.clone(), self.ui.clone(), self.session_id.clone()) else { return };
+                bridge::row_note(&self.ui, message, "Discord wants a captcha: solve it in the browser tab that opened".into(), true, None);
+                self.tasks.spawn(async move {
+                    let ready = |url: String| bridge::open_url(&ui, url);
+                    match crate::captcha::solve(ch, ready).await {
+                        Ok(answer) => {
+                            bridge::row_note(&ui, message, "Joining…".into(), true, None);
+                            let result = rest.join_invite(&code, &session, ctx, Some(&answer)).await;
+                            Done::Joined { message, code, ctx, captcha: true, result }
+                        }
+                        Err(error) => Done::CaptchaFailed { message, code, error },
+                    }
+                });
+                return;
+            }
+            Done::CaptchaFailed { message, code, error } => {
+                tracing::warn!("captcha: {error}");
+                return self.captcha_fallback(message, &code, &format!("The captcha didn't work: {error}.")).await;
+            }
+            Done::Joined { message, code, result: Err(e), .. } if e.is_captcha() => {
+                return self.captcha_fallback(message, &code, "Discord still wants a captcha.").await;
             }
             Done::Joined { message, result: Err(e), .. } => {
                 let msg = match &e {
