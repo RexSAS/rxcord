@@ -16,6 +16,7 @@ use tokio_tungstenite::{
     },
 };
 
+const DEFAULT_URL: &str = "wss://gateway.discord.gg";
 const QUERY: &str = "/?encoding=json&v=9&compress=zlib-stream";
 
 pub enum GatewayEvent {
@@ -39,7 +40,7 @@ enum Outcome {
 
 /// Typed gateway loop; runs until `AuthFailed` or `tx` is closed.
 pub async fn run_gateway(token: String, tx: Sender<GatewayEvent>) {
-    run(token, tx, |_| {}).await;
+    run(token, tx, |_| {}, DEFAULT_URL).await;
 }
 
 /// Like `run_gateway` but forwards every raw op-0 frame as (event name, `d`) before typed parsing.
@@ -60,7 +61,7 @@ pub async fn run_gateway_raw(token: String, tx: Sender<(String, Box<RawValue>)>)
         }
     };
     tokio::select! {
-        _ = run(token, etx, hook) => {}
+        _ = run(token, etx, hook, DEFAULT_URL) => {}
         _ = tx.closed() => {}
     }
 }
@@ -69,7 +70,7 @@ async fn emit(tx: &Sender<GatewayEvent>, ev: GatewayEvent) -> bool {
     tx.send(ev).await.is_ok()
 }
 
-async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&str)) {
+async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&str), url: &str) {
     let mut session = Session::new(token);
     let mut attempt = 0u32;
     loop {
@@ -77,7 +78,7 @@ async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&st
             return;
         }
         let mut got_dispatch = false;
-        let outcome = match connect(&session).await {
+        let outcome = match connect(&session, url).await {
             Some(ws) => {
                 if !emit(&tx, GatewayEvent::Status(ConnStatus::Connected)).await {
                     return;
@@ -101,7 +102,10 @@ async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&st
                     return;
                 }
                 // Op 7 also backs off (attempt is 0 after a healthy session, so the delay is the minimum).
-                sleep(backoff(attempt - 1, rand::random())).await;
+                tokio::select! {
+                    _ = sleep(backoff(attempt - 1, rand::random())) => {}
+                    _ = tx.closed() => return,
+                }
             }
         }
     }
@@ -109,10 +113,10 @@ async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&st
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(session: &Session) -> Option<Ws> {
+async fn connect(session: &Session, default_url: &str) -> Option<Ws> {
     let url = match session.resume_url() {
         Some(u) => format!("{}{QUERY}", u.trim_end_matches('/')),
-        None => format!("wss://gateway.discord.gg{QUERY}"),
+        None => format!("{default_url}{QUERY}"),
     };
     let mut req = url.into_client_request().ok()?;
     for (k, v) in client_props::base_headers() {
@@ -138,6 +142,7 @@ async fn connection(
     let mut next_hb: Option<Instant> = None;
     loop {
         let actions = tokio::select! {
+            _ = tx.closed() => return Outcome::Closed,
             _ = async { sleep_until(next_hb.unwrap()).await }, if next_hb.is_some() => {
                 let interval = session.heartbeat_interval().unwrap_or(Duration::from_secs(40));
                 next_hb = Some(next_hb.unwrap() + interval);
@@ -194,5 +199,26 @@ async fn connection(
                 Action::AuthFailed => return Outcome::AuthFailed,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn tls_provider_available() {
+        // Panics if rustls has no crypto provider compiled in (what connect_async would hit).
+        rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore::empty()).with_no_client_auth();
+    }
+
+    #[tokio::test]
+    async fn stops_during_backoff_when_receiver_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let h = tokio::spawn(run("t".into(), tx, |_| {}, "ws://127.0.0.1:1"));
+        while !matches!(rx.recv().await, Some(GatewayEvent::Status(ConnStatus::Reconnecting { .. }))) {}
+        drop(rx); // backoff sleep is >= 0.5s; it must end promptly
+        tokio::time::timeout(Duration::from_millis(300), h).await.unwrap().unwrap();
     }
 }

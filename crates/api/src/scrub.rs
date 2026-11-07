@@ -1,8 +1,9 @@
 use serde_json::Value;
 
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 25] = [
     "token", "email", "phone", "content", "username", "global_name", "name", "topic", "avatar", "icon", "banner",
-    "bio", "url", "proxy_url", "filename",
+    "bio", "url", "proxy_url", "filename", "nick", "display_name", "pronouns", "description", "analytics_token",
+    "session_id", "auth_session_id_hash", "state", "text", "resume_gateway_url",
 ];
 
 /// Redacts personal string values (by key name) in place, recursively.
@@ -29,10 +30,10 @@ mod tests {
 
     #[test]
     fn scrub_redacts_nested() {
-        let mut v = json!({"id": "1", "content": "hi", "author": {"email": "a@b", "name": "n", "id": "2"},
+        let mut v = json!({"id": "1", "content": "hi", "author": {"email": "a@b", "name": "n", "id": "2", "nick": "k", "session_id": "s"},
             "list": [{"content": "c", "id": "3"}]});
         scrub(&mut v);
-        assert_eq!(v, json!({"id": "1", "content": "x", "author": {"email": "x", "name": "x", "id": "2"},
+        assert_eq!(v, json!({"id": "1", "content": "x", "author": {"email": "x", "name": "x", "id": "2", "nick": "x", "session_id": "x"},
             "list": [{"content": "x", "id": "3"}]}));
     }
 }
