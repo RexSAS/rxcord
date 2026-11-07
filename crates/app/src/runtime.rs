@@ -16,8 +16,8 @@ use rxcord_voice::session::LeaveReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Duration, Instant};
 
 pub enum Command {
     LoginToken(String),
@@ -47,11 +47,12 @@ pub enum Command {
     JoinVoice(Id),
     /// The voice bar's hang-up.
     LeaveVoice,
+    /// The window closed: leave voice, let the gateway send that, then stop (main.rs waits for it).
+    Quit,
 }
 
 /// Results of tasks spawned on the runtime, handled back on the loop.
 enum Done {
-    Nothing,
     History { channel: Id, generation: u64, before: Option<Id>, result: Result<Vec<Message>, ApiError> },
     Acked(Id, Id, Result<(), ApiError>),
     AckDue(Id),
@@ -77,9 +78,13 @@ enum Input {
 
 /// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
 /// `last_guild` (0 = none): expanded on login, updated as guilds are used; main.rs saves it on exit.
-pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_guild: Arc<AtomicU64>) -> UnboundedSender<Command> {
+pub fn spawn_runtime(
+    ui: slint::Weak<AppWindow>,
+    focused: Arc<AtomicBool>,
+    last_guild: Arc<AtomicU64>,
+) -> (UnboundedSender<Command>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("rxcord-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
@@ -90,10 +95,11 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_
             }
             let session_id = String::new();
             let (voice, conn) = (Controller::default(), None);
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn }.run(rx));
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn }.run(rx));
+            rt.shutdown_timeout(Duration::from_millis(200)); // don't wait out blocking tasks on exit
         })
         .expect("spawn runtime thread");
-    tx
+    (tx, thread)
 }
 
 struct Runtime {
@@ -103,6 +109,8 @@ struct Runtime {
     gw: Option<mpsc::Receiver<GatewayEvent>>,
     /// Main-gateway commands (voice state).
     gw_cmds: Option<mpsc::Sender<GatewayCmd>>,
+    /// `run_gateway`, outside `tasks`: ending a session lets it flush `gw_cmds` first.
+    gw_task: Option<JoinHandle<()>>,
     qr: Option<mpsc::Receiver<QrStatus>>,
     /// Session tasks; replacing the set aborts them all (logout, new login).
     tasks: JoinSet<Done>,
@@ -124,6 +132,27 @@ async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
     match r {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// How long an ending gateway may take to send its queued commands (op 4 null) before it's aborted.
+const GATEWAY_FLUSH: Duration = Duration::from_millis(500);
+
+/// Waits (bounded) for the gateway to send what's queued and stop after its commands closed. Its events
+/// keep being taken meanwhile: it may be blocked handing one over before it reads its commands.
+async fn finish_gateway(mut task: JoinHandle<()>, mut gw: Option<mpsc::Receiver<GatewayEvent>>) {
+    let done = tokio::time::timeout(GATEWAY_FLUSH, async {
+        loop {
+            tokio::select! {
+                _ = &mut task => return,
+                e = recv_opt(&mut gw) => if e.is_none() { gw = None },
+            }
+        }
+    })
+    .await;
+    if done.is_err() {
+        tracing::warn!("gateway didn't stop in time");
+        task.abort();
     }
 }
 
@@ -167,8 +196,8 @@ impl Runtime {
         loop {
             let input = tokio::select! {
                 c = cmds.recv() => match c {
+                    Some(Command::Quit) | None => return self.quit().await, // UI gone
                     Some(c) => Input::Cmd(c),
-                    None => return, // UI gone
                 },
                 g = recv_opt(&mut self.gw) => Input::Gw(g),
                 q = recv_opt(&mut self.qr) => Input::Qr(q),
@@ -207,19 +236,33 @@ impl Runtime {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         self.gw_cmds = Some(cmd_tx);
         self.with_ui(|ui| ui.set_connecting(true)); // until READY shows the app
-        self.tasks.spawn(async move {
-            run_gateway(token, tx, cmd_rx).await;
-            Done::Nothing
-        });
+        self.gw_task = Some(tokio::spawn(run_gateway(token, tx, cmd_rx)));
     }
 
-    /// Dropping the gateway receiver stops `run_gateway`; dropping the task set aborts everything else.
-    fn end_session(&mut self) {
-        let fx = self.voice.hang_up(); // while the gateway can still send it
+    /// Closing its commands stops `run_gateway` once it has sent them (bounded, see `finish_gateway`);
+    /// returns the wait. Nothing to wait for without a gateway.
+    fn close_gateway(&mut self) -> Option<JoinHandle<()>> {
+        self.gw_cmds = None;
+        let task = self.gw_task.take()?;
+        Some(tokio::spawn(finish_gateway(task, self.gw.take())))
+    }
+
+    async fn quit(&mut self) {
+        let fx = self.voice.hang_up();
         self.voice_effects(fx);
+        if let Some(wait) = self.close_gateway() {
+            let _ = wait.await;
+        }
+    }
+
+    /// Hangs up voice (op 4 null is queued first, then the gateway flushes it and stops); dropping the
+    /// task set aborts everything else.
+    fn end_session(&mut self) {
+        let fx = self.voice.hang_up();
+        self.voice_effects(fx);
+        self.close_gateway();
         self.tasks = JoinSet::new();
         self.gw = None;
-        self.gw_cmds = None;
         self.qr = None;
         self.rest = None;
         // Unsent text goes back into the drafts, never auto-sent: the next login may be another account.
@@ -364,6 +407,7 @@ impl Runtime {
                 let fx = self.voice.hang_up();
                 self.voice_effects(fx);
             }
+            Command::Quit => {} // handled in `run`
             Command::InstallUpdate => drop(self.update_tx.send(())),
             Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
         }
@@ -610,7 +654,6 @@ impl Runtime {
 
     async fn done(&mut self, d: Done) {
         let err = match d {
-            Done::Nothing => return,
             Done::History { channel, generation, before, result: Ok(msgs) } => {
                 let changes = self.nav.history_page(&mut self.store, channel, generation, before, msgs);
                 return self.changed(changes.unwrap_or_default());
@@ -718,5 +761,35 @@ impl Runtime {
             ApiError::Unauthorized => self.logout("Session expired. Please log in again.").await,
             e => tracing::warn!("request failed: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn finish_gateway_drains_events_until_the_driver_stops() {
+        let (tx, rx) = mpsc::channel(1);
+        // a driver with more events to hand over before it gets to its (closed) commands
+        let task = tokio::spawn(async move {
+            for _ in 0..5 {
+                let _ = tx.send(GatewayEvent::Status(ConnStatus::Connected)).await;
+            }
+        });
+        let t0 = std::time::Instant::now();
+        finish_gateway(task, Some(rx)).await;
+        assert!(t0.elapsed() < GATEWAY_FLUSH, "finished, not timed out");
+    }
+
+    #[tokio::test]
+    async fn finish_gateway_aborts_a_stuck_driver() {
+        let (dropped_tx, dropped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _keep = dropped_tx;
+            std::future::pending::<()>().await
+        });
+        finish_gateway(task, None).await;
+        assert!(dropped.await.is_err(), "aborted: its state was dropped");
     }
 }

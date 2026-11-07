@@ -152,22 +152,25 @@ async fn connection(
 ) -> Outcome {
     let mut inflater = Inflater::new(); // fresh zlib context per connection
     let mut next_hb: Option<Instant> = None;
-    let mut cmds_open = true;
     loop {
         let actions = tokio::select! {
+            // Commands first: on shutdown the app closes `cmds` right after queueing op 4 null, which
+            // must go out before we notice the event receiver going away.
+            biased;
+            c = cmds.recv() => match c {
+                Some(c) => session.command(c).into_iter().collect(),
+                // The app is done with this session: everything queued was sent above.
+                None => {
+                    let _ = ws.close(None).await;
+                    return Outcome::Closed;
+                }
+            },
             _ = tx.closed() => return Outcome::Closed,
             _ = async { sleep_until(next_hb.unwrap()).await }, if next_hb.is_some() => {
                 let interval = session.heartbeat_interval().unwrap_or(Duration::from_secs(40));
                 next_hb = Some(next_hb.unwrap() + interval);
                 session.on_heartbeat_due()
             }
-            c = cmds.recv(), if cmds_open => match c {
-                Some(c) => session.command(c).into_iter().collect(),
-                None => {
-                    cmds_open = false;
-                    continue;
-                }
-            },
             msg = ws.next() => {
                 let text = match msg {
                     Some(Ok(Message::Text(t))) => Ok(t.to_string()),
@@ -245,6 +248,36 @@ mod tests {
         let h = tokio::spawn(run("t".into(), tx, tokio::sync::mpsc::channel(1).1, |_| {}, "ws://127.0.0.1:1"));
         while !matches!(rx.recv().await, Some(GatewayEvent::Status(ConnStatus::Reconnecting { .. }))) {}
         drop(rx); // backoff sleep is >= 0.5s; it must end promptly
+        tokio::time::timeout(Duration::from_millis(300), h).await.unwrap().unwrap();
+    }
+
+    /// Logout while in voice: the app queues op 4 null and drops both channels at once.
+    #[tokio::test]
+    async fn closing_commands_flushes_them_then_stops() {
+        use tokio_tungstenite::accept_async;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(4);
+        let h = tokio::spawn(async move { run("t".into(), tx, cmd_rx, |_| {}, &url).await });
+        let mut ws = accept_async(listener.accept().await.unwrap().0).await.unwrap();
+        ws.send(Message::text(r#"{"op":10,"d":{"heartbeat_interval":45000}}"#)).await.unwrap();
+        let ready = r#"{"op":0,"t":"READY","s":1,"d":{"user":{"id":"1","username":"u"},"session_id":"x","resume_gateway_url":"ws://r"}}"#;
+        ws.send(Message::text(ready)).await.unwrap();
+        while !matches!(rx.recv().await, Some(GatewayEvent::Event(crate::event::Event::Ready(_)))) {}
+        let leave = GatewayCmd::VoiceState { guild_id: Some(crate::id::Id(10)), channel_id: None, self_mute: false, self_deaf: false };
+        cmd_tx.try_send(leave).unwrap();
+        drop((cmd_tx, rx));
+        let mut op4 = vec![];
+        while let Some(Ok(m)) = ws.next().await {
+            match m {
+                Message::Text(t) if t.contains(r#""op":4"#) => op4.push(t.to_string()),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(op4.len(), 1, "{op4:?}");
+        assert!(op4[0].contains(r#""channel_id":null"#), "{}", op4[0]);
         tokio::time::timeout(Duration::from_millis(300), h).await.unwrap().unwrap();
     }
 }

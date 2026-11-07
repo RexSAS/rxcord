@@ -58,7 +58,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // Window focus, shared with the runtime (acks now, notifications in Task 13). Starts false: winit
     // reports Focused(true) when the window gets focus.
     let focused = Arc::new(AtomicBool::new(false));
-    let tx = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild.clone());
+    let (tx, runtime) = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild.clone());
+    let quit = tx.clone();
     let (t, w) = (tx.clone(), ui.as_weak());
     ui.on_update_clicked(move |action| match update::parse_click(&action) {
         Some(update::Click::Install) => drop(t.send(Command::InstallUpdate)),
@@ -161,7 +162,11 @@ fn main() -> Result<(), slint::PlatformError> {
             std::thread::spawn(move || opener::open_browser(&u).map_err(|e| tracing::warn!("open {u}: {e}")));
         }
     });
-    ui.run()
+    let r = ui.run();
+    // Leave voice before the process ends (op 4 null); the runtime bounds this to ~0.5 s.
+    let _ = quit.send(Command::Quit);
+    let _ = runtime.join();
+    r
 }
 
 /// Window size/position, divider and last server, for the next start.
