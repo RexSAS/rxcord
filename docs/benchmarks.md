@@ -43,3 +43,14 @@ ps -o rss= -p $(pgrep -x rxcord)           # RSS in KiB
 SLINT_DEBUG_PERFORMANCE=refresh_lazy,console ./target/release/rxcord   # frame log
 RXCORD_RENDERER=gpu ./target/release/rxcord                            # femtovg instead of software
 ```
+
+## 2026-11-07 — v0.2.0+ (gaming theme, splash), logged in, idle, not in voice (Linux, release build)
+
+| Metric | rxcord |
+|---|---|
+| CPU, 60 s average (`scripts/idle-check`) | 0.00 % of one core |
+| RAM (RSS / PSS) | 50 MB / 41 MB |
+| Threads | 9 |
+| GPU | none: software renderer, no `/dev/dri` handle, no GL/Vulkan libraries loaded |
+
+Official Discord was not installed on this machine, so no same-machine comparison yet; published figures: ~300–600 MB RAM idle in third-party tests, "normal usage under 1 GB" per Discord (2025). In-call CPU and the in-game FPS comparison are still manual (see `docs/stage1-checks.md`).
