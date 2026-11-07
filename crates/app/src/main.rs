@@ -1,4 +1,5 @@
 mod bridge;
+mod compose;
 #[cfg(debug_assertions)]
 mod demo;
 mod markdown;
@@ -7,6 +8,7 @@ mod runtime;
 mod token;
 mod view;
 
+use compose::OutgoingError;
 use rxcord_api::id::Id;
 use runtime::Command;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
@@ -50,8 +52,46 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_load_older(move || drop(selected(&w).map(|c| t.send(Command::LoadOlder(c)))));
     let (t, w) = (tx.clone(), ui.as_weak());
     ui.on_retry(move || drop(selected(&w).map(|c| t.send(Command::OpenChannel(c)))));
+    let (t, w) = (tx.clone(), ui.as_weak());
+    ui.on_send(move |text| {
+        if let Some(ui) = w.upgrade() {
+            send(&ui, &t, &text);
+        }
+    });
+    let t = tx.clone();
+    ui.on_start_edit(move |m| drop(t.send(Command::StartEdit(id(m)))));
+    let (t, w) = (tx.clone(), ui.as_weak());
+    ui.on_delete_message(move |m| {
+        if let (Some(channel), Some(message)) = (selected(&w), id(m)) {
+            let _ = t.send(Command::Delete { channel, message });
+        }
+    });
+    let t = tx.clone();
+    ui.on_retry_send(move |n| drop(t.send(Command::Retry(n.into()))));
     let t = tx.clone();
     ui.on_bottom_visible(move |b| drop(t.send(Command::BottomVisible(b))));
     ui.on_thumb_visible(move |u| drop(tx.send(Command::ThumbVisible(u.into()))));
     ui.run()
+}
+
+/// Composer submit: a new message leaves the composer at once (it shows as a pending row); an edit keeps
+/// the composer in edit mode until the runtime reports the result.
+fn send(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Command>, text: &str) {
+    let id = |s: slint::SharedString| s.parse().ok().map(Id);
+    let Some(channel) = id(ui.get_selected_channel()) else { return };
+    let content = match compose::validate_outgoing(text) {
+        Ok(c) => c.to_string(),
+        Err(OutgoingError::Empty) => return,
+        Err(OutgoingError::TooLong(n)) => {
+            return ui.set_composer_error(format!("Message is too long ({n}/{}).", compose::MAX_CHARS).into());
+        }
+    };
+    ui.set_composer_error("".into());
+    if let Some(message) = id(ui.get_edit_id()) {
+        let _ = tx.send(Command::Edit { channel, message, content });
+        return;
+    }
+    let _ = tx.send(Command::Send { channel, content, reply_to: id(ui.get_reply_id()) });
+    ui.set_composer_text("".into());
+    ui.set_reply_id("".into());
 }

@@ -1,5 +1,6 @@
 //! Per-session navigation state and the pure rules for history paging and read acks.
 use crate::view::MessageRow;
+use rxcord_api::ApiError;
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
 use rxcord_store::{Change, Store};
@@ -114,6 +115,17 @@ impl Nav {
         }
         self.in_flight.remove(&ch);
         true
+    }
+
+    /// A history request of `ch` failed: the notice to show, if the channel is open with nothing loaded.
+    pub fn history_failed(&mut self, s: &Store, ch: Id, generation: u64, e: &ApiError) -> Option<&'static str> {
+        if !self.finish_request(ch, generation) || self.selected != Some(ch) || !s.messages(ch).is_empty() {
+            return None;
+        }
+        Some(match e {
+            ApiError::Http { status: 403, .. } => "You don't have access to this channel",
+            _ => "Couldn't load messages — click to retry",
+        })
     }
 
     /// Decides (and records) an ack for `ch`. Needs the channel selected, loaded, on screen and the window focused.

@@ -285,6 +285,13 @@ impl Store {
         p.failed = true;
         Some(Change::Messages(p.channel))
     }
+    /// Clears the failed flag for a resend with the same nonce and returns the entry to resend;
+    /// `None` unless it had failed (a send still in flight is not sent twice).
+    pub fn retry_pending(&mut self, nonce: &str) -> Option<Pending> {
+        let p = self.pending.iter_mut().find(|p| p.nonce == nonce && p.failed)?;
+        p.failed = false;
+        Some(p.clone())
+    }
     pub fn take_pending(&mut self, nonce: &str) -> Option<Pending> {
         let i = self.pending.iter().position(|p| p.nonce == nonce)?;
         Some(self.pending.remove(i))

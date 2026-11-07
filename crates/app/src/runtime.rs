@@ -1,22 +1,19 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
 use crate::nav::{Ack, HISTORY_PAGE, Nav};
-use crate::{AppWindow, bridge, token};
+use crate::{AppWindow, bridge, compose, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
-use rxcord_api::nonce::make_nonce;
 use rxcord_api::remote_auth::{QrStatus, qr_login};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-#[allow(dead_code)] // Send/Retry/Edit/Delete are sent by the UI from Task 11
 pub enum Command {
     LoginToken(String),
     StartQr,
@@ -30,8 +27,11 @@ pub enum Command {
     LoadOlder(Id),
     Send { channel: Id, content: String, reply_to: Option<Id> },
     Retry(String /*nonce*/),
+    /// Put own message `Some(id)` (or the newest own one) into the composer for editing.
+    StartEdit(Option<Id>),
     Edit { channel: Id, message: Id, content: String },
     Delete { channel: Id, message: Id },
+    #[allow(dead_code)] // image loading: Task 12
     ThumbVisible(String /*url*/),
 }
 
@@ -42,7 +42,8 @@ enum Done {
     Acked(Id, Id, Result<(), ApiError>),
     AckDue(Id),
     Sent(String, Result<Box<Message>, ApiError>),
-    Op(Result<(), ApiError>),
+    Edited(Id, Result<Box<Message>, ApiError>),
+    Deleted { channel_id: Id, id: Id, result: Result<(), ApiError> },
     QrToken(Result<String, ApiError>),
 }
 
@@ -100,6 +101,9 @@ impl Runtime {
                 self.command(Command::SelectGuild(Some(Id(crate::demo::GUILD)))).await;
                 self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
                 msgs.into_iter().for_each(|m| self.event(m));
+                // No session: shows the failed-send row with its retry action.
+                let (channel, content) = (Id(crate::demo::CHANNEL), "this send fails (demo has no session)".into());
+                self.command(Command::Send { channel, content, reply_to: Some(Id(538)) }).await;
             }
         } else {
             match tokio::task::spawn_blocking(token::load).await.ok().flatten() {
@@ -231,23 +235,33 @@ impl Runtime {
                 }
             }
             Command::Send { channel, content, reply_to } => {
-                let nonce = make_nonce(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64));
-                self.send(Pending { nonce, channel, content, reply_to, failed: false });
+                let p = compose::new_pending(channel, content, reply_to);
+                let c = self.store.add_pending(p.clone());
+                self.changed(vec![c]);
+                self.post(p);
             }
             Command::Retry(nonce) => {
-                if let Some(p) = self.store.take_pending(&nonce) {
-                    self.send(Pending { failed: false, ..p });
+                if let Some(p) = self.store.retry_pending(&nonce) {
+                    self.changed(vec![Change::Messages(p.channel)]);
+                    self.post(p);
+                }
+            }
+            Command::StartEdit(id) => {
+                if let Some((m, text)) = self.nav.selected.and_then(|ch| compose::edit_target(&self.store, ch, id)) {
+                    bridge::start_edit(&self.ui, m, text);
                 }
             }
             Command::Edit { channel, message, content } => {
-                if let Some(rest) = self.rest.clone() {
-                    self.tasks.spawn(async move { Done::Op(rest.edit_message(channel, message, &content).await.map(drop)) });
-                }
+                let Some(rest) = self.rest.clone() else { return bridge::edit_done(&self.ui, message, false) };
+                self.tasks.spawn(async move {
+                    Done::Edited(message, rest.edit_message(channel, message, &content).await.map(Box::new))
+                });
             }
-            Command::Delete { channel, message } => {
-                if let Some(rest) = self.rest.clone() {
-                    self.tasks.spawn(async move { Done::Op(rest.delete_message(channel, message).await) });
-                }
+            Command::Delete { channel, message: id } => {
+                let Some(rest) = self.rest.clone() else { return bridge::delete_failed(&self.ui, id) };
+                self.tasks.spawn(async move {
+                    Done::Deleted { channel_id: channel, id, result: rest.delete_message(channel, id).await }
+                });
             }
             Command::ThumbVisible(_) => {} // image loading: Task 12
         }
@@ -306,14 +320,15 @@ impl Runtime {
         }
     }
 
-    fn send(&mut self, p: Pending) {
-        let Some(rest) = self.rest.clone() else { return };
-        let (channel, nonce, content, reply_to) = (p.channel, p.nonce.clone(), p.content.clone(), p.reply_to);
-        let c = self.store.add_pending(p);
-        self.changed(vec![c]);
+    /// Sends a stored pending message; without a session it fails at once, keeping the text with a retry.
+    fn post(&mut self, p: Pending) {
+        let Some(rest) = self.rest.clone() else {
+            let c = self.store.fail_pending(&p.nonce);
+            return self.changed(c.into_iter().collect());
+        };
         self.tasks.spawn(async move {
-            let r = rest.send_message(channel, &content, &nonce, reply_to).await.map(Box::new);
-            Done::Sent(nonce, r)
+            let r = rest.send_message(p.channel, &p.content, &p.nonce, p.reply_to).await.map(Box::new);
+            Done::Sent(p.nonce, r)
         });
     }
 
@@ -355,14 +370,7 @@ impl Runtime {
                 return self.changed(changes.unwrap_or_default());
             }
             Done::History { channel, generation, result: Err(e), .. } => {
-                if self.nav.finish_request(channel, generation)
-                    && self.nav.selected == Some(channel)
-                    && self.store.messages(channel).is_empty()
-                {
-                    let msg = match e {
-                        ApiError::Http { status: 403, .. } => "You don't have access to this channel",
-                        _ => "Couldn't load messages — click to retry",
-                    };
+                if let Some(msg) = self.nav.history_failed(&self.store, channel, generation, &e) {
                     bridge::set_error(&self.ui, msg.into());
                 }
                 e
@@ -387,13 +395,29 @@ impl Runtime {
                 self.changed(c.into_iter().collect());
                 e
             }
-            Done::Op(Ok(())) => return,
+            Done::Edited(id, Ok(m)) => {
+                bridge::edit_done(&self.ui, id, true);
+                let changes = self.store.apply(&compose::edit_event(*m));
+                return self.changed(changes);
+            }
+            Done::Deleted { channel_id, id, result: Ok(()) } => {
+                let changes = self.store.apply(&Event::MessageDelete { id, channel_id });
+                return self.changed(changes);
+            }
             Done::QrToken(Ok(t)) => return self.login(t).await,
             Done::QrToken(Err(e)) => {
                 tracing::warn!("QR login failed: {e}");
                 return;
             }
-            Done::Acked(_, _, Err(e)) | Done::Op(Err(e)) => e,
+            Done::Edited(id, Err(e)) => {
+                bridge::edit_done(&self.ui, id, false);
+                e
+            }
+            Done::Deleted { id, result: Err(e), .. } => {
+                bridge::delete_failed(&self.ui, id);
+                e
+            }
+            Done::Acked(_, _, Err(e)) => e,
         };
         match err {
             ApiError::Unauthorized => self.logout("Session expired. Please log in again.").await,

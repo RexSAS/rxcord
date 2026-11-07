@@ -1,0 +1,94 @@
+import { Button, TextEdit, Palette } from "std-widgets.slint";
+
+// Message input. Enter sends, Shift+Enter adds a newline, Up on an empty composer edits your last
+// message, Esc cancels reply/edit. Validation happens in Rust (`compose::validate_outgoing`).
+export component Composer inherits VerticalLayout {
+    in-out property <string> text;
+    // message being replied to / edited ("" = none)
+    in-out property <string> reply-id;
+    in property <string> reply-author;
+    in-out property <string> edit-id;
+    in property <string> error;
+    callback send(string);
+    callback edit-last();
+
+    property <int> count: root.text.character-count;
+
+    public function focus-input() { input.focus(); }
+
+    public function cancel() {
+        if root.edit-id != "" { root.text = ""; }
+        root.edit-id = "";
+        root.reply-id = "";
+    }
+
+    padding: 8px;
+    spacing: 4px;
+
+    if root.reply-id != "" || root.edit-id != "": HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.edit-id != "" ? "Editing message" : "Replying to " + root.reply-author;
+            font-size: 12px;
+            opacity: 0.7;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        TouchArea {
+            clicked => { root.cancel(); }
+            accessible-role: button;
+            accessible-label: "Cancel (Esc)";
+            accessible-action-default => { root.cancel(); }
+            Text {
+                text: "✕ Cancel";
+                font-size: 12px;
+                color: Palette.accent-background;
+            }
+        }
+    }
+    if root.error != "": Text {
+        text: root.error;
+        color: #da373c;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        input := TextEdit {
+            text <=> root.text;
+            height: 72px;
+            wrap: word-wrap;
+            placeholder-text: "Message";
+            key-pressed(e) => {
+                if e.text == Key.Return && !e.modifiers.shift {
+                    root.send(self.text);
+                    return accept;
+                }
+                if e.text == Key.Escape && (root.reply-id != "" || root.edit-id != "") {
+                    root.cancel();
+                    return accept;
+                }
+                if e.text == Key.UpArrow && self.text == "" && root.edit-id == "" {
+                    root.edit-last();
+                    return accept;
+                }
+                reject
+            }
+        }
+        VerticalLayout {
+            alignment: end;
+            spacing: 4px;
+            if root.count > 1800: Text {
+                text: root.count + "/2000";
+                color: root.count > 2000 ? #da373c : Palette.foreground;
+                font-size: 12px;
+                horizontal-alignment: center;
+            }
+            Button {
+                text: root.edit-id != "" ? "Save" : "Send";
+                enabled: root.text != "" && root.count <= 2000;
+                clicked => { root.send(root.text); }
+            }
+        }
+    }
+}

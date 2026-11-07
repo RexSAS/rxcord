@@ -35,7 +35,50 @@ pub fn clear(ui: &Weak<AppWindow>) {
         ui.set_guild_title("".into());
         ui.set_channel_title("".into());
         ui.set_messages_error("".into());
+        ui.set_composer_text("".into());
+        ui.set_reply_id("".into());
+        ui.set_edit_id("".into());
+        ui.set_composer_error("".into());
+        ui.set_row_error_id("".into());
     });
+}
+
+/// Puts own message `id` into the composer in edit mode.
+pub fn start_edit(ui: &Weak<AppWindow>, id: Id, text: String) {
+    with_ui(ui, move |ui| {
+        ui.set_reply_id("".into());
+        ui.set_edit_id(id.to_string().into());
+        ui.set_composer_text(text.into());
+        ui.set_composer_error("".into());
+        ui.invoke_focus_composer();
+    });
+}
+
+/// An edit finished. Success leaves edit mode; failure keeps the text and says so (on the row if the user moved on).
+pub fn edit_done(ui: &Weak<AppWindow>, id: Id, ok: bool) {
+    with_ui(ui, move |ui| {
+        let editing = ui.get_edit_id() == id.to_string().as_str();
+        match (ok, editing) {
+            (true, true) => {
+                ui.set_edit_id("".into());
+                ui.set_composer_text("".into());
+                ui.set_composer_error("".into());
+            }
+            (true, false) => {}
+            (false, true) => ui.set_composer_error("Couldn't save the edit. Press Enter to try again.".into()),
+            (false, false) => row_error(&ui, id, "Couldn't edit message"),
+        }
+    });
+}
+
+pub fn delete_failed(ui: &Weak<AppWindow>, id: Id) {
+    with_ui(ui, move |ui| row_error(&ui, id, "Couldn't delete message"));
+}
+
+/// Inline error under one message row; replaced by the next one, cleared on channel switch.
+fn row_error(ui: &AppWindow, id: Id, msg: &str) {
+    ui.set_row_error_id(id.to_string().into());
+    ui.set_row_error(msg.into());
 }
 
 pub fn push_guilds(ui: &Weak<AppWindow>, s: &Store) {
@@ -163,6 +206,7 @@ fn message_item(r: MessageRow) -> MessageItem {
         edited: r.edited,
         pending: r.pending,
         failed: r.failed,
+        mine: r.mine,
     }
 }
 

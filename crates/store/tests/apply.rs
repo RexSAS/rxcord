@@ -182,6 +182,19 @@ fn fail_and_take_pending() {
 }
 
 #[test]
+fn retry_pending_only_failed() {
+    let mut s = ready_store();
+    s.add_pending(pend("a", GCH));
+    s.add_pending(pend("b", GCH));
+    assert_eq!(s.retry_pending("a"), None, "still in flight: no double send");
+    s.fail_pending("a");
+    assert_eq!(s.retry_pending("a"), Some(pend("a", GCH)));
+    let p = s.pending(GCH);
+    assert_eq!((p[0].nonce.as_str(), p[0].failed), ("a", false), "same nonce, same place");
+    assert_eq!(s.retry_pending("zz"), None);
+}
+
+#[test]
 fn guild_and_channel_delete_clean_up() {
     let mut s = ready_store();
     let g = s.guilds()[0].id;

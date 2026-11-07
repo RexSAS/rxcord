@@ -121,7 +121,8 @@ fn resolve_mentions(s: &Store, known: &[User], mut blocks: Vec<Block>) -> Vec<Bl
 }
 
 fn preview(m: &Message) -> String {
-    let text: String = m.content.chars().take(100).collect();
+    // one line: the preview is an elided single-line Text
+    let text: String = m.content.chars().take(100).map(|c| if c == '\n' { ' ' } else { c }).collect();
     format!("{}: {text}", m.author.display_name())
 }
 

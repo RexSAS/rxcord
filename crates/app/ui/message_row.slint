@@ -19,11 +19,38 @@ export struct MessageItem {
     edited: bool,
     pending: bool,
     failed: bool,
+    mine: bool,
 }
 
-export component MessageRow inherits Rectangle {
+component Action inherits TouchArea {
+    in property <string> text;
+    in property <color> color: Palette.accent-background;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    Text {
+        text: root.text;
+        color: root.color;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+}
+
+// A TouchArea for `has-hover`: the row's actions show while the pointer is over it.
+export component MessageRow inherits TouchArea {
     in property <MessageItem> msg;
+    // inline error for this row ("" = none)
+    in property <string> error;
     callback thumb-visible(string);
+    callback start-reply(string, string);
+    callback start-edit(string);
+    callback delete(string);
+    callback retry(string);
+
+    // Delete takes a second click.
+    property <bool> confirm;
+    changed has-hover => { if !self.has-hover { root.confirm = false; } }
+    property <bool> actions: root.has-hover && !root.msg.pending;
 
     VerticalLayout {
         padding-left: 16px;
@@ -50,12 +77,35 @@ export component MessageRow inherits Rectangle {
                 opacity: 0.6;
                 vertical-alignment: center;
             }
+            // opacity, not `if`: the buttons stay in the accessibility tree
+            Action {
+                text: "Reply";
+                opacity: root.actions ? 1 : 0;
+                enabled: !root.msg.pending;
+                clicked => { root.start-reply(root.msg.id, root.msg.author); }
+            }
+            if root.msg.mine: Action {
+                text: "Edit";
+                opacity: root.actions ? 1 : 0;
+                enabled: !root.msg.pending;
+                clicked => { root.start-edit(root.msg.id); }
+            }
+            if root.msg.mine: Action {
+                text: root.confirm ? "Click again to delete" : "Delete";
+                color: #da373c;
+                opacity: root.actions ? 1 : 0;
+                enabled: !root.msg.pending;
+                clicked => {
+                    if root.confirm { root.delete(root.msg.id); }
+                    root.confirm = !root.confirm;
+                }
+            }
         }
         for b in root.msg.blocks: VerticalLayout {
-            opacity: root.msg.pending ? 0.5 : 1.0;
+            opacity: root.msg.pending && !root.msg.failed ? 0.5 : 1.0;
             if !b.code: StyledText {
                 text: b.text;
-                default-color: Palette.foreground;
+                default-color: root.msg.failed ? #da373c : Palette.foreground;
             }
             if b.code: Rectangle {
                 background: Palette.alternate-background;
@@ -87,8 +137,21 @@ export component MessageRow inherits Rectangle {
                 init => { root.thumb-visible(t); }
             }
         }
-        if root.msg.failed: Text {
-            text: "Failed to send";
+        if root.msg.failed: HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Text {
+                text: "Failed to send";
+                color: #da373c;
+                font-size: 12px;
+            }
+            Action {
+                text: "Retry";
+                clicked => { root.retry(root.msg.id); }
+            }
+        }
+        if root.error != "": Text {
+            text: root.error;
             color: #da373c;
             font-size: 12px;
         }
