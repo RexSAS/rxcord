@@ -4,18 +4,23 @@
 use rxcord_api::event::Event;
 use rxcord_api::gateway::GatewayCmd;
 use rxcord_api::id::Id;
+use rxcord_voice::audio::capture::{Capture, CaptureOut};
 use rxcord_voice::audio::playback::Playback;
 use rxcord_voice::driver::{VoiceCmd, VoiceEvent, VoiceStatus, run_voice};
 use rxcord_voice::session::{Connect, LeaveReason};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often a lost or missing output device is tried again.
+/// How often a lost or missing device is tried again.
 const REOPEN_EVERY: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(10);
+/// Until settings exist (Task 10).
+const NOISE_SUPPRESSION: bool = true;
 
 /// What the runtime must do after a controller call, in order.
 #[derive(Debug)]
@@ -157,6 +162,10 @@ impl Controller {
 pub enum AudioNote {
     /// Whether an output device is open.
     Speaker(bool),
+    /// Whether a microphone is open (none: we're effectively muted).
+    Mic(bool),
+    /// The mic hears speech right now (only sent when it changes).
+    Level(bool),
     /// Users heard recently and whether they're talking now (only sent when it changes).
     Levels(Vec<(u64, bool)>),
 }
@@ -175,9 +184,16 @@ pub struct Conn {
     events: mpsc::Receiver<VoiceEvent>,
     media: Option<std_mpsc::Sender<(u64, u16, Vec<u8>)>>,
     notes: mpsc::UnboundedReceiver<AudioNote>,
+    /// Read by the audio thread every tick.
+    muted: Arc<AtomicBool>,
     pub status: VoiceStatus,
     /// An output device is open.
     pub speaker: bool,
+    /// A microphone is open.
+    pub mic: bool,
+    /// The mic hears speech (the voice bar's level dot, Task 10).
+    #[allow(dead_code)]
+    pub level: bool,
 }
 
 impl Conn {
@@ -188,13 +204,19 @@ impl Conn {
         tokio::spawn(run_voice(connect, channel.0, ev_tx, cmd_rx));
         let (media, media_rx) = std_mpsc::channel();
         let (note_tx, notes) = mpsc::unbounded_channel();
-        let spawned = std::thread::Builder::new()
-            .name("rxcord-voice-audio".into())
-            .spawn(move || audio_loop(|| Playback::start(None).map_err(|e| tracing::warn!("audio output: {e}")).ok(), media_rx, note_tx, REOPEN_EVERY));
+        let muted = Arc::new(AtomicBool::new(false));
+        let thread = Audio { cmds: cmds.clone(), notes: note_tx, muted: muted.clone(), reopen: REOPEN_EVERY };
+        let spawned = std::thread::Builder::new().name("rxcord-voice-audio".into()).spawn(move || {
+            thread.run(
+                || Playback::start(None).map_err(|e| tracing::warn!("audio output: {e}")).ok(),
+                || Capture::start(None, NOISE_SUPPRESSION).map_err(|e| tracing::warn!("audio input: {e}")).ok(),
+                media_rx,
+            )
+        });
         if let Err(e) = spawned {
             tracing::warn!("audio thread: {e}");
         }
-        Conn { cmds, events, media: Some(media), notes, status: VoiceStatus::Connecting, speaker: true }
+        Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connecting, speaker: true, mic: true, level: false }
     }
 
     pub async fn next(&mut self) -> ConnIn {
@@ -211,8 +233,14 @@ impl Conn {
         }
     }
 
+    /// Muted: nothing is sent (the mic stays open so unmuting is instant).
+    #[allow(dead_code)] // the mute button: Task 10
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
     /// Never blocks: the driver may itself be waiting to hand us an event.
-    #[allow(dead_code)] // Opus/Speaking: capture, Task 9
+    #[allow(dead_code)] // the audio thread sends on its own clone; Task 10's UI uses this
     pub fn send(&self, cmd: VoiceCmd) {
         if self.cmds.try_send(cmd).is_err() {
             tracing::debug!("voice command dropped: driver busy or gone");
@@ -249,50 +277,113 @@ impl Output for Playback {
     }
 }
 
-/// The audio thread: feeds media to the output, ticks it every 10 ms, reports levels; a lost or
-/// missing device is reopened every `reopen` (the connection stays up meanwhile). Returns when `media`
-/// closes.
-fn audio_loop<O: Output>(
-    mut open: impl FnMut() -> Option<O>,
-    media: std_mpsc::Receiver<(u64, u16, Vec<u8>)>,
+/// What the audio thread records from: `Capture`, or a fake in tests.
+trait Input {
+    fn tick(&mut self) -> Vec<CaptureOut>;
+    fn failed(&self) -> bool;
+    fn set_muted(&mut self, muted: bool);
+}
+
+impl Input for Capture {
+    fn tick(&mut self) -> Vec<CaptureOut> {
+        Capture::tick(self)
+    }
+    fn failed(&self) -> bool {
+        Capture::failed(self)
+    }
+    fn set_muted(&mut self, muted: bool) {
+        Capture::set_muted(self, muted)
+    }
+}
+
+/// A device the audio thread keeps open: a lost or missing one is reopened every `reopen`.
+struct Slot<T> {
+    dev: Option<T>,
+    retry_at: std::time::Instant,
+    /// Last reported open state.
+    shown: Option<bool>,
+}
+
+impl<T> Slot<T> {
+    fn new() -> Self {
+        Slot { dev: None, retry_at: std::time::Instant::now(), shown: None }
+    }
+
+    /// Drop a failed device, retry a missing one; whether it's open, when that changed.
+    fn keep(&mut self, now: std::time::Instant, reopen: Duration, failed: impl Fn(&T) -> bool, open: impl FnOnce() -> Option<T>) -> Option<bool> {
+        if self.dev.as_ref().is_some_and(failed) {
+            self.dev = None;
+            self.retry_at = now + reopen;
+        }
+        if self.dev.is_none() && now >= self.retry_at {
+            self.dev = open();
+            self.retry_at = now + reopen;
+        }
+        let open = self.dev.is_some();
+        (self.shown != Some(open)).then(|| *self.shown.insert(open))
+    }
+}
+
+/// The audio thread's ends of the channels.
+struct Audio {
+    cmds: mpsc::Sender<VoiceCmd>,
     notes: mpsc::UnboundedSender<AudioNote>,
+    muted: Arc<AtomicBool>,
     reopen: Duration,
-) {
-    let (mut out, mut retry_at, mut speaker, mut levels) = (None::<O>, std::time::Instant::now(), None, vec![]);
-    let mut next_tick = std::time::Instant::now();
-    loop {
+}
+
+impl Audio {
+    /// Feeds media to the output and the mic's packets to the driver, ticking both every 10 ms, and
+    /// reports levels; lost or missing devices are reopened every `reopen` (the connection stays up
+    /// meanwhile). Returns when `media` closes.
+    fn run<O: Output, I: Input>(&self, mut open_out: impl FnMut() -> Option<O>, mut open_mic: impl FnMut() -> Option<I>, media: std_mpsc::Receiver<(u64, u16, Vec<u8>)>) {
+        let (mut out, mut mic, mut levels) = (Slot::<O>::new(), Slot::<I>::new(), vec![]);
+        let mut next_tick = std::time::Instant::now();
         loop {
-            match media.recv_timeout(next_tick.saturating_duration_since(std::time::Instant::now())) {
-                Ok((user, seq, opus)) => {
-                    if let Some(o) = &mut out {
-                        o.push(user, seq, opus);
+            loop {
+                match media.recv_timeout(next_tick.saturating_duration_since(std::time::Instant::now())) {
+                    Ok((user, seq, opus)) => {
+                        if let Some(o) = &mut out.dev {
+                            o.push(user, seq, opus);
+                        }
                     }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
                 }
-                Err(std_mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
             }
-        }
-        let now = std::time::Instant::now();
-        next_tick = (next_tick + TICK).max(now);
-        if out.as_ref().is_some_and(|o| o.failed()) {
-            tracing::warn!("audio output lost");
-            out = None;
-            retry_at = now + reopen;
-        }
-        if out.is_none() && now >= retry_at {
-            out = open();
-            retry_at = now + reopen;
-        }
-        if speaker != Some(out.is_some()) {
-            speaker = Some(out.is_some());
-            let _ = notes.send(AudioNote::Speaker(out.is_some()));
-        }
-        if let Some(o) = &mut out {
-            o.tick();
-            let l = o.levels();
-            if l != levels {
-                levels = l;
-                let _ = notes.send(AudioNote::Levels(levels.clone()));
+            let now = std::time::Instant::now();
+            next_tick = (next_tick + TICK).max(now);
+            if let Some(open) = out.keep(now, self.reopen, O::failed, &mut open_out) {
+                if !open {
+                    tracing::warn!("no audio output");
+                }
+                let _ = self.notes.send(AudioNote::Speaker(open));
+            }
+            if let Some(open) = mic.keep(now, self.reopen, I::failed, &mut open_mic) {
+                if !open {
+                    tracing::warn!("no audio input");
+                    let _ = self.cmds.try_send(VoiceCmd::Speaking(false)); // in case it died mid-sentence
+                }
+                let _ = self.notes.send(AudioNote::Mic(open));
+            }
+            if let Some(o) = &mut out.dev {
+                o.tick();
+                let l = o.levels();
+                if l != levels {
+                    levels = l;
+                    let _ = self.notes.send(AudioNote::Levels(levels.clone()));
+                }
+            }
+            if let Some(m) = &mut mic.dev {
+                m.set_muted(self.muted.load(Ordering::Relaxed));
+                for o in m.tick() {
+                    // never block the audio thread: a busy driver loses the packet
+                    let _ = match o {
+                        CaptureOut::Opus(f) => self.cmds.try_send(VoiceCmd::Opus(f)).map_err(drop),
+                        CaptureOut::Speaking(on) => self.cmds.try_send(VoiceCmd::Speaking(on)).map_err(drop),
+                        CaptureOut::Level(on) => self.notes.send(AudioNote::Level(on)).map_err(drop),
+                    };
+                }
             }
         }
     }
@@ -407,7 +498,8 @@ mod tests {
         let (ev_tx, events) = mpsc::channel(1);
         let (media, media_rx) = std_mpsc::channel();
         let (_note_tx, notes) = mpsc::unbounded_channel();
-        let conn = Conn { cmds, events, media: Some(media), notes, status: VoiceStatus::Connected, speaker: true };
+        let muted = Arc::new(AtomicBool::new(false));
+        let conn = Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connected, speaker: true, mic: true, level: false };
         conn.send(VoiceCmd::Speaking(true));
         conn.send(VoiceCmd::Speaking(false)); // full: dropped, never blocks
         drop(conn);
@@ -444,12 +536,10 @@ mod tests {
             f.store(false, Ordering::Relaxed);
             (i != 1).then(|| Fake { failed: f.clone(), pushed: p.clone() })
         };
-        let (media, media_rx) = std_mpsc::channel();
-        let (note_tx, mut notes) = mpsc::unbounded_channel();
-        let reopen = Duration::from_millis(30);
-        let thread = std::thread::spawn(move || audio_loop(open, media_rx, note_tx, reopen));
+        let (media, mut notes, _cmds, _muted, thread) = spawn_audio(open, || None::<FakeMic>);
         let mut next = || notes.blocking_recv().unwrap();
         assert_eq!(next(), AudioNote::Speaker(true));
+        assert_eq!(next(), AudioNote::Mic(false), "no microphone: the call goes on");
         assert_eq!(next(), AudioNote::Levels(vec![(7, false)]));
         media.send((7, 0, vec![1])).unwrap();
         assert_eq!(next(), AudioNote::Levels(vec![(7, true)]));
@@ -459,5 +549,68 @@ mod tests {
         assert_eq!(opens.load(Ordering::Relaxed), 3);
         drop(media);
         thread.join().unwrap();
+    }
+
+    type Spawned = (std_mpsc::Sender<(u64, u16, Vec<u8>)>, mpsc::UnboundedReceiver<AudioNote>, mpsc::Receiver<VoiceCmd>, Arc<AtomicBool>, std::thread::JoinHandle<()>);
+
+    /// The audio thread with a 30 ms reopen interval.
+    fn spawn_audio<O: Output, I: Input>(open_out: impl FnMut() -> Option<O> + Send + 'static, open_mic: impl FnMut() -> Option<I> + Send + 'static) -> Spawned {
+        let (media, media_rx) = std_mpsc::channel();
+        let (note_tx, notes) = mpsc::unbounded_channel();
+        let (cmds, cmd_rx) = mpsc::channel(64);
+        let muted = Arc::new(AtomicBool::new(false));
+        let audio = Audio { cmds, notes: note_tx, muted: muted.clone(), reopen: Duration::from_millis(30) };
+        let thread = std::thread::spawn(move || audio.run(open_out, open_mic, media_rx));
+        (media, notes, cmd_rx, muted, thread)
+    }
+
+    struct FakeMic {
+        failed: Arc<AtomicBool>,
+        muted: Arc<AtomicBool>,
+        out: Vec<CaptureOut>,
+    }
+    impl Input for FakeMic {
+        fn tick(&mut self) -> Vec<CaptureOut> {
+            std::mem::take(&mut self.out)
+        }
+        fn failed(&self) -> bool {
+            self.failed.load(Ordering::Relaxed)
+        }
+        fn set_muted(&mut self, muted: bool) {
+            self.muted.store(muted, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn mic_packets_go_to_the_driver_and_loss_reopens() {
+        let (failed, mic_muted, opens) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let (f, m, n) = (failed.clone(), mic_muted.clone(), opens.clone());
+        let open_mic = move || {
+            n.fetch_add(1, Ordering::Relaxed);
+            f.store(false, Ordering::Relaxed);
+            m.store(false, Ordering::Relaxed);
+            let out = vec![CaptureOut::Level(true), CaptureOut::Speaking(true), CaptureOut::Opus(vec![1])];
+            Some(FakeMic { failed: f.clone(), muted: m.clone(), out })
+        };
+        let (media, mut notes, mut cmds, muted, thread) = spawn_audio(|| None::<Fake>, open_mic);
+        assert_eq!(notes.blocking_recv(), Some(AudioNote::Speaker(false)));
+        assert_eq!(notes.blocking_recv(), Some(AudioNote::Mic(true)));
+        assert_eq!(notes.blocking_recv(), Some(AudioNote::Level(true)), "level dot");
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(true))));
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Opus(f)) if f == [1]));
+        muted.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mic_muted.load(Ordering::Relaxed) {
+            assert!(std::time::Instant::now() < deadline, "mute reaches the mic");
+            std::thread::yield_now();
+        }
+        failed.store(true, Ordering::Relaxed); // unplugged
+        assert_eq!(notes.blocking_recv(), Some(AudioNote::Mic(false)), "\"No microphone\", still connected");
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(false))), "we stop speaking");
+        assert_eq!(notes.blocking_recv(), Some(AudioNote::Mic(true)), "reopened after the retry interval");
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        drop(media);
+        thread.join().unwrap();
+        assert!(mic_muted.load(Ordering::Relaxed), "the reopened mic is muted too");
     }
 }

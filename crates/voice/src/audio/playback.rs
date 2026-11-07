@@ -31,7 +31,7 @@ const SPEAKING_RMS: f32 = 0.01;
 pub struct Playback {
     engine: Engine,
     /// `None` when the device runs at 48 kHz.
-    resampler: Option<Resampler>,
+    resampler: Option<Resampler<2>>,
     channels: usize,
     ring: rtrb::Producer<f32>,
     /// Device samples kept queued ahead of the callback, at least (40 ms).
@@ -86,7 +86,7 @@ impl Playback {
         tracing::debug!(rate = config.sample_rate, channels, "audio output open");
         Ok(Playback {
             engine: Engine::default(),
-            resampler: (config.sample_rate != RATE).then(|| Resampler::new(config.sample_rate)),
+            resampler: (config.sample_rate != RATE).then(|| Resampler::new(RATE, config.sample_rate)),
             channels,
             ring,
             min_target: config.sample_rate as usize * channels / 25, // 40 ms
@@ -156,35 +156,35 @@ fn fill_target(min: usize, period: usize, capacity: usize) -> usize {
     min.max(2 * period).min(capacity / 2)
 }
 
-/// Linear resampler from 48 kHz stereo interleaved to another rate.
-pub(crate) struct Resampler {
+/// Linear resampler between two rates, `C` interleaved channels.
+pub(crate) struct Resampler<const C: usize> {
     /// Input frames per output frame.
     step: f64,
     /// Position in the current input, where 0 is the last frame of the previous one.
     pos: f64,
-    prev: [f32; 2],
+    prev: [f32; C],
 }
 
-impl Resampler {
-    pub(crate) fn new(out_rate: u32) -> Self {
-        Resampler { step: RATE as f64 / out_rate as f64, pos: 0.0, prev: [0.0; 2] }
+impl<const C: usize> Resampler<C> {
+    pub(crate) fn new(from: u32, to: u32) -> Self {
+        Resampler { step: from as f64 / to as f64, pos: 0.0, prev: [0.0; C] }
     }
 
     pub(crate) fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        let frames = input.len() / 2;
+        let frames = input.len() / C;
         let prev = self.prev;
-        let at = |i: usize, c: usize| if i == 0 { prev[c] } else { input[(i - 1) * 2 + c] };
+        let at = |i: usize, c: usize| if i == 0 { prev[c] } else { input[(i - 1) * C + c] };
         while self.pos < frames as f64 {
             let i = self.pos as usize;
             let t = (self.pos - i as f64) as f32;
-            for c in 0..2 {
+            for c in 0..C {
                 out.push(at(i, c) + (at(i + 1, c) - at(i, c)) * t);
             }
             self.pos += self.step;
         }
         self.pos -= frames as f64;
         if frames > 0 {
-            self.prev = [input[frames * 2 - 2], input[frames * 2 - 1]];
+            self.prev = std::array::from_fn(|c| input[(frames - 1) * C + c]);
         }
     }
 }
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn resample_48k_to_44k_length() {
-        let mut r = Resampler::new(44_100);
+        let mut r = Resampler::<2>::new(48_000, 44_100);
         let mut out = Vec::new();
         r.process(&vec![0.1; 960 * 2], &mut out);
         assert!((out.len() as i64 / 2 - 882).abs() <= 1, "{} frames", out.len() / 2);
@@ -343,6 +343,17 @@ mod tests {
             r.process(&vec![0.1; 480 * 2], &mut out);
         }
         assert!((out.len() as i64 / 2 - 44_100).abs() <= 1, "{} frames over 1 s", out.len() / 2);
+    }
+
+    #[test]
+    fn resample_44k_mono_to_48k_length() {
+        let mut r = Resampler::<1>::new(44_100, 48_000);
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            r.process(&[0.1; 441], &mut out);
+        }
+        assert!((out.len() as i64 - 48_000).abs() <= 1, "{} samples over 1 s", out.len());
+        assert!(out.iter().skip(2).all(|s| (s - 0.1).abs() < 1e-6), "a constant stays constant");
     }
 
     #[test]

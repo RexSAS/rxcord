@@ -602,6 +602,15 @@ impl Runtime {
                 conn.speaker = ok;
                 return self.push_voice();
             }
+            ConnIn::Audio(AudioNote::Mic(ok)) => {
+                conn.mic = ok;
+                conn.level &= ok;
+                return self.push_voice();
+            }
+            ConnIn::Audio(AudioNote::Level(on)) => {
+                conn.level = on;
+                return;
+            }
             ConnIn::Event(VoiceEvent::Status(s)) => {
                 conn.status = s;
                 return self.push_voice();
@@ -630,6 +639,7 @@ impl Runtime {
             let state = match &self.conn {
                 Some(k) if matches!(k.status, VoiceStatus::Reconnecting { .. }) => return "Reconnecting voice…".into(),
                 Some(k) if !k.speaker => " · No speaker",
+                Some(k) if !k.mic => " · No microphone",
                 Some(k) if k.status == VoiceStatus::Connected => "",
                 _ => " · Connecting…",
             };
