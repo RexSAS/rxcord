@@ -1,0 +1,45 @@
+import { Button, VerticalBox } from "std-widgets.slint";
+import { LoginScreen } from "login.slint";
+
+export component AppWindow inherits Window {
+    title: "rxcord";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+
+    in property <bool> logged-in;
+    in property <image> qr;
+    in property <string> login-status;
+    // Connection banner text; empty when connected.
+    in property <string> banner;
+    callback login-token(string);
+    callback start-qr();
+    callback logout();
+
+    VerticalLayout {
+        if root.banner != "": Rectangle {
+            height: 28px;
+            background: #b0602a;
+            Text {
+                text: root.banner;
+                color: white;
+            }
+        }
+        if !root.logged-in: LoginScreen {
+            qr: root.qr;
+            status: root.login-status;
+            login-token(t) => { root.login-token(t); }
+            start-qr => { root.start-qr(); }
+        }
+        // Main frame: filled in by Task 10.
+        if root.logged-in: VerticalBox {
+            alignment: start;
+            HorizontalLayout {
+                alignment: end;
+                Button {
+                    text: "Log out";
+                    clicked => { root.logout(); }
+                }
+            }
+        }
+    }
+}

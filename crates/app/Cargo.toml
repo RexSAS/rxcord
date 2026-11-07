@@ -5,3 +5,17 @@ edition = "2024"
 
 [dependencies]
 rxcord-api = { path = "../api" }
+rxcord-store = { path = "../store" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+slint.workspace = true
+keyring.workspace = true
+qrcode.workspace = true
+chrono.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

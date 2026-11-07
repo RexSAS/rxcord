@@ -1,0 +1,53 @@
+import { Button, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component LoginScreen inherits Rectangle {
+    in property <image> qr;
+    in property <string> status;
+    callback login-token(string);
+    callback start-qr();
+
+    VerticalBox {
+        alignment: center;
+        Text {
+            text: "Log in to Discord";
+            font-size: 22px;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: root.qr;
+                width: 240px;
+                height: 240px;
+                image-rendering: pixelated;
+            }
+        }
+        Text {
+            text: root.status;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            alignment: center;
+            Button {
+                text: "New QR code";
+                clicked => { root.start-qr(); }
+            }
+        }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            token := LineEdit {
+                width: 320px;
+                input-type: password;
+                placeholder-text: "…or paste a token";
+                accepted => { root.login-token(self.text); self.text = ""; }
+            }
+            Button {
+                text: "Log in";
+                enabled: token.text != "";
+                clicked => { root.login-token(token.text); token.text = ""; }
+            }
+        }
+    }
+}

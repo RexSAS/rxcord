@@ -15,3 +15,9 @@ futures-util = "0.3"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 wiremock = "0.6"
+slint = { version = "1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "renderer-femtovg", "accessibility"] }
+slint-build = "1"
+keyring = { version = "3", features = ["async-secret-service", "tokio", "crypto-rust", "windows-native"] }
+qrcode = { version = "0.14", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
