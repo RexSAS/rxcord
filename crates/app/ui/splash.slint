@@ -1,0 +1,69 @@
+import { Theme } from "theme.slint";
+
+// Shown while a saved login connects and loads (until READY). The bar animates only while this is on
+// screen, so it costs nothing once the app is up.
+export component Splash inherits Rectangle {
+    in property <string> status;
+    callback logout();
+
+    background: Theme.bg;
+    VerticalLayout {
+        alignment: center;
+        spacing: 14px;
+        Text {
+            text: "RXCORD";
+            font-size: 44px;
+            font-weight: 900;
+            letter-spacing: 10px;
+            color: Theme.accent;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "LIGHTWEIGHT · LOW LATENCY · GAME READY";
+            font-size: 10px;
+            letter-spacing: 2px;
+            color: Theme.dim;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            alignment: center;
+            track := Rectangle {
+                width: 220px;
+                height: 4px;
+                border-radius: 2px;
+                background: Theme.line;
+                clip: true;
+                // a neon segment sweeping across, one pass every 1.2 s
+                Rectangle {
+                    width: 70px;
+                    border-radius: 2px;
+                    x: (mod(animation-tick() / 1ms, 1200) / 1200) * (track.width + self.width) - self.width;
+                    background: @linear-gradient(90deg, Theme.accent.transparentize(100%) 0%, Theme.accent 50%, Theme.glow 100%);
+                }
+            }
+        }
+        Text {
+            text: root.status;
+            font-size: 12px;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+    }
+    // escape hatch if the saved login is stuck
+    out := TouchArea {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 40px;
+        width: label.preferred-width + 16px;
+        height: 24px;
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: "Log out";
+        accessible-action-default => { root.logout(); }
+        clicked => { root.logout(); }
+        label := Text {
+            text: "Log out";
+            font-size: 11px;
+            color: out.has-hover ? Theme.accent : Theme.dim;
+        }
+    }
+}

@@ -1,6 +1,7 @@
 import { Theme } from "theme.slint";
 import { Button, Palette } from "std-widgets.slint";
 import { LoginScreen } from "login.slint";
+import { Splash } from "splash.slint";
 import { Tree, TreeItem } from "tree.slint";
 import { Tabs, TabItem } from "tabs.slint";
 import { MessageList } from "messages.slint";
@@ -24,7 +25,7 @@ export component AppWindow inherits Window {
     in property <string> login-status;
     in property <string> login-error;
     // saved-login session started, READY not yet received
-    in property <bool> connecting;
+    in property <bool> connecting: true;
     // Connection banner text; empty when connected.
     in property <string> banner;
     callback login-token(string);
@@ -442,14 +443,19 @@ export component AppWindow inherits Window {
                 noise-changed(n) => { root.voice-noise(n); }
             }
         }
-        if !root.logged-in: LoginScreen {
+        if !root.logged-in && root.connecting: Splash {
+            width: parent.width;
+            height: parent.height;
+            status: root.banner != "" ? root.banner : "Loading your servers…";
+            logout => { root.logout(); }
+        }
+        if !root.logged-in && !root.connecting: LoginScreen {
             width: parent.width;
             height: parent.height;
             background: Theme.bg;
             qr: root.qr;
             status: root.login-status;
             error: root.login-error;
-            connecting: root.connecting;
             login-token(t) => { root.login-token(t); }
             start-qr => { root.start-qr(); }
             logout => { root.logout(); }

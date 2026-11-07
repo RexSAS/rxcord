@@ -6,8 +6,6 @@ export component LoginScreen inherits Rectangle {
     in property <string> status;
     // last failure (session expired, login failed); kept while the QR status changes
     in property <string> error;
-    // a saved login is connecting: no QR or token entry, only "Log out"
-    in property <bool> connecting;
     callback login-token(string);
     callback start-qr();
     callback logout();
@@ -25,18 +23,7 @@ export component LoginScreen inherits Rectangle {
             horizontal-alignment: center;
             wrap: word-wrap;
         }
-        if root.connecting: Text {
-            text: "Connecting with saved login…";
-            horizontal-alignment: center;
-        }
-        if root.connecting: HorizontalLayout {
-            alignment: center;
-            Button {
-                text: "Log out";
-                clicked => { root.logout(); }
-            }
-        }
-        if !root.connecting: HorizontalLayout {
+        HorizontalLayout {
             alignment: center;
             Image {
                 source: root.qr;
@@ -45,19 +32,19 @@ export component LoginScreen inherits Rectangle {
                 image-rendering: pixelated;
             }
         }
-        if !root.connecting: Text {
+        Text {
             text: root.status;
             horizontal-alignment: center;
             wrap: word-wrap;
         }
-        if !root.connecting: HorizontalLayout {
+        HorizontalLayout {
             alignment: center;
             Button {
                 text: "New QR code";
                 clicked => { root.start-qr(); }
             }
         }
-        if !root.connecting: HorizontalLayout {
+        HorizontalLayout {
             alignment: center;
             spacing: 8px;
             token := LineEdit {
