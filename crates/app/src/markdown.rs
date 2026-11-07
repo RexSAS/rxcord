@@ -164,12 +164,12 @@ fn inline(line: &str, spans: &mut Vec<Span>) {
                     // content must be non-empty: the opener may not be the last token
                     let nonempty = top.is_some_and(|t| t + 1 < toks.len() || !buf.is_empty());
                     let want = match (ch, top_kind) {
-                        ('*', Some(Kind::Star)) | ('_', Some(Kind::Under)) => Some((1, top_kind.unwrap(), "")),
-                        ('*', Some(Kind::Bold)) if left >= 2 => Some((2, Kind::Bold, "")),
-                        ('~', Some(Kind::Strike)) if left >= 2 => Some((2, Kind::Strike, "")),
+                        ('*', Some(Kind::Star)) | ('_', Some(Kind::Under)) => Some(1),
+                        ('*', Some(Kind::Bold)) if left >= 2 => Some(2),
+                        ('~', Some(Kind::Strike)) if left >= 2 => Some(2),
                         _ => None,
                     };
-                    if let (true, true, Some((take, ..))) = (can_close, nonempty, want) {
+                    if let (true, true, Some(take)) = (can_close, nonempty, want) {
                         flush!();
                         let t = stack.pop().unwrap();
                         let Tok::Delim { matched, .. } = &mut toks[t] else { unreachable!() };
@@ -213,7 +213,10 @@ fn inline(line: &str, spans: &mut Vec<Span>) {
             '@' if prev.is_none_or(|p| !p.is_alphanumeric()) => {
                 let len = ["@everyone", "@here"]
                     .iter()
-                    .find(|w| c[i..].iter().take(w.len()).copied().eq(w.chars()))
+                    .find(|w| {
+                        c[i..].iter().take(w.len()).copied().eq(w.chars())
+                            && c.get(i + w.len()).is_none_or(|x| !x.is_alphanumeric())
+                    })
                     .map(|w| w.len());
                 match len {
                     Some(len) => {
@@ -250,7 +253,6 @@ fn inline(line: &str, spans: &mut Vec<Span>) {
     flush!();
     // an unmatched opener was never closed: it is literal text
     let (mut bold, mut italic, mut strike) = (0u32, 0u32, 0u32);
-    let mut open_stack: Vec<Kind> = Vec::new();
     for t in toks {
         match t {
             Tok::Delim { kind, lit, matched } => {
@@ -258,13 +260,7 @@ fn inline(line: &str, spans: &mut Vec<Span>) {
                     push_style(spans, lit.to_string(), bold > 0, italic > 0, strike > 0);
                     continue;
                 }
-                let on = if lit.is_empty() {
-                    open_stack.pop();
-                    -1
-                } else {
-                    open_stack.push(kind);
-                    1
-                };
+                let on = if lit.is_empty() { -1 } else { 1 }; // closers carry no literal
                 let cnt = match kind {
                     Kind::Bold => &mut bold,
                     Kind::Strike => &mut strike,
@@ -409,6 +405,49 @@ mod tests {
             Span { text: "https://a.b/c?d=1".into(), link: Some("https://a.b/c?d=1".into()), ..Default::default() }
         );
         assert_eq!(s[2], plain(") ok"));
+    }
+
+    #[test]
+    fn everyone_needs_word_boundary() {
+        assert_eq!(para("@everyoneelse"), vec![plain("@everyoneelse")]);
+    }
+
+    #[test]
+    fn emoji_next_to_star() {
+        let s = para("*😀*");
+        assert_eq!(s, vec![Span { text: "😀".into(), italic: true, ..Default::default() }]);
+        assert_eq!(para("😀**"), vec![plain("😀**")]);
+    }
+
+    #[test]
+    fn double_underscore_is_italic() {
+        let s = para("__x__");
+        assert_eq!(s, vec![Span { text: "x".into(), italic: true, ..Default::default() }]);
+    }
+
+    #[test]
+    fn adversarial_inputs_linear_and_plain() {
+        let mixed: String = "abcXYZ019".chars().cycle().take(4000).collect();
+        let cases = [
+            mixed,
+            format!("```{}", "x".repeat(100_000)),
+            "*_".repeat(50_000),
+            "`a``".repeat(25_000),
+            "<@".repeat(50_000),
+        ];
+        for src in cases {
+            let t = std::time::Instant::now();
+            let b = parse(&src);
+            assert!(t.elapsed().as_millis() < 50, "took {:?}", t.elapsed());
+            if src.contains("```") && !src.starts_with("```") {
+                continue; // repeated "```" legitimately forms fences; only timing matters
+            }
+            assert_eq!(b.len(), 1);
+            let Block::Para(s) = &b[0] else { panic!("not a para") };
+            assert!(s.iter().all(|s| !s.bold && !s.italic && !s.code && s.mention.is_none()));
+            let all: String = s.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(all, src);
+        }
     }
 
     #[test]
