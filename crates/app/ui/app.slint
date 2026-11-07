@@ -1,0 +1,177 @@
+import { Button, Palette } from "std-widgets.slint";
+import { LoginScreen } from "login.slint";
+import { GuildList, ChannelList, GuildItem, ChannelItem } from "sidebar.slint";
+import { MessageList } from "messages.slint";
+import { Composer } from "composer.slint";
+import { MessageItem, BlockItem, ThumbItem, FileItem } from "message_row.slint";
+
+export { GuildItem, ChannelItem, MessageItem, BlockItem, ThumbItem, FileItem }
+
+export component AppWindow inherits Window {
+    title: "rxcord";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    background: Palette.background;
+
+    in property <bool> logged-in;
+    in property <image> qr;
+    in property <string> login-status;
+    in property <string> login-error;
+    // saved-login session started, READY not yet received
+    in property <bool> connecting;
+    // Connection banner text; empty when connected.
+    in property <string> banner;
+    callback login-token(string);
+    callback start-qr();
+    callback logout();
+
+    in property <[GuildItem]> guilds;
+    in property <[ChannelItem]> channels;
+    in property <[MessageItem]> messages;
+    // "@me" selects Direct Messages.
+    in property <string> selected-guild;
+    in property <string> selected-channel;
+    in property <string> guild-title;
+    in property <string> channel-title;
+    callback select-guild(string);
+    callback select-channel(string);
+    // shown instead of messages when the first load failed
+    in property <string> messages-error;
+    callback retry();
+    callback load-older();
+    callback bottom-visible(bool);
+    callback thumb-visible(string);
+    // attachment link or image clicked
+    callback open-url(string);
+
+    // Composer state (see composer.slint); ids are "" when unset.
+    in-out property <string> composer-text;
+    in-out property <string> reply-id;
+    in-out property <string> reply-author;
+    in-out property <string> edit-id;
+    in-out property <string> edit-stash;
+    // composer text when the edit was submitted (Rust only)
+    in-out property <string> edit-submitted;
+    in-out property <string> composer-error;
+    in-out property <string> row-error-id;
+    in property <string> row-error;
+    callback send(string);
+    // "" = your newest message in the channel
+    callback start-edit(string);
+    callback delete-message(string);
+    callback retry-send(string /*nonce*/);
+    // Per-channel drafts (kept in Rust): returns the draft of channel `to`, keeping `text` for the old one.
+    callback switch-draft(string /*text*/, string /*to*/) -> string;
+    // unsent text of an ended session, added to that channel's draft
+    callback restore-draft(string /*channel*/, string /*text*/);
+    // READY for user id: drafts of another account are dropped
+    callback session-user(string);
+
+    changed selected-channel => {
+        composer.cancel();
+        root.row-error-id = "";
+        root.composer-text = root.switch-draft(root.composer-text, root.selected-channel);
+    }
+
+    public function focus-composer() { composer.focus-input(); }
+    public function scroll-to-bottom() { msgs.scroll-to-bottom(); }
+    public function messages-prepended(n: int) { msgs.prepended(n); }
+
+    VerticalLayout {
+        if root.banner != "": Rectangle {
+            height: 28px;
+            background: #b0602a;
+            Text {
+                text: root.banner;
+                color: white;
+            }
+        }
+        Rectangle {
+        // `visible` instead of `if`: the message list must exist for the public functions above.
+        HorizontalLayout {
+            width: parent.width;
+            height: parent.height;
+            visible: root.logged-in;
+            GuildList {
+                guilds: root.guilds;
+                selected: root.selected-guild;
+                select(id) => { root.select-guild(id); }
+            }
+            VerticalLayout {
+                ChannelList {
+                    vertical-stretch: 1;
+                    channels: root.channels;
+                    title: root.guild-title;
+                    selected: root.selected-channel;
+                    select(id) => { root.select-channel(id); }
+                }
+                HorizontalLayout {
+                    padding: 8px;
+                    Button {
+                        text: "Log out";
+                        clicked => { root.logout(); }
+                    }
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Rectangle {
+                    height: 48px;
+                    Text {
+                        x: 16px;
+                        text: root.channel-title;
+                        font-weight: 700;
+                        overflow: elide;
+                        width: parent.width - 32px;
+                    }
+                }
+                msgs := MessageList {
+                    messages: root.messages;
+                    error: root.messages-error;
+                    retry => { root.retry(); }
+                    load-older => { root.load-older(); }
+                    bottom-visible(b) => { root.bottom-visible(b); }
+                    thumb-visible(u) => { root.thumb-visible(u); }
+                    open-url(u) => { root.open-url(u); }
+                    row-error-id: root.row-error-id;
+                    row-error: root.row-error;
+                    start-reply(id, author) => {
+                        composer.cancel();
+                        root.reply-id = id;
+                        root.reply-author = author;
+                        composer.focus-input();
+                    }
+                    start-edit(id) => { root.start-edit(id); }
+                    delete(id) => {
+                        root.row-error-id = "";
+                        root.delete-message(id);
+                    }
+                    retry-send(nonce) => { root.retry-send(nonce); }
+                }
+                composer := Composer {
+                    text <=> root.composer-text;
+                    reply-id <=> root.reply-id;
+                    reply-author: root.reply-author;
+                    edit-id <=> root.edit-id;
+                    stash <=> root.edit-stash;
+                    error <=> root.composer-error;
+                    send(t) => { root.send(t); }
+                    edit-last => { root.start-edit(""); }
+                }
+            }
+        }
+        if !root.logged-in: LoginScreen {
+            width: parent.width;
+            height: parent.height;
+            background: Palette.background;
+            qr: root.qr;
+            status: root.login-status;
+            error: root.login-error;
+            connecting: root.connecting;
+            login-token(t) => { root.login-token(t); }
+            start-qr => { root.start-qr(); }
+            logout => { root.logout(); }
+        }
+        }
+    }
+}

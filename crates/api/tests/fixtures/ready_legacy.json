@@ -1,0 +1,8 @@
+{"v":9,"user":{"id":"100000000000000001","username":"rex","global_name":"Rex","avatar":"abc123","discriminator":"0"},
+"session_id":"sess_abc","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg",
+"guilds":[{"id":"200000000000000001","name":"Test Guild","icon":"gicon","channels":[
+{"id":"300000000000000001","type":0,"name":"general","position":0,"parent_id":null,"last_message_id":"400000000000000001"},
+{"id":"300000000000000002","type":4,"name":"Text","position":1}]}],
+"private_channels":[{"id":"300000000000000009","type":1,"recipient_ids":["100000000000000002"],"last_message_id":"400000000000000002"}],
+"read_state":[{"id":"300000000000000001","last_message_id":"400000000000000001","mention_count":2}],
+"users":[{"id":"100000000000000002","username":"friend","global_name":null,"avatar":null}]}

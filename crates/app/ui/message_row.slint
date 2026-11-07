@@ -1,0 +1,194 @@
+import { Palette } from "std-widgets.slint";
+
+export struct BlockItem {
+    code: bool,
+    // `Para` blocks
+    text: styled-text,
+    // `Code` blocks
+    raw: string,
+}
+
+export struct ThumbItem {
+    // sized proxy URL (cache key)
+    url: string,
+    // full-size URL, opened on click
+    full: string,
+    width: int,
+    height: int,
+    // empty until loaded (or for good if the fetch failed)
+    image: image,
+}
+
+export struct FileItem {
+    name: string,
+    url: string,
+}
+
+export struct MessageItem {
+    id: string,
+    author: string,
+    time: string,
+    blocks: [BlockItem],
+    reply: string,
+    thumbs: [ThumbItem],
+    files: [FileItem],
+    edited: bool,
+    pending: bool,
+    failed: bool,
+    mine: bool,
+}
+
+component Action inherits TouchArea {
+    in property <string> text;
+    in property <color> color: Palette.accent-background;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    Text {
+        text: root.text;
+        color: root.color;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+}
+
+// A TouchArea for `has-hover`: the row's actions show while the pointer is over it.
+export component MessageRow inherits TouchArea {
+    in property <MessageItem> msg;
+    // inline error for this row ("" = none)
+    in property <string> error;
+    callback thumb-visible(string);
+    callback open-url(string);
+    callback start-reply(string, string);
+    callback start-edit(string);
+    callback delete(string);
+    callback retry(string);
+
+    // Delete takes a second click.
+    property <bool> confirm;
+    changed has-hover => { if !self.has-hover { root.confirm = false; } }
+    property <bool> actions: root.has-hover && !root.msg.pending;
+
+    VerticalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 2px;
+        if root.msg.reply != "": Text {
+            text: "↪ " + root.msg.reply;
+            font-size: 12px;
+            opacity: 0.6;
+            overflow: elide;
+        }
+        HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Text {
+                text: root.msg.author;
+                font-weight: 700;
+            }
+            Text {
+                text: root.msg.time + (root.msg.edited ? "  (edited)" : "");
+                font-size: 11px;
+                opacity: 0.6;
+                vertical-alignment: center;
+            }
+            // opacity, not `if`: the buttons stay in the accessibility tree
+            Action {
+                text: "Reply";
+                opacity: root.actions ? 1 : 0;
+                enabled: !root.msg.pending;
+                clicked => { root.start-reply(root.msg.id, root.msg.author); }
+            }
+            if root.msg.mine: Action {
+                text: "Edit";
+                opacity: root.actions ? 1 : 0;
+                enabled: !root.msg.pending;
+                clicked => { root.start-edit(root.msg.id); }
+            }
+            if root.msg.mine: Action {
+                text: root.confirm ? "Click again to delete" : "Delete";
+                color: #da373c;
+                opacity: root.actions ? 1 : 0;
+                enabled: !root.msg.pending;
+                clicked => {
+                    if root.confirm { root.delete(root.msg.id); }
+                    root.confirm = !root.confirm;
+                }
+            }
+        }
+        for b in root.msg.blocks: VerticalLayout {
+            opacity: root.msg.pending && !root.msg.failed ? 0.5 : 1.0;
+            if !b.code: StyledText {
+                text: b.text;
+                default-color: root.msg.failed ? #da373c : Palette.foreground;
+            }
+            if b.code: Rectangle {
+                background: Palette.alternate-background;
+                border-width: 1px;
+                border-color: Palette.border;
+                border-radius: 4px;
+                VerticalLayout {
+                    padding: 8px;
+                    Text {
+                        text: b.raw;
+                        // `Text` only takes a named family, no generic "monospace"
+                        font-family: Platform.os == OperatingSystemType.windows ? "Consolas" : "DejaVu Sans Mono";
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+        for f in root.msg.files: HorizontalLayout {
+            alignment: start;
+            Action {
+                text: "📎 " + f.name;
+                clicked => { root.open-url(f.url); }
+            }
+        }
+        for t in root.msg.thumbs: HorizontalLayout {
+            alignment: start;
+            // fixed size from the attachment's dimensions: no layout jump when the image arrives
+            TouchArea {
+                width: t.width * 1px;
+                height: t.height * 1px;
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Open image";
+                accessible-action-default => { root.open-url(t.full); }
+                init => { root.thumb-visible(t.url); }
+                clicked => { root.open-url(t.full); }
+                Rectangle {
+                    border-radius: 4px;
+                    clip: true;
+                    background: Palette.alternate-background;
+                    Image {
+                        source: t.image;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: contain;
+                    }
+                }
+            }
+        }
+        if root.msg.failed: HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            Text {
+                text: "Failed to send";
+                color: #da373c;
+                font-size: 12px;
+            }
+            Action {
+                text: "Retry";
+                clicked => { root.retry(root.msg.id); }
+            }
+        }
+        if root.error != "": Text {
+            text: root.error;
+            color: #da373c;
+            font-size: 12px;
+        }
+    }
+}

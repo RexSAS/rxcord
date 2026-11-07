@@ -1,0 +1,7 @@
+{"v":9,"user":{"id":"100000000000000001","username":"rex","global_name":"Rex","avatar":null},
+"session_id":"sess_cap","resume_gateway_url":"wss://gateway-us-east1-c.discord.gg",
+"guilds":[{"id":"200000000000000002","properties":{"name":"Cap Guild","icon":"capicon","owner_id":"100000000000000001"},"channels":[
+{"id":"300000000000000011","type":0,"name":"chat","position":3,"parent_id":"300000000000000010"}]}],
+"private_channels":[],
+"read_state":{"version":1,"partial":false,"entries":[{"id":"300000000000000011","last_message_id":"400000000000000011","mention_count":0},{"id":"300000000000000012","last_message_id":null,"mention_count":1}]},
+"users":[]}

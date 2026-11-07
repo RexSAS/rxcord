@@ -1,0 +1,24 @@
+[package]
+name = "rxcord-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+reqwest.workspace = true
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

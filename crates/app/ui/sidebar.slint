@@ -1,0 +1,143 @@
+import { ListView, Palette } from "std-widgets.slint";
+
+export struct GuildItem {
+    id: string,
+    name: string,
+    short: string,
+    unread: bool,
+    mentions: int,
+}
+
+export struct ChannelItem {
+    id: string,
+    name: string,
+    // 4 = category header, 1/3 = DM, 2/13 = voice
+    kind: int,
+    unread: bool,
+    mentions: int,
+    enabled: bool,
+}
+
+component Badge inherits Rectangle {
+    in property <int> count;
+    visible: count > 0;
+    width: max(16px, label.preferred-width + 8px);
+    height: 16px;
+    border-radius: 8px;
+    background: #da373c;
+    label := Text {
+        text: count;
+        color: white;
+        font-size: 11px;
+        font-weight: 700;
+    }
+}
+
+export component GuildList inherits Rectangle {
+    in property <[GuildItem]> guilds;
+    in property <string> selected;
+    callback select(string);
+
+    width: 72px;
+    background: Palette.alternate-background;
+    ListView {
+        for g in root.guilds: Rectangle {
+            height: 56px;
+            accessible-role: button;
+            accessible-label: g.name;
+            accessible-action-default => { root.select(g.id); }
+            // unread pill on the left edge
+            Rectangle {
+                x: 0;
+                width: 4px;
+                height: g.id == root.selected ? 40px : 8px;
+                visible: g.unread || g.id == root.selected;
+                border-radius: 2px;
+                background: Palette.foreground;
+            }
+            Rectangle {
+                width: 48px;
+                height: 48px;
+                border-radius: g.id == root.selected ? 16px : 24px;
+                background: g.id == root.selected ? Palette.accent-background : Palette.background;
+                Text {
+                    text: g.short;
+                    color: g.id == root.selected ? Palette.accent-foreground : Palette.foreground;
+                    font-weight: 600;
+                }
+                ta := TouchArea {
+                    clicked => { root.select(g.id); }
+                }
+            }
+            Badge {
+                x: parent.width - self.width - 8px;
+                y: parent.height - self.height - 4px;
+                count: g.mentions;
+            }
+        }
+    }
+}
+
+export component ChannelList inherits Rectangle {
+    in property <[ChannelItem]> channels;
+    in property <string> title;
+    in property <string> selected;
+    callback select(string);
+
+    width: 220px;
+    background: Palette.alternate-background;
+    VerticalLayout {
+        Rectangle {
+            height: 48px;
+            Text {
+                x: 16px;
+                text: root.title;
+                font-weight: 700;
+                overflow: elide;
+                width: parent.width - 32px;
+            }
+        }
+        ListView {
+            for c in root.channels: Rectangle {
+                property <bool> header: c.kind == 4;
+                property <bool> voice: c.kind == 2 || c.kind == 13;
+                property <bool> dm: c.kind == 1 || c.kind == 3;
+                height: header ? 36px : 32px;
+                accessible-role: list-item;
+                accessible-label: c.name;
+                accessible-enabled: c.enabled && !header;
+                accessible-action-default => { if c.enabled && !header { root.select(c.id); } }
+                Rectangle {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    border-radius: 4px;
+                    visible: !header;
+                    background: c.id == root.selected ? Palette.selection-background : ta.has-hover && c.enabled ? Palette.background : transparent;
+                }
+                HorizontalLayout {
+                    padding-left: header ? 8px : 16px;
+                    padding-right: 16px;
+                    spacing: 6px;
+                    Text {
+                        text: header ? c.name : (dm ? "" : voice ? "♪ " : "# ") + c.name;
+                        vertical-alignment: header ? bottom : center;
+                        overflow: elide;
+                        font-size: header ? 11px : 14px;
+                        font-weight: header || (c.unread && c.enabled) ? 700 : 400;
+                        color: c.id == root.selected ? Palette.selection-foreground : Palette.foreground;
+                        opacity: !c.enabled ? 0.4 : header || c.unread || c.id == root.selected ? 1.0 : 0.65;
+                    }
+                    Badge {
+                        y: (parent.height - self.height) / 2;
+                        count: c.mentions;
+                    }
+                }
+                ta := TouchArea {
+                    enabled: c.enabled && !header;
+                    mouse-cursor: self.enabled ? pointer : default;
+                    clicked => { root.select(c.id); }
+                }
+            }
+        }
+    }
+}

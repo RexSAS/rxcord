@@ -1,0 +1,23 @@
+[package]
+name = "rxcord"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rxcord-api = { path = "../api" }
+rxcord-store = { path = "../store" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+slint.workspace = true
+keyring.workspace = true
+qrcode.workspace = true
+chrono.workspace = true
+serde_json.workspace = true # demo fixtures (RXCORD_DEMO)
+image.workspace = true
+lru.workspace = true
+opener.workspace = true
+notify-rust.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

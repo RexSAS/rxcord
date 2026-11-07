@@ -1,0 +1,75 @@
+import { Button, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component LoginScreen inherits Rectangle {
+    in property <image> qr;
+    in property <string> status;
+    // last failure (session expired, login failed); kept while the QR status changes
+    in property <string> error;
+    // a saved login is connecting: no QR or token entry, only "Log out"
+    in property <bool> connecting;
+    callback login-token(string);
+    callback start-qr();
+    callback logout();
+
+    VerticalBox {
+        alignment: center;
+        Text {
+            text: "Log in to Discord";
+            font-size: 22px;
+            horizontal-alignment: center;
+        }
+        if root.error != "": Text {
+            text: root.error;
+            color: #e05050;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        if root.connecting: Text {
+            text: "Connecting with saved login…";
+            horizontal-alignment: center;
+        }
+        if root.connecting: HorizontalLayout {
+            alignment: center;
+            Button {
+                text: "Log out";
+                clicked => { root.logout(); }
+            }
+        }
+        if !root.connecting: HorizontalLayout {
+            alignment: center;
+            Image {
+                source: root.qr;
+                width: 240px;
+                height: 240px;
+                image-rendering: pixelated;
+            }
+        }
+        if !root.connecting: Text {
+            text: root.status;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        if !root.connecting: HorizontalLayout {
+            alignment: center;
+            Button {
+                text: "New QR code";
+                clicked => { root.start-qr(); }
+            }
+        }
+        if !root.connecting: HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            token := LineEdit {
+                width: 320px;
+                input-type: password;
+                placeholder-text: "…or paste a token";
+                accepted => { root.login-token(self.text); self.text = ""; }
+            }
+            Button {
+                text: "Log in";
+                enabled: token.text != "";
+                clicked => { root.login-token(token.text); token.text = ""; }
+            }
+        }
+    }
+}
