@@ -103,10 +103,15 @@ impl Store {
         r.mentions = 0;
     }
 
+    /// READY replaces all state except `pending` (unsent messages survive a
+    /// re-identify). Messages are dropped as they may have a gap; the app
+    /// re-opens the selected channel afterwards (`open_channel` -> true -> refetch).
     pub fn apply(&mut self, ev: &Event) -> Vec<Change> {
         match ev {
             Event::Ready(r) => {
+                let pending = std::mem::take(&mut self.pending);
                 *self = Store::default();
+                self.pending = pending;
                 self.me = Some(r.user.clone());
                 for u in &r.users {
                     self.users.insert(u.id, u.clone());
@@ -142,7 +147,10 @@ impl Store {
             }
             Event::GuildDelete { id } => {
                 self.guilds.retain(|g| g.id != *id);
-                self.channels.retain(|_, c| c.guild_id != Some(*id));
+                let gone: Vec<Id> = self.channels.values().filter(|c| c.guild_id == Some(*id)).map(|c| c.id).collect();
+                for c in gone {
+                    self.drop_channel(c);
+                }
                 vec![Change::GuildList, Change::Channels { guild: Some(*id) }]
             }
             Event::ChannelCreate(c) | Event::ChannelUpdate(c) => {
@@ -156,9 +164,7 @@ impl Store {
                 vec![ch]
             }
             Event::ChannelDelete(c) => {
-                self.channels.remove(&c.id);
-                self.read.remove(&c.id);
-                self.msgs.remove(&c.id);
+                self.drop_channel(c.id);
                 vec![self.chg(c)]
             }
             Event::MessageCreate(m) => self.on_create(m),
@@ -192,6 +198,13 @@ impl Store {
         }
     }
 
+    fn drop_channel(&mut self, id: Id) {
+        self.channels.remove(&id);
+        self.read.remove(&id);
+        self.msgs.remove(&id);
+        self.pending.retain(|p| p.channel != id);
+    }
+
     fn chg(&self, c: &Channel) -> Change {
         if is_dm(c) { Change::DmList } else { Change::Channels { guild: c.guild_id } }
     }
@@ -201,12 +214,17 @@ impl Store {
             tracing::debug!(channel = m.channel_id.0, "message for unknown channel");
             return vec![];
         };
+        // Not newer than what we've seen: a redelivery (e.g. after resume).
+        let fresh = ch.last_message_id < Some(m.id);
         ch.last_message_id = ch.last_message_id.max(Some(m.id));
         let dm = is_dm(ch);
         let mut out = vec![];
         if self.msgs.contains_key(&m.channel_id) {
             let q = self.msgs.entry(m.channel_id).or_default();
-            if !q.iter().any(|x| x.id == m.id) {
+            if q.iter().any(|x| x.id == m.id) {
+                return vec![];
+            }
+            {
                 q.push_back(m.clone());
                 while q.len() > MESSAGE_CAP {
                     q.pop_front();
@@ -216,6 +234,9 @@ impl Store {
                 self.pending.retain(|p| &p.nonce != n);
             }
             out.push(Change::Messages(m.channel_id));
+        }
+        if !fresh {
+            return out;
         }
         let me = self.me.as_ref().map(|u| u.id);
         if Some(m.author.id) == me {
@@ -245,9 +266,9 @@ impl Store {
     /// `msgs` is newest-first as returned by the API.
     pub fn prepend_history(&mut self, channel: Id, msgs: Vec<Message>) -> Vec<Change> {
         let q = self.msgs.entry(channel).or_default();
-        let have: HashSet<Id> = q.iter().map(|m| m.id).collect();
+        let mut have: HashSet<Id> = q.iter().map(|m| m.id).collect();
         let mut added = false;
-        for m in msgs.into_iter().filter(|m| !have.contains(&m.id)) {
+        for m in msgs.into_iter().filter(|m| have.insert(m.id)) {
             q.push_front(m);
             added = true;
         }
@@ -259,13 +280,10 @@ impl Store {
         self.pending.push(p);
         c
     }
-    pub fn fail_pending(&mut self, nonce: &str) -> Change {
-        let mut ch = None;
-        for p in self.pending.iter_mut().filter(|p| p.nonce == nonce) {
-            p.failed = true;
-            ch = Some(p.channel);
-        }
-        ch.map_or(Change::Messages(Id(0)), Change::Messages)
+    pub fn fail_pending(&mut self, nonce: &str) -> Option<Change> {
+        let p = self.pending.iter_mut().find(|p| p.nonce == nonce)?;
+        p.failed = true;
+        Some(Change::Messages(p.channel))
     }
     pub fn take_pending(&mut self, nonce: &str) -> Option<Pending> {
         let i = self.pending.iter().position(|p| p.nonce == nonce)?;

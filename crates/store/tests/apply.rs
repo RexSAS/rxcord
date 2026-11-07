@@ -149,3 +149,76 @@ fn close_trims_to_cap() {
     assert_eq!(q.front().unwrap().id, Id(BASE + 51));
     assert_eq!(q.back().unwrap().id, Id(BASE + 250));
 }
+
+#[test]
+fn duplicate_dm_create_counts_once() {
+    let mut s = ready_store();
+    let dm = dm_id(&s);
+    for opened in [false, true] {
+        if opened {
+            s.open_channel(dm);
+        }
+        let base = s.mention_count(dm);
+        create(&mut s, msg(700 + opened as u64, dm, Id(7)));
+        let again = create(&mut s, msg(700 + opened as u64, dm, Id(7)));
+        assert_eq!(s.mention_count(dm), base + 1);
+        assert!(!again.contains(&Change::Unread(dm)));
+    }
+}
+
+fn pend(n: &str, ch: Id) -> Pending {
+    Pending { nonce: n.into(), channel: ch, content: "x".into(), reply_to: None, failed: false }
+}
+
+#[test]
+fn fail_and_take_pending() {
+    let mut s = ready_store();
+    s.add_pending(pend("a", GCH));
+    assert_eq!(s.fail_pending("a"), Some(Change::Messages(GCH)));
+    assert_eq!(s.fail_pending("zz"), None);
+    assert!(s.pending(GCH)[0].failed);
+    assert_eq!(s.take_pending("a").unwrap().nonce, "a");
+    assert!(s.take_pending("a").is_none());
+}
+
+#[test]
+fn guild_and_channel_delete_clean_up() {
+    let mut s = ready_store();
+    let g = s.guilds()[0].id;
+    s.open_channel(GCH);
+    create(&mut s, msg(1, GCH, Id(7)));
+    s.add_pending(pend("a", GCH));
+    s.apply(&Event::GuildDelete { id: g });
+    assert!(s.channels_of(g).is_empty());
+    assert!(s.messages(GCH).is_empty() && s.pending(GCH).is_empty());
+    assert_eq!(s.mention_count(GCH), 0);
+
+    let mut s = ready_store();
+    let ch = s.channel(GCH).unwrap().clone();
+    s.open_channel(GCH);
+    create(&mut s, msg(1, GCH, Id(7)));
+    s.add_pending(pend("a", GCH));
+    s.apply(&Event::ChannelDelete(ch));
+    assert!(s.channel(GCH).is_none());
+    assert!(s.messages(GCH).is_empty() && s.pending(GCH).is_empty());
+}
+
+#[test]
+fn re_ready_keeps_pending_drops_messages() {
+    let mut s = ready_store();
+    s.open_channel(GCH);
+    create(&mut s, msg(1, GCH, Id(7)));
+    s.add_pending(pend("a", GCH));
+    let r: Ready = serde_json::from_str(&fx("ready_legacy.json")).unwrap();
+    s.apply(&Event::Ready(Box::new(r)));
+    assert_eq!(s.pending(GCH).len(), 1);
+    assert!(s.messages(GCH).is_empty());
+    assert!(s.open_channel(GCH));
+}
+
+#[test]
+fn prepend_dedupes_within_batch() {
+    let mut s = ready_store();
+    s.prepend_history(GCH, vec![msg(2, GCH, Id(7)), msg(2, GCH, Id(7)), msg(1, GCH, Id(7))]);
+    assert_eq!(s.messages(GCH).len(), 2);
+}
