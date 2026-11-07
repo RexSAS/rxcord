@@ -17,6 +17,7 @@ serde_json.workspace = true # demo fixtures (RXCORD_DEMO)
 image.workspace = true
 lru.workspace = true
 opener.workspace = true
+notify-rust.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

@@ -5,6 +5,7 @@ mod demo;
 mod images;
 mod markdown;
 mod nav;
+mod notify;
 mod runtime;
 mod token;
 mod view;

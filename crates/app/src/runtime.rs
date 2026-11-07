@@ -1,6 +1,6 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
 use crate::nav::{Ack, HISTORY_PAGE, Nav};
-use crate::{AppWindow, bridge, compose, images, token};
+use crate::{AppWindow, bridge, compose, images, notify, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
 use rxcord_api::id::Id;
@@ -331,6 +331,16 @@ impl Runtime {
     fn event(&mut self, ev: Event) {
         let ready = matches!(ev, Event::Ready(_));
         let changes = self.store.apply(&ev);
+        // Unread(channel) is only reported for a create the store saw as new, so redeliveries stay silent.
+        if let Event::MessageCreate(m) = &ev
+            && changes.contains(&Change::Unread(m.channel_id))
+            && let Some(me) = self.store.me().map(|u| u.id)
+            && let Some(c) = self.store.channel(m.channel_id)
+            && notify::should_notify(m, me, matches!(c.kind, 1 | 3), self.nav.selected, self.focused.load(Ordering::Relaxed))
+        {
+            let (title, body) = notify::notification_text(m, &self.store);
+            notify::show(&title, &body);
+        }
         if ready {
             tracing::info!(guilds = self.store.guilds().len(), "READY");
             bridge::logged_in(&self.ui, self.store.me().map(|u| u.id));
