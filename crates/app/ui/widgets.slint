@@ -1,0 +1,21 @@
+// Small shared pieces.
+export component Badge inherits Rectangle {
+    in property <int> count;
+    visible: count > 0;
+    width: max(16px, label.preferred-width + 8px);
+    height: 16px;
+    border-radius: 8px;
+    background: #da373c;
+    label := Text {
+        text: count;
+        color: white;
+        font-size: 11px;
+        font-weight: 700;
+    }
+}
+
+export component Dot inherits Rectangle {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+}

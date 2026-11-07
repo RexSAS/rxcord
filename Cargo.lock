@@ -4679,6 +4679,7 @@ dependencies = [
  "qrcode",
  "rxcord-api",
  "rxcord-store",
+ "serde",
  "serde_json",
  "slint",
  "slint-build",

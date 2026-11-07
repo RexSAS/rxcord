@@ -1,5 +1,5 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
-use crate::nav::{Ack, HISTORY_PAGE, Nav};
+use crate::nav::{Ack, DMS_NODE, HISTORY_PAGE, Nav};
 use crate::{AppWindow, bridge, compose, images, notify, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
@@ -9,7 +9,7 @@ use rxcord_api::remote_auth::{QrStatus, qr_login};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -18,9 +18,11 @@ pub enum Command {
     LoginToken(String),
     StartQr,
     Logout,
-    /// `None` = Direct Messages
-    SelectGuild(Option<Id>),
+    /// Expand or collapse a tree node (guild id or `DMS_NODE`).
+    ToggleNode(Id),
+    /// Open the channel's tab, or activate it.
     OpenChannel(Id),
+    CloseTab(Id),
     BottomVisible(bool),
     /// The window gained or lost focus (state is in the shared `focused` flag).
     FocusChanged,
@@ -55,14 +57,15 @@ enum Input {
 }
 
 /// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
-pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>) -> UnboundedSender<Command> {
+/// `last_guild` (0 = none): expanded on login, updated as guilds are used; main.rs saves it on exit.
+pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_guild: Arc<AtomicU64>) -> UnboundedSender<Command> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("rxcord-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
             let (store, tasks, nav, thumbs) = (Store::new(), JoinSet::new(), Nav::default(), images::Thumbs::new());
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs }.run(rx));
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs, last_guild }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -79,6 +82,7 @@ struct Runtime {
     nav: Nav,
     focused: Arc<AtomicBool>,
     thumbs: images::Thumbs,
+    last_guild: Arc<AtomicU64>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -95,7 +99,10 @@ impl Runtime {
             {
                 let (ready, msgs) = crate::demo::events();
                 self.event(ready);
-                self.command(Command::SelectGuild(Some(Id(crate::demo::GUILD)))).await;
+                if !self.nav.expanded.contains(&Id(crate::demo::GUILD)) {
+                    self.command(Command::ToggleNode(Id(crate::demo::GUILD))).await;
+                }
+                self.command(Command::OpenChannel(Id(200))).await;
                 self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
                 msgs.into_iter().for_each(|m| self.event(m));
                 self.command(crate::demo::failed_send()).await;
@@ -202,11 +209,17 @@ impl Runtime {
             }
             Command::StartQr => self.show_login(""),
             Command::Logout => self.logout("").await,
-            Command::SelectGuild(g) => {
-                self.nav.guild = g;
-                bridge::push_channels(&self.ui, &self.store, self.nav.guild);
-                bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
+            Command::ToggleNode(n) => {
+                if !self.nav.expanded.remove(&n) {
+                    self.nav.expanded.insert(n);
+                    self.used_guild(n);
+                }
+                bridge::push_tree(&self.ui, &self.store, &mut self.nav);
             }
+            Command::CloseTab(id) => match self.nav.close_tab(&mut self.store, id) {
+                Some(next) => self.show_tab(next, false),
+                None => bridge::push_tree(&self.ui, &self.store, &mut self.nav),
+            },
             Command::OpenChannel(id) => {
                 bridge::set_error(&self.ui, String::new());
                 if self.nav.selected == Some(id) {
@@ -216,12 +229,10 @@ impl Runtime {
                     }
                     return;
                 }
-                if self.nav.open(&mut self.store, id) {
-                    self.fetch(id, None);
+                if let Some(g) = self.store.channel(id).and_then(|c| c.guild_id) {
+                    self.used_guild(g);
                 }
-                bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
-                bridge::push_messages(&self.ui, &self.store, &mut self.nav);
-                self.maybe_ack(id);
+                self.show_tab(Some(id), false);
             }
             Command::LoadOlder(id) => {
                 if let Some(before) = self.nav.older_before(&self.store, id) {
@@ -272,6 +283,27 @@ impl Runtime {
         }
     }
 
+    /// Activates `next` (opening its tab) or nothing; `carry`: the previous tab's channel was deleted.
+    fn show_tab(&mut self, next: Option<Id>, carry: bool) {
+        if let Some(id) = next
+            && self.nav.open(&mut self.store, id)
+        {
+            self.fetch(id, None);
+        }
+        bridge::push_selection(&self.ui, self.nav.selected, carry);
+        bridge::push_messages(&self.ui, &self.store, &mut self.nav);
+        bridge::push_tree(&self.ui, &self.store, &mut self.nav);
+        if let Some(id) = next {
+            self.maybe_ack(id);
+        }
+    }
+
+    fn used_guild(&self, g: Id) {
+        if g != DMS_NODE {
+            self.last_guild.store(g.0, Ordering::Relaxed);
+        }
+    }
+
     async fn login(&mut self, token: String) {
         let t = token.clone();
         let _ = tokio::task::spawn_blocking(move || token::save(&t)).await;
@@ -310,12 +342,12 @@ impl Runtime {
 
     /// Pushes only the UI models a batch of store changes affects.
     fn changed(&mut self, changes: Vec<Change>) {
-        let (guilds, chans, msgs) = self.nav.affected(&self.store, &changes);
-        if guilds {
-            bridge::push_guilds(&self.ui, &self.store, &self.nav.forbidden);
+        let (tree, msgs) = self.nav.affected(&changes);
+        if changes.contains(&Change::Me) {
+            bridge::push_me(&self.ui, &self.store);
         }
-        if chans {
-            bridge::push_channels(&self.ui, &self.store, self.nav.guild);
+        if tree {
+            bridge::push_tree(&self.ui, &self.store, &mut self.nav);
         }
         if msgs {
             bridge::push_messages(&self.ui, &self.store, &mut self.nav);
@@ -340,10 +372,9 @@ impl Runtime {
     fn event(&mut self, ev: Event) {
         let ready = matches!(ev, Event::Ready(_));
         let changes = self.store.apply(&ev);
-        if self.nav.drop_missing_selection(&self.store) {
+        if let Some(next) = self.nav.drop_missing_tabs(&mut self.store) {
             bridge::set_error(&self.ui, String::new());
-            bridge::push_selection(&self.ui, &self.store, self.nav.guild, None);
-            bridge::push_messages(&self.ui, &self.store, &mut self.nav);
+            self.show_tab(next, true);
         }
         // Unread(channel) is only reported for a create the store saw as new, so redeliveries stay silent.
         if let Event::MessageCreate(m) = &ev
@@ -358,6 +389,10 @@ impl Runtime {
         if ready {
             tracing::info!(guilds = self.store.guilds().len(), "READY");
             bridge::logged_in(&self.ui, self.store.me().map(|u| u.id));
+            if self.nav.expanded.is_empty() {
+                self.nav.expanded.insert(DMS_NODE);
+                self.nav.expanded.insert(Id(self.last_guild.load(Ordering::Relaxed)));
+            }
             // READY drops stored messages; refetch the open channel. Older pages still in flight are stale.
             self.nav.reset_history();
             if let Some(id) = self.nav.selected
@@ -365,7 +400,7 @@ impl Runtime {
             {
                 self.fetch(id, None);
             }
-            bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);
+            bridge::push_selection(&self.ui, self.nav.selected, false);
             bridge::push_messages(&self.ui, &self.store, &mut self.nav);
         }
         self.changed(changes);
@@ -397,7 +432,7 @@ impl Runtime {
                     bridge::set_error(&self.ui, msg.into());
                 }
                 if self.nav.forbidden.contains(&channel) {
-                    bridge::push_guilds(&self.ui, &self.store, &self.nav.forbidden);
+                    bridge::push_tree(&self.ui, &self.store, &mut self.nav);
                 }
                 e
             }

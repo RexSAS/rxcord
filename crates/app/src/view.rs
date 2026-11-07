@@ -1,6 +1,7 @@
 //! Plain `Send` view structs built from the store on the runtime thread.
 use crate::images::{THUMB_MAX, fit, thumb_url};
 use crate::markdown::{Block, Mention, parse};
+use crate::nav::DMS_NODE;
 use chrono::{DateTime, FixedOffset, Local};
 use rxcord_api::id::Id;
 use rxcord_api::model::{Attachment, Channel, Message, User};
@@ -114,6 +115,47 @@ pub fn channel_rows(s: &Store, guild: Id) -> Vec<ChannelRow> {
 
 pub fn dm_rows(s: &Store) -> Vec<ChannelRow> {
     s.dms().into_iter().map(|c| channel_row(s, c)).collect()
+}
+
+/// One line of the tree: a node (DMs or a guild, `depth` 0) or a channel/category under an expanded node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeRow {
+    pub node: bool,
+    pub depth: u8,
+    pub expanded: bool,
+    /// For nodes: everything inside (the UI shows it while collapsed).
+    pub row: ChannelRow,
+}
+
+/// DMs first, then guilds in READY order; expanded nodes list their channels in Discord order.
+pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>) -> Vec<TreeRow> {
+    let node = |id: Id, name: String, unread: bool, mentions: u32, children: Vec<ChannelRow>| {
+        let open = expanded.contains(&id);
+        let row = ChannelRow { id, name, kind: 0, unread, mentions, enabled: true };
+        let mut out = vec![TreeRow { node: true, depth: 0, expanded: open, row }];
+        if open {
+            let mut in_category = false;
+            for c in children {
+                in_category |= c.kind == 4;
+                let depth = if in_category && c.kind != 4 { 2 } else { 1 };
+                out.push(TreeRow { node: false, depth, expanded: false, row: c });
+            }
+        }
+        out
+    };
+    let dms = dm_rows(s);
+    let (unread, mentions) = (dms.iter().any(|d| d.unread), dms.iter().map(|d| d.mentions).sum());
+    let mut out = node(DMS_NODE, "Direct Messages".into(), unread, mentions, dms);
+    for g in guild_rows(s, forbidden) {
+        let children = if expanded.contains(&g.id) { channel_rows(s, g.id) } else { vec![] };
+        out.extend(node(g.id, g.name, g.unread, g.mentions, children));
+    }
+    out
+}
+
+/// Open tabs in order; tabs of channels that vanished are skipped (the runtime closes them).
+pub fn tab_rows(s: &Store, tabs: &[Id]) -> Vec<ChannelRow> {
+    tabs.iter().filter_map(|t| s.channel(*t)).map(|c| channel_row(s, c)).collect()
 }
 
 /// Mention spans show names: `@user` (from the message's `mentions`, then the store), `#channel`, `@role`.
@@ -240,8 +282,8 @@ mod tests {
         assert!(!rows[0].pending && !rows[0].mine);
         let t = |url: &str, full: &str, width, height| Thumb { url: url.into(), full: full.into(), width, height };
         assert_eq!(rows[0].thumbs, [
-            t("https://media/a.png?width=400&height=200", "https://cdn/a.png", 400, 200),
-            t("https://media/b.png?width=400&height=400", "https://cdn/b.png", 200, 200), // size unknown
+            t("https://media/a.png?width=200&height=100", "https://cdn/a.png", 200, 100),
+            t("https://media/b.png?width=200&height=200", "https://cdn/b.png", 100, 100), // size unknown
         ]);
         let f = |n: &str| (n.to_string(), format!("https://cdn/{n}"));
         assert_eq!(rows[0].files, [f("d.svg"), f("c.txt")]);
@@ -319,5 +361,41 @@ mod tests {
         assert_eq!(format_time("2026-11-07T21:05:09.123000+00:00", plus2), "23:05");
         assert_eq!(format_time("2026-11-07T23:30:00+00:00", plus2), "01:30");
         assert_eq!(format_time("garbage", plus2), "");
+    }
+
+    #[test]
+    fn tree_rows_nodes_children_and_totals() {
+        let ready = json!({
+            "user": {"id": "1", "username": "me"},
+            "guilds": [
+                {"id": "10", "name": "G", "channels": [
+                    {"id": "50", "type": 4, "name": "Cat", "position": 0},
+                    {"id": "101", "type": 0, "name": "b", "position": 1, "parent_id": "50", "last_message_id": "9"},
+                    {"id": "100", "type": 0, "name": "a", "position": 0, "last_message_id": "9"}]},
+                {"id": "11", "name": "H", "channels": [{"id": "110", "type": 0, "name": "c", "last_message_id": "9"}]}],
+            "private_channels": [{"id": "200", "type": 1, "recipient_ids": ["2"]}],
+            "users": [{"id": "2", "username": "bob"}],
+            "read_state": [{"id": "101", "last_message_id": "1", "mention_count": 2}, {"id": "100", "last_message_id": "9"},
+                {"id": "110", "last_message_id": "9"}],
+        });
+        let mut s = Store::new();
+        s.apply(&Event::Ready(Box::new(serde_json::from_value(ready).unwrap())));
+        let none = HashSet::new();
+        let shape = |rows: &[TreeRow]| rows.iter().map(|r| (r.row.name.clone(), r.depth, r.node)).collect::<Vec<_>>();
+        let rows = tree_rows(&s, &none, &none);
+        assert_eq!(shape(&rows), [("Direct Messages".into(), 0, true), ("G".into(), 0, true), ("H".into(), 0, true)]);
+        assert!(rows[1].row.unread && rows[1].row.mentions == 2 && !rows[1].expanded, "collapsed guild totals");
+        assert!(!rows[2].row.unread);
+        let open: HashSet<Id> = [DMS_NODE, Id(10)].into();
+        let rows = tree_rows(&s, &open, &none);
+        assert_eq!(shape(&rows), [
+            ("Direct Messages".into(), 0, true), ("bob".into(), 1, false),
+            ("G".into(), 0, true), ("a".into(), 1, false), ("Cat".into(), 1, false), ("b".into(), 2, false),
+            ("H".into(), 0, true)]);
+        assert!(rows[2].expanded && rows[5].row.unread);
+        let forbidden: HashSet<Id> = [Id(101)].into();
+        assert!(!tree_rows(&s, &none, &forbidden)[1].row.unread, "403 channels don't light the node");
+        let tabs = tab_rows(&s, &[Id(200), Id(999), Id(100)]);
+        assert_eq!(tabs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["bob", "a"]);
     }
 }

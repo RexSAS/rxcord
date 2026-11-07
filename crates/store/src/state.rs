@@ -275,6 +275,11 @@ impl Store {
         }
     }
 
+    /// Drops the loaded messages of `id` (its tab closed); new messages stop being kept until it's reopened.
+    pub fn forget_channel(&mut self, id: Id) {
+        self.msgs.remove(&id);
+    }
+
     /// `msgs` is newest-first as returned by the API.
     pub fn prepend_history(&mut self, channel: Id, msgs: Vec<Message>) -> Vec<Change> {
         let q = self.msgs.entry(channel).or_default();

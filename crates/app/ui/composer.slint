@@ -28,7 +28,7 @@ export component Composer inherits VerticalLayout {
         root.error = "";
     }
 
-    padding: 8px;
+    padding: 6px;
     spacing: 4px;
 
     if root.reply-id != "" || root.edit-id != "": HorizontalLayout {
@@ -62,7 +62,8 @@ export component Composer inherits VerticalLayout {
         spacing: 8px;
         input := TextEdit {
             text <=> root.text;
-            height: 72px;
+            // one line; longer text (Shift+Enter) scrolls inside
+            height: 40px;
             wrap: word-wrap;
             placeholder-text: "Message";
             key-pressed(e) => {
@@ -82,7 +83,7 @@ export component Composer inherits VerticalLayout {
             }
         }
         VerticalLayout {
-            alignment: end;
+            alignment: center;
             spacing: 4px;
             if root.count > 1800: Text {
                 text: root.count + "/2000";

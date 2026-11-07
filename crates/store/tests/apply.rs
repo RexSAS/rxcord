@@ -260,3 +260,16 @@ fn channel_create_dm_with_full_recipients_names_the_dm() {
     assert_eq!(ch.recipient_ids, vec![Id(555)]);
     assert_eq!(s.user(Id(555)).unwrap().display_name(), "Bob");
 }
+
+#[test]
+fn forget_channel_stops_keeping_messages() {
+    let mut s = ready_store();
+    s.open_channel(GCH);
+    create(&mut s, msg(1, GCH, Id(2)));
+    assert_eq!(s.messages(GCH).len(), 1);
+    s.forget_channel(GCH);
+    assert!(s.messages(GCH).is_empty());
+    create(&mut s, msg(2, GCH, Id(2)));
+    assert!(s.messages(GCH).is_empty(), "closed channel keeps no messages");
+    assert!(s.is_unread(GCH), "but its unread state still updates");
+}

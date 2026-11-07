@@ -2,16 +2,12 @@
 use crate::markdown::{Block, Span};
 use crate::nav::Nav;
 use crate::images::ThumbUpdate;
-use crate::view::{self, ChannelRow, GuildRow, MessageRow, Thumb};
-use crate::{AppWindow, BlockItem, ChannelItem, FileItem, GuildItem, MessageItem, ThumbItem};
+use crate::view::{self, ChannelRow, MessageRow, Thumb, TreeRow};
+use crate::{AppWindow, FileItem, MessageItem, TabItem, ThumbItem, TreeItem};
 use rxcord_api::id::Id;
 use rxcord_api::remote_auth::QrStatus;
 use rxcord_store::Store;
-use std::collections::HashSet;
 use slint::{Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, StyledText, VecModel, Weak};
-
-/// Guild id the UI uses for the "Direct Messages" entry.
-pub const DMS: &str = "@me";
 
 pub fn with_ui(ui: &Weak<AppWindow>, f: impl FnOnce(AppWindow) + Send + 'static) {
     let ui = ui.clone();
@@ -29,13 +25,11 @@ fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
 /// Empties every navigation model (new session).
 pub fn clear(ui: &Weak<AppWindow>) {
     with_ui(ui, |ui| {
-        ui.set_guilds(ModelRc::default());
-        ui.set_channels(ModelRc::default());
+        ui.set_tree(model(vec![])); // must stay a VecModel, see `set_tree`
+        ui.set_tabs(ModelRc::default());
         ui.set_messages(model(vec![])); // must stay a VecModel, see `set_messages`
-        ui.set_selected_guild(DMS.into());
         ui.set_selected_channel("".into());
-        ui.set_guild_title("".into());
-        ui.set_channel_title("".into());
+        ui.set_me_name("".into());
         ui.set_messages_error("".into());
         // Composer text and reply/edit mode are left alone: the selected-channel change saves the draft.
         ui.set_composer_error("".into());
@@ -107,29 +101,60 @@ fn row_error(ui: &AppWindow, id: Id, msg: &str) {
     ui.set_row_error(msg.into());
 }
 
-pub fn push_guilds(ui: &Weak<AppWindow>, s: &Store, forbidden: &HashSet<Id>) {
-    let dms = view::dm_rows(s);
-    let summary = (dms.iter().any(|d| d.unread), dms.iter().map(|d| d.mentions).sum());
-    set_guilds(ui, view::guild_rows(s, forbidden), summary);
+/// Tree and tabs. Rows that didn't change aren't touched, so a busy server doesn't redraw the tree.
+pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
+    let rows = view::tree_rows(s, &nav.expanded, &nav.forbidden);
+    let tabs: Vec<TabItem> = view::tab_rows(s, nav.tabs.ids()).into_iter().map(tab_item).collect();
+    let edits: Option<Vec<(usize, TreeRow)>> = (rows.len() == nav.tree.len())
+        .then(|| rows.iter().enumerate().filter(|(i, r)| nav.tree[*i] != **r).map(|(i, r)| (i, r.clone())).collect());
+    let full = edits.is_none().then(|| rows.clone());
+    nav.tree = rows;
+    with_ui(ui, move |ui| {
+        let m = ui.get_tree();
+        match (full, m.as_any().downcast_ref::<VecModel<TreeItem>>()) {
+            (None, Some(vm)) => edits.into_iter().flatten().for_each(|(i, r)| vm.set_row_data(i, tree_item(r))),
+            (Some(rows), Some(vm)) => vm.set_vec(rows.into_iter().map(tree_item).collect::<Vec<_>>()),
+            _ => {}
+        }
+        if ui.get_tabs().iter().ne(tabs.iter().cloned()) {
+            ui.set_tabs(model(tabs));
+        }
+    });
 }
 
-/// Channels of `guild`, or the DM list for `None`.
-pub fn push_channels(ui: &Weak<AppWindow>, s: &Store, guild: Option<Id>) {
-    let rows = match guild {
-        Some(g) => view::channel_rows(s, g),
-        None => view::dm_rows(s),
-    };
-    set_channels(ui, rows);
+fn tree_item(r: TreeRow) -> TreeItem {
+    TreeItem {
+        id: r.row.id.to_string().into(),
+        name: if r.row.kind == 4 && !r.node { r.row.name.to_uppercase() } else { r.row.name }.into(),
+        node: r.node,
+        expanded: r.expanded,
+        depth: r.depth.into(),
+        kind: r.row.kind.into(),
+        unread: r.row.unread,
+        mentions: r.row.mentions as i32,
+        enabled: r.row.enabled,
+    }
 }
 
-pub fn push_selection(ui: &Weak<AppWindow>, s: &Store, guild: Option<Id>, selected: Option<Id>) {
-    let (guild, guild_title) = match guild {
-        None => (DMS.to_string(), "Direct Messages".to_string()),
-        Some(g) => (g.to_string(), s.guilds().iter().find(|x| x.id == g).map(|x| x.name.clone()).unwrap_or_default()),
-    };
-    let ch = selected.and_then(|c| s.channel(c));
-    let title = ch.map(|c| view::channel_row(s, c).name).unwrap_or_default();
-    set_selection(ui, guild, ch.map(|c| c.id.to_string()).unwrap_or_default(), guild_title, title);
+fn tab_item(c: ChannelRow) -> TabItem {
+    TabItem { id: c.id.to_string().into(), name: c.name.into(), kind: c.kind.into(), unread: c.unread, mentions: c.mentions as i32 }
+}
+
+/// The active tab. `carry`: the previous one was deleted, its composer text moves along.
+pub fn push_selection(ui: &Weak<AppWindow>, selected: Option<Id>, carry: bool) {
+    let id = selected.map(|c| c.to_string()).unwrap_or_default();
+    with_ui(ui, move |ui| {
+        if carry {
+            ui.set_carry_draft(true);
+        }
+        ui.set_selected_channel(id.into());
+    });
+}
+
+/// Status bar name.
+pub fn push_me(ui: &Weak<AppWindow>, s: &Store) {
+    let name = s.me().map(|u| u.display_name().to_string()).unwrap_or_default();
+    with_ui(ui, move |ui| ui.set_me_name(name.into()));
 }
 
 /// Sends the selected channel's rows: a full replace for another channel or a first fill, else row edits.
@@ -151,46 +176,6 @@ pub fn push_messages(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
 /// One-line notice in the message pane (empty hides it).
 pub fn set_error(ui: &Weak<AppWindow>, msg: String) {
     with_ui(ui, move |ui| ui.set_messages_error(msg.into()));
-}
-
-/// `dms` = (any DM unread, total DM mentions) for the "Direct Messages" entry on top.
-fn set_guilds(ui: &Weak<AppWindow>, rows: Vec<GuildRow>, dms: (bool, u32)) {
-    with_ui(ui, move |ui| {
-        let dm =
-            GuildItem { id: DMS.into(), name: "Direct Messages".into(), short: "DM".into(), unread: dms.0, mentions: dms.1 as i32 };
-        let guilds = rows.into_iter().map(|g| GuildItem {
-            id: g.id.to_string().into(),
-            short: g.name.split_whitespace().filter_map(|w| w.chars().next()).take(3).collect::<String>().into(),
-            name: g.name.into(),
-            unread: g.unread,
-            mentions: g.mentions as i32,
-        });
-        ui.set_guilds(model(std::iter::once(dm).chain(guilds).collect()));
-    });
-}
-
-fn set_channels(ui: &Weak<AppWindow>, rows: Vec<ChannelRow>) {
-    with_ui(ui, move |ui| {
-        let items = rows.into_iter().map(|c| ChannelItem {
-            id: c.id.to_string().into(),
-            name: if c.kind == 4 { c.name.to_uppercase() } else { c.name }.into(),
-            kind: c.kind.into(),
-            unread: c.unread,
-            mentions: c.mentions as i32,
-            enabled: c.enabled,
-        });
-        ui.set_channels(model(items.collect()));
-    });
-}
-
-/// Ids and header titles of the selected guild (`DMS` for DMs) and channel.
-fn set_selection(ui: &Weak<AppWindow>, guild: String, channel: String, guild_title: String, channel_title: String) {
-    with_ui(ui, move |ui| {
-        ui.set_selected_guild(guild.into());
-        ui.set_selected_channel(channel.into());
-        ui.set_guild_title(guild_title.into());
-        ui.set_channel_title(channel_title.into());
-    });
 }
 
 /// `reset`: replace everything and scroll to the newest row. Otherwise apply the `(start, remove, rows)`
@@ -217,15 +202,11 @@ fn set_messages(ui: &Weak<AppWindow>, reset: bool, edits: Vec<(usize, usize, Vec
 }
 
 fn message_item(r: MessageRow) -> MessageItem {
-    let blocks = r.blocks.iter().map(|b| match b {
-        Block::Para(spans) => BlockItem { code: false, text: styled(spans), raw: Default::default() },
-        Block::Code { text, .. } => BlockItem { code: true, text: Default::default(), raw: text.into() },
-    });
     MessageItem {
-        id: r.id.map(|i| i.to_string()).or(r.nonce).unwrap_or_default().into(),
+        id: r.id.map(|i| i.to_string()).or(r.nonce.clone()).unwrap_or_default().into(),
+        body: styled(&body_spans(&r)),
         author: r.author.into(),
         time: r.time.into(),
-        blocks: model(blocks.collect()),
         reply: r.reply_preview.unwrap_or_default().into(),
         thumbs: model(r.thumbs.into_iter().map(thumb_item).collect()),
         files: model(r.files.into_iter().map(|(name, url)| FileItem { name: name.into(), url: url.into() }).collect()),
@@ -234,6 +215,32 @@ fn message_item(r: MessageRow) -> MessageItem {
         failed: r.failed,
         mine: r.mine,
     }
+}
+
+/// Compact row text: "HH:MM Name: " then every block (code as inline code, line by line), blank-line separated.
+fn body_spans(r: &MessageRow) -> Vec<Span> {
+    let plain = |t: &str| Span { text: t.into(), ..Default::default() };
+    let mut out = vec![plain(&format!("{} ", r.time)), Span { text: r.author.clone(), bold: true, ..Default::default() }, plain(": ")];
+    for (i, b) in r.blocks.iter().enumerate() {
+        if i > 0 || matches!(b, Block::Code { .. }) {
+            out.push(plain(if i > 0 { "\n\n" } else { "\n" }));
+        }
+        match b {
+            Block::Para(spans) => out.extend(spans.iter().cloned()),
+            Block::Code { text, .. } => {
+                for (j, l) in text.trim_end_matches('\n').split('\n').enumerate() {
+                    if j > 0 {
+                        out.push(plain("\n"));
+                    }
+                    out.push(Span { text: l.into(), code: true, ..Default::default() });
+                }
+            }
+        }
+    }
+    if r.edited {
+        out.push(Span { text: " (edited)".into(), italic: true, ..Default::default() });
+    }
+    out
 }
 
 fn thumb_item(t: Thumb) -> ThumbItem {
@@ -407,6 +414,33 @@ fn qr_pixels(url: &str) -> SharedPixelBuffer<Rgba8Pixel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_has_header_code_lines_and_edited_mark() {
+        let r = MessageRow {
+            id: None,
+            nonce: None,
+            author: "bob".into(),
+            time: "12:01".into(),
+            blocks: vec![
+                Block::Para(vec![Span { text: "hi".into(), ..Default::default() }]),
+                Block::Code { lang: None, text: "a\n b\n".into() },
+            ],
+            thumbs: vec![],
+            files: vec![],
+            reply_preview: None,
+            edited: true,
+            mine: false,
+            pending: false,
+            failed: false,
+        };
+        let s = body_spans(&r);
+        let text: String = s.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(text, "12:01 bob: hi\n\na\n b (edited)");
+        assert!(s[1].bold && s.iter().filter(|x| x.code).count() == 2);
+        let empty = MessageRow { blocks: vec![], edited: false, ..r };
+        assert_eq!(body_spans(&empty).len(), 3, "attachment-only message: just the header");
+    }
 
     fn row(id: u64, text: &str) -> MessageRow {
         MessageRow {

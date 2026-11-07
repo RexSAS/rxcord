@@ -1,0 +1,72 @@
+import { Palette } from "std-widgets.slint";
+import { Badge } from "widgets.slint";
+
+export struct TabItem {
+    id: string,
+    name: string,
+    kind: int,
+    unread: bool,
+    mentions: int,
+}
+
+// One tab per open channel or DM. Click activates, × or middle click closes.
+export component Tabs inherits Rectangle {
+    in property <[TabItem]> tabs;
+    in property <string> active;
+    callback activate(string);
+    callback close(string);
+
+    height: 26px;
+    background: Palette.alternate-background;
+    Flickable {
+        content-width: max(self.width, row.preferred-width);
+        row := HorizontalLayout {
+            alignment: start;
+            for t in root.tabs: Rectangle {
+                property <bool> on: t.id == root.active;
+                background: on ? Palette.background : ta.has-hover ? Palette.control-background : transparent;
+                border-width: on ? 1px : 0;
+                border-color: Palette.border;
+                accessible-role: tab;
+                accessible-label: t.name;
+                accessible-item-selected: on;
+                accessible-action-default => { root.activate(t.id); }
+                ta := TouchArea {
+                    clicked => { root.activate(t.id); }
+                    pointer-event(e) => {
+                        if e.button == PointerEventButton.middle && e.kind == PointerEventKind.up { root.close(t.id); }
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 4px;
+                    spacing: 4px;
+                    Text {
+                        text: (t.kind == 1 || t.kind == 3 ? "" : "#") + t.name;
+                        vertical-alignment: center;
+                        max-width: 140px;
+                        overflow: elide;
+                        font-size: 12px;
+                        font-weight: t.unread && !on ? 700 : 400;
+                    }
+                    Badge {
+                        y: (parent.height - self.height) / 2;
+                        count: on ? 0 : t.mentions;
+                    }
+                    x := TouchArea {
+                        width: 14px;
+                        accessible-role: button;
+                        accessible-label: "Close " + t.name;
+                        accessible-action-default => { root.close(t.id); }
+                        clicked => { root.close(t.id); }
+                        Text {
+                            text: "×";
+                            opacity: x.has-hover ? 1.0 : 0.5;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -98,6 +98,16 @@ impl Drafts {
         to.and_then(|c| self.saved.remove(&c)).unwrap_or_default()
     }
 
+    /// The current channel was deleted: its `text` moves on to `to` (after `to`'s own draft) instead of
+    /// being saved under a channel that no longer exists. With no `to`, it stays in the composer.
+    pub fn carry(&mut self, text: String, to: Option<Id>) -> String {
+        if let Some(c) = self.current.take() {
+            self.saved.remove(&c);
+        }
+        self.current = to;
+        join(&to.and_then(|c| self.saved.remove(&c)).unwrap_or_default(), &text)
+    }
+
     /// Appends restored text to `ch`'s draft; returns the new composer text when `ch` is the one shown.
     pub fn restore(&mut self, ch: Id, text: &str, composer: &str) -> Option<String> {
         if self.current == Some(ch) {
@@ -198,5 +208,17 @@ mod tests {
         assert_eq!(edit_target(&s, ch, Some(Id(500))), Some((Id(500), "m500".into())));
         assert_eq!(edit_target(&s, ch, Some(Id(501))), None, "not mine");
         assert_eq!(edit_target(&s, Id(999), None), None);
+    }
+
+    #[test]
+    fn carry_moves_text_of_deleted_channel() {
+        let mut d = Drafts::default();
+        d.switch(String::new(), Some(Id(1)));
+        d.switch("draft two".into(), Some(Id(3))); // channel 1 had an empty draft; 2 never visited
+        d.switch("three".into(), Some(Id(2)));
+        assert_eq!(d.carry("orphan".into(), Some(Id(3))), "three\n\norphan");
+        assert_eq!(d.switch("x".into(), Some(Id(2))), "", "the deleted channel's draft is not kept");
+        assert_eq!(d.carry("left".into(), None), "left", "no tab left: stays in the composer");
+        assert_eq!(d.switch("y".into(), Some(Id(3))), "x", "carry left the other drafts alone");
     }
 }
