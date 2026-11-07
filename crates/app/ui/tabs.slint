@@ -9,12 +9,17 @@ export struct TabItem {
     mentions: int,
 }
 
-// One tab per open channel or DM. Click activates, × or middle click closes.
+// One tab per open channel or DM. Click activates, × or middle click closes. The active DM's 📞
+// starts a call; while we're in that call it's ✖ (hang up).
 export component Tabs inherits Rectangle {
     in property <[TabItem]> tabs;
     in property <string> active;
+    // the voice channel or call we're in ("" = none)
+    in property <string> in-call;
     callback activate(string);
     callback close(string);
+    callback call(string);
+    callback hang-up();
 
     height: 26px;
     background: Palette.alternate-background;
@@ -52,6 +57,20 @@ export component Tabs inherits Rectangle {
                     Badge {
                         y: (parent.height - self.height) / 2;
                         count: on ? 0 : t.mentions;
+                    }
+                    if on && (t.kind == 1 || t.kind == 3): ph := TouchArea {
+                        property <bool> in-it: root.in-call == t.id;
+                        width: 18px;
+                        accessible-role: button;
+                        accessible-label: in-it ? "Hang up" : "Call " + t.name;
+                        accessible-action-default => { if in-it { root.hang-up(); } else { root.call(t.id); } }
+                        clicked => { if in-it { root.hang-up(); } else { root.call(t.id); } }
+                        Text {
+                            text: in-it ? "✖" : "📞";
+                            color: in-it ? #ed4245 : Palette.foreground;
+                            opacity: ph.has-hover ? 1.0 : 0.7;
+                            vertical-alignment: center;
+                        }
                     }
                     x := TouchArea {
                         width: 14px;

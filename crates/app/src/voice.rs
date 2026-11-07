@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// An unanswered incoming call stops ringing here.
+pub const RING_TIMEOUT: Duration = Duration::from_secs(45);
 /// How often a lost or missing device is tried again.
 const REOPEN_EVERY: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(10);
@@ -35,11 +37,16 @@ pub enum Effect {
     Disconnect,
     /// Shown in the status bar for a few seconds.
     Notice(&'static str),
+    /// Ring the other people of this DM call (REST).
+    Ring(Id),
 }
 
 struct Target {
-    guild: Id,
+    /// None for a DM call.
+    guild: Option<Id>,
     channel: Id,
+    /// We started this call: ring the others once our voice state is in.
+    ring: bool,
     session: Option<String>,
     /// (token, endpoint)
     server: Option<(String, String)>,
@@ -60,8 +67,8 @@ pub struct Controller {
 }
 
 impl Controller {
-    fn op4(&self, guild: Id, channel: Option<Id>) -> Effect {
-        Effect::Gateway(GatewayCmd::VoiceState { guild_id: Some(guild), channel_id: channel, self_mute: self.mute, self_deaf: self.deaf })
+    fn op4(&self, guild: Option<Id>, channel: Option<Id>) -> Effect {
+        Effect::Gateway(GatewayCmd::VoiceState { guild_id: guild, channel_id: channel, self_mute: self.mute, self_deaf: self.deaf })
     }
 
     pub fn muted(&self) -> bool {
@@ -96,8 +103,8 @@ impl Controller {
         self.target.iter().map(|t| self.op4(t.guild, Some(t.channel))).collect()
     }
 
-    /// (guild, channel) we're in or joining.
-    pub fn channel(&self) -> Option<(Id, Id)> {
+    /// (guild, channel) we're in or joining; guild None for a DM call.
+    pub fn channel(&self) -> Option<(Option<Id>, Id)> {
         self.target.as_ref().map(|t| (t.guild, t.channel))
     }
 
@@ -110,8 +117,8 @@ impl Controller {
         self.target.as_ref().filter(|t| !t.connected).map(|t| t.deadline)
     }
 
-    /// Join `channel`, leaving (moving out of) any current one: one op 4.
-    pub fn join(&mut self, guild: Id, channel: Id, now: Instant) -> Vec<Effect> {
+    /// Join `channel` (guild None: a DM call), leaving (moving out of) any current one: one op 4.
+    pub fn join(&mut self, guild: Option<Id>, channel: Id, now: Instant) -> Vec<Effect> {
         if self.target.as_ref().is_some_and(|t| t.channel == channel) {
             return vec![];
         }
@@ -119,8 +126,17 @@ impl Controller {
         if self.connected() {
             fx.push(Effect::Disconnect);
         }
-        self.target = Some(Target { guild, channel, session: None, server: None, connected: false, deadline: now + JOIN_TIMEOUT });
+        self.target = Some(Target { guild, channel, ring: false, session: None, server: None, connected: false, deadline: now + JOIN_TIMEOUT });
         fx.push(self.op4(guild, Some(channel)));
+        fx
+    }
+
+    /// Start a call in DM `channel`: join it, then ring the others once Discord accepted the join.
+    pub fn call(&mut self, channel: Id, now: Instant) -> Vec<Effect> {
+        let fx = self.join(None, channel, now);
+        if let Some(t) = self.target.as_mut().filter(|_| !fx.is_empty()) {
+            t.ring = true;
+        }
         fx
     }
 
@@ -138,9 +154,15 @@ impl Controller {
     /// Main-gateway events; `me` is our user id.
     pub fn event(&mut self, ev: &Event, me: Id) -> Vec<Effect> {
         let Some(t) = &mut self.target else { return vec![] };
+        // the voice server's id: the guild, or the DM channel for a call
+        let server_id = t.guild.unwrap_or(t.channel);
+        let mut fx = vec![];
         match ev {
             Event::VoiceStateUpdate(v) if v.user_id == me && v.channel_id == Some(t.channel) => {
                 t.session = Some(v.session_id.clone());
+                if std::mem::take(&mut t.ring) {
+                    fx.push(Effect::Ring(t.channel));
+                }
             }
             // Disconnected by a moderator or another client of ours. While still joining it may be the
             // echo of leaving the previous channel, so only a live connection counts.
@@ -149,20 +171,19 @@ impl Controller {
                 return vec![Effect::Disconnect, Effect::Notice("Disconnected from voice")];
             }
             // endpoint null: the server is still being allocated, another update follows
-            Event::VoiceServerUpdate(s) if s.guild_id == Some(t.guild) && s.endpoint.is_some() => {
+            Event::VoiceServerUpdate(s) if s.guild_id.or(s.channel_id) == Some(server_id) && s.endpoint.is_some() => {
                 let endpoint = s.endpoint.clone().unwrap_or_default();
                 // Same endpoint while connected: a main-gateway reconnect replaying op 4; the voice
                 // connection keeps going. // VERIFY LIVE
                 if t.connected && t.server.as_ref().is_some_and(|(_, e)| *e == endpoint) {
-                    return vec![];
+                    return fx;
                 }
                 t.server = Some((s.token.clone(), endpoint));
             }
-            _ => return vec![],
+            _ => return fx,
         }
-        let (Some(session), Some((token, endpoint))) = (&t.session, &t.server) else { return vec![] };
-        let connect = Connect { server_id: t.guild.0, user_id: me.0, session_id: session.clone(), token: token.clone(), endpoint: endpoint.clone() };
-        let mut fx = vec![];
+        let (Some(session), Some((token, endpoint))) = (&t.session, &t.server) else { return fx };
+        let connect = Connect { server_id: server_id.0, user_id: me.0, session_id: session.clone(), token: token.clone(), endpoint: endpoint.clone() };
         if t.connected {
             fx.push(Effect::Disconnect); // voice server changed
         }
@@ -196,10 +217,54 @@ impl Controller {
     }
 }
 
+/// The incoming-call prompt: one call at a time, shown once per call while it rings us.
+#[derive(Default)]
+pub struct Incoming {
+    /// The DM channel and when its prompt appeared.
+    prompt: Option<(Id, Instant)>,
+    /// Calls we answered (accept, decline, timeout) that still ring us: not shown again.
+    answered: HashSet<Id>,
+}
+
+impl Incoming {
+    /// The call being prompted for.
+    pub fn channel(&self) -> Option<Id> {
+        self.prompt.map(|p| p.0)
+    }
+
+    /// When the prompt gives up (`end` it then).
+    pub fn deadline(&self) -> Option<Instant> {
+        self.prompt.map(|p| p.1 + RING_TIMEOUT)
+    }
+
+    /// Calls changed; `ringing` is `Store::ringing_me`. Returns the call that just got its prompt (notify).
+    pub fn sync(&mut self, ringing: &[Id], now: Instant) -> Option<Id> {
+        self.answered.retain(|c| ringing.contains(c));
+        if self.prompt.is_some_and(|p| !ringing.contains(&p.0)) {
+            self.prompt = None;
+        }
+        if self.prompt.is_some() {
+            return None;
+        }
+        let c = *ringing.iter().find(|c| !self.answered.contains(c))?;
+        self.prompt = Some((c, now));
+        Some(c)
+    }
+
+    /// Accepted, declined or timed out: the prompt goes and isn't shown again while that call rings.
+    pub fn end(&mut self) -> Option<Id> {
+        let (c, _) = self.prompt.take()?;
+        self.answered.insert(c);
+        Some(c)
+    }
+}
+
 /// What the voice bar shows; text "" when not in voice.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Bar {
     pub text: String,
+    /// The channel we're in or joining ("" = none): the active DM tab's 📞 becomes ✖.
+    pub channel: String,
     pub muted: bool,
     pub deafened: bool,
     /// The level dot: the mic hears speech and we're not muted.
@@ -239,6 +304,8 @@ pub enum ToAudio {
     Input(Option<String>, bool),
     /// Reopen the speaker.
     Output(Option<String>),
+    /// Mix the incoming-call ring in, or stop it.
+    Ring(bool),
 }
 
 /// What the audio thread opens devices with and applies to them (again after a reopen).
@@ -250,6 +317,7 @@ pub struct AudioCfg {
     pub threshold: f32,
     pub deafened: bool,
     pub gains: HashMap<u64, f32>,
+    pub ringing: bool,
 }
 
 impl AudioCfg {
@@ -262,6 +330,7 @@ impl AudioCfg {
             threshold: s.vad_threshold,
             deafened,
             gains: users.filter_map(|u| Some((u.parse().ok()?, s.gain(u)))).collect(),
+            ringing: false,
         }
     }
 }
@@ -389,6 +458,7 @@ trait Output {
     fn levels(&self) -> Vec<(u64, bool)>;
     fn set_gain(&mut self, user_id: u64, gain: f32);
     fn set_deafened(&mut self, deafened: bool);
+    fn set_ringing(&mut self, on: bool);
 }
 
 impl Output for Playback {
@@ -409,6 +479,9 @@ impl Output for Playback {
     }
     fn set_deafened(&mut self, deafened: bool) {
         Playback::set_deafened(self, deafened)
+    }
+    fn set_ringing(&mut self, on: bool) {
+        Playback::set_ringing(self, on)
     }
 }
 
@@ -517,6 +590,10 @@ impl Audio {
                         cfg.output = dev;
                         out.reopen();
                     }
+                    Ok(ToAudio::Ring(on)) => {
+                        cfg.ringing = on;
+                        out.dev.iter_mut().for_each(|o| o.set_ringing(on));
+                    }
                     Err(std_mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
                 }
@@ -526,6 +603,7 @@ impl Audio {
             let opened_out = || {
                 open_out(&cfg).map(|mut o| {
                     o.set_deafened(cfg.deafened);
+                    o.set_ringing(cfg.ringing);
                     cfg.gains.iter().for_each(|(u, g)| o.set_gain(*u, *g));
                     o
                 })
@@ -622,19 +700,21 @@ mod tests {
         fx.into_iter()
             .map(|e| match e {
                 Effect::Gateway(GatewayCmd::VoiceState { guild_id, channel_id, .. }) => {
-                    format!("op4 {} {}", guild_id.unwrap().0, channel_id.map_or("null".into(), |c| c.0.to_string()))
+                    let id = |i: Option<Id>| i.map_or("null".into(), |c| c.0.to_string());
+                    format!("op4 {} {}", id(guild_id), id(channel_id))
                 }
                 Effect::Connect { connect: c, channel } => {
                     format!("connect {} {} {} {} {} {}", channel.0, c.server_id, c.user_id, c.session_id, c.token, c.endpoint)
                 }
                 Effect::Disconnect => "disconnect".into(),
                 Effect::Notice(n) => format!("notice {n}"),
+                Effect::Ring(c) => format!("ring {}", c.0),
             })
             .collect()
     }
 
     fn connected_to(c: &mut Controller, ch: Id, now: Instant) {
-        assert_eq!(names(c.join(G, ch, now)), [format!("op4 10 {}", ch.0)]);
+        assert_eq!(names(c.join(Some(G), ch, now)), [format!("op4 10 {}", ch.0)]);
         assert!(names(c.event(&server(Some("v.discord.media")), ME)).is_empty(), "waits for our state too");
         let other = ev("VOICE_STATE_UPDATE", json!({"user_id": "2", "channel_id": ch.to_string(), "session_id": "x"}));
         assert!(names(c.event(&other, ME)).is_empty(), "someone else's state");
@@ -642,13 +722,80 @@ mod tests {
         assert!(c.connected() && c.deadline().is_none());
     }
 
+    const DM: Id = Id(7);
+
+    fn ready_with_dm() -> rxcord_store::Store {
+        let mut s = rxcord_store::Store::new();
+        s.apply(&ev("READY", json!({"user": {"id": "1", "username": "me"}, "session_id": "s",
+            "private_channels": [{"id": "7", "type": 1, "recipient_ids": ["2"]}], "guilds": []})));
+        s
+    }
+    fn call(name: &str, ringing: &[&str]) -> Event {
+        ev(name, json!({"channel_id": "7", "ringing": ringing, "voice_states": [{"user_id": "2", "channel_id": "7", "session_id": "x"}]}))
+    }
+
+    #[test]
+    fn incoming_call_prompt_once() {
+        let (mut s, mut inc, t0) = (ready_with_dm(), Incoming::default(), Instant::now());
+        s.apply(&call("CALL_CREATE", &["1"]));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), Some(DM), "prompt (and notify) once");
+        assert_eq!((inc.channel(), inc.deadline()), (Some(DM), Some(t0 + RING_TIMEOUT)));
+        s.apply(&call("CALL_UPDATE", &["1"]));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), None, "still ringing: no second prompt");
+        assert_eq!(inc.channel(), Some(DM));
+        s.apply(&call("CALL_UPDATE", &[]));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), None);
+        assert_eq!((inc.channel(), inc.deadline()), (None, None), "not ringing me any more: prompt cleared");
+        assert_eq!(inc.end(), None);
+        // rung again, then declined (or timed out): gone, and not shown again while Discord still rings us
+        s.apply(&call("CALL_UPDATE", &["1"]));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), Some(DM));
+        assert_eq!(inc.end(), Some(DM));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), None);
+        assert_eq!(inc.channel(), None);
+        s.apply(&ev("CALL_DELETE", json!({"channel_id": "7"})));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), None);
+        s.apply(&call("CALL_CREATE", &["1"]));
+        assert_eq!(inc.sync(&s.ringing_me(), t0), Some(DM), "a new call prompts again");
+        s.apply(&ev("CALL_DELETE", json!({"channel_id": "7"})));
+        inc.sync(&s.ringing_me(), t0);
+        assert_eq!(inc.channel(), None, "CALL_DELETE clears the prompt");
+    }
+
+    #[test]
+    fn accept_while_in_voice_leaves_first() {
+        let (mut c, mut inc, now) = (Controller::default(), Incoming::default(), Instant::now());
+        connected_to(&mut c, A, now);
+        inc.sync(&[DM], now);
+        let ch = inc.end().unwrap();
+        assert_eq!(inc.channel(), None, "prompt (and ring) gone before joining");
+        assert_eq!(names(c.join(None, ch, now)), ["disconnect", "op4 null 7"], "guild voice stopped first, then one op 4 for the call");
+        assert_eq!(c.channel(), Some((None, DM)));
+        assert!(names(c.event(&state(ME, None), ME)).is_empty(), "the echo of leaving A");
+        let mine = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": "7", "session_id": "sess"}));
+        assert!(names(c.event(&mine, ME)).is_empty(), "accepted: nobody to ring");
+        assert!(names(c.event(&server(Some("g")), ME)).is_empty(), "a guild's server update isn't ours");
+        let dm_server = ev("VOICE_SERVER_UPDATE", json!({"token": "tok", "guild_id": null, "channel_id": "7", "endpoint": "d"}));
+        assert_eq!(names(c.event(&dm_server, ME)), ["connect 7 7 1 sess tok d"], "server id = the DM channel");
+    }
+
+    #[test]
+    fn start_call_rings_once_joined() {
+        let (mut c, now) = (Controller::default(), Instant::now());
+        assert_eq!(names(c.call(DM, now)), ["op4 null 7"]);
+        let mine = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": "7", "session_id": "sess"}));
+        assert_eq!(names(c.event(&mine, ME)), ["ring 7"], "join accepted: ring the others");
+        assert!(names(c.event(&mine, ME)).is_empty(), "rung once");
+        assert!(names(c.call(DM, now)).is_empty(), "already in it");
+    }
+
     #[test]
     fn double_join_moves() {
         let (mut c, now) = (Controller::default(), Instant::now());
         connected_to(&mut c, A, now);
-        assert!(names(c.join(G, A, now)).is_empty(), "already there: no second op 4");
-        assert_eq!(names(c.join(G, B, now)), ["disconnect", "op4 10 101"], "old driver stopped, one op 4");
-        assert_eq!(c.channel(), Some((G, B)));
+        assert!(names(c.join(Some(G), A, now)).is_empty(), "already there: no second op 4");
+        assert_eq!(names(c.join(Some(G), B, now)), ["disconnect", "op4 10 101"], "old driver stopped, one op 4");
+        assert_eq!(c.channel(), Some((Some(G), B)));
         assert!(!c.connected());
         assert!(names(c.event(&state(ME, Some(A)), ME)).is_empty(), "stale state for A");
         assert!(names(c.event(&state(ME, None), ME)).is_empty(), "echo of leaving A doesn't cancel the join");
@@ -661,7 +808,7 @@ mod tests {
     #[test]
     fn join_timeout() {
         let (mut c, t0) = (Controller::default(), Instant::now());
-        c.join(G, A, t0);
+        c.join(Some(G), A, t0);
         c.event(&state(ME, Some(A)), ME);
         assert!(names(c.event(&server(None), ME)).is_empty(), "endpoint null: keep waiting");
         assert_eq!(c.deadline(), Some(t0 + JOIN_TIMEOUT));
@@ -675,7 +822,7 @@ mod tests {
     #[test]
     fn hangup_mid_handshake_sends_null_once() {
         let (mut c, now) = (Controller::default(), Instant::now());
-        c.join(G, A, now);
+        c.join(Some(G), A, now);
         c.event(&state(ME, Some(A)), ME);
         assert_eq!(names(c.hang_up()), ["op4 10 null"], "nothing running yet: no disconnect");
         assert!(names(c.hang_up()).is_empty(), "null sent once");
@@ -736,6 +883,11 @@ mod tests {
         }
         fn set_deafened(&mut self, deafened: bool) {
             self.log.lock().unwrap().push(format!("deafened {deafened}"));
+        }
+        fn set_ringing(&mut self, on: bool) {
+            if on {
+                self.log.lock().unwrap().push("ringing".into());
+            }
         }
     }
 
@@ -869,7 +1021,7 @@ mod tests {
         c.toggle_deafen();
         assert_eq!(op4_flags(c.toggle_mute()), [(Some(A), false, false)], "unmuting undeafens");
         c.toggle_mute();
-        assert_eq!(op4_flags(c.join(G, B, now)), [(Some(B), true, false)], "flags kept across joins");
+        assert_eq!(op4_flags(c.join(Some(G), B, now)), [(Some(B), true, false)], "flags kept across joins");
         assert_eq!(op4_flags(c.hang_up()), [(None, true, false)]);
         assert!((c.muted(), c.deafened()) == (true, false));
     }
@@ -964,6 +1116,7 @@ mod tests {
         failed.store(true, Ordering::Relaxed); // speaker unplugged
         assert_eq!(next(), Some(AudioNote::Speaker(false)));
         assert_eq!(next(), Some(AudioNote::Speaker(true)));
+        media.send(ToAudio::Ring(true)).unwrap();
         media.send(ToAudio::Output(Some("hdmi".into()))).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !log.lock().unwrap().iter().any(|l| l == "open Some(\"hdmi\")") {
@@ -976,8 +1129,8 @@ mod tests {
         assert_eq!(
             log,
             "open None, deafened false, mic None false, gain 5 0, deafened true, mic Some(\"usb\") false, \
-             open None, deafened true, gain 5 0, open Some(\"hdmi\"), deafened true, gain 5 0",
-            "every reopened speaker gets deafen and gains"
+             open None, deafened true, gain 5 0, ringing, open Some(\"hdmi\"), deafened true, ringing, gain 5 0",
+            "every reopened speaker gets deafen, the ring and gains"
         );
     }
 }

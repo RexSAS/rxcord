@@ -43,8 +43,15 @@ export component AppWindow inherits Window {
     // voice bar text ("" = not in voice) and a short-lived status bar notice
     in property <string> voice;
     in property <string> notice;
+    // the channel we're in or joining ("" = none)
+    in property <string> voice-channel;
     callback join-voice(string);
     callback hang-up();
+    // DM calls: a DM tab's 📞, and the incoming-call prompt ("" = none) with its buttons
+    callback start-call(string);
+    in property <string> call-prompt;
+    callback accept-call();
+    callback decline-call();
     // voice bar buttons and the mic's level dot (hears speech, not muted)
     in property <bool> voice-muted;
     in property <bool> voice-deafened;
@@ -166,8 +173,11 @@ export component AppWindow inherits Window {
             Tabs {
                 tabs: root.tabs;
                 active: root.selected-channel;
+                in-call: root.voice-channel;
                 activate(id) => { root.select-channel(id); }
                 close(id) => { root.close-tab(id); }
+                call(id) => { root.start-call(id); }
+                hang-up => { root.hang-up(); }
             }
             Rectangle { height: 1px; background: root.line; }
             Rectangle {
@@ -284,6 +294,54 @@ export component AppWindow inherits Window {
                 }
             }
             if root.voice != "": Rectangle { height: 1px; background: root.line; }
+            if root.call-prompt != "": Rectangle {
+                height: 22px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 4px;
+                    spacing: 10px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.call-prompt;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        font-size: 12px;
+                        font-weight: 700;
+                    }
+                    accept := TouchArea {
+                        width: accept-text.preferred-width;
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Accept call";
+                        accessible-action-default => { root.accept-call(); }
+                        clicked => { root.accept-call(); }
+                        accept-text := Text {
+                            text: "Accept";
+                            color: #3ba55c;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            opacity: accept.has-hover ? 1.0 : 0.8;
+                        }
+                    }
+                    decline := TouchArea {
+                        width: decline-text.preferred-width;
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Decline call";
+                        accessible-action-default => { root.decline-call(); }
+                        clicked => { root.decline-call(); }
+                        decline-text := Text {
+                            text: "Decline";
+                            color: #ed4245;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            opacity: decline.has-hover ? 1.0 : 0.8;
+                        }
+                    }
+                }
+            }
+            if root.call-prompt != "": Rectangle { height: 1px; background: root.line; }
             // status bar
             Rectangle {
                 height: 22px;

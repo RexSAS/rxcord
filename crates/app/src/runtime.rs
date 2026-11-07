@@ -1,6 +1,6 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
 use crate::nav::{Ack, DMS_NODE, HISTORY_PAGE, Nav};
-use crate::voice::{AudioCfg, AudioNote, Bar, Conn, ConnIn, Controller, Effect, ToAudio};
+use crate::voice::{AudioCfg, AudioNote, Bar, Conn, ConnIn, Controller, Effect, Incoming, ToAudio};
 use crate::{AppWindow, bridge, compose, images, notify, settings, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::GatewayCmd;
@@ -12,6 +12,7 @@ use rxcord_api::rest::{InviteContext, JoinedGuild};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
 use rxcord_voice::driver::{VoiceEvent, VoiceStatus};
+use rxcord_voice::audio::tone::RingOut;
 use rxcord_voice::session::LeaveReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +46,11 @@ pub enum Command {
     JoinInvite { message: Id, code: String },
     /// Join this guild voice channel (moving out of any other).
     JoinVoice(Id),
+    /// A DM tab's 📞: join the DM's call and ring the others.
+    StartCall(Id),
+    /// The incoming-call prompt's buttons.
+    AcceptCall,
+    DeclineCall,
     /// The voice bar's hang-up.
     LeaveVoice,
     /// The voice bar's 🎤 and 🎧.
@@ -87,6 +93,7 @@ enum Input {
     Thumb(images::Loaded),
     Voice(ConnIn),
     VoiceTimeout,
+    RingTimeout,
     SaveSettings,
 }
 
@@ -110,7 +117,8 @@ pub fn spawn_runtime(
             }
             let session_id = String::new();
             let (voice, conn, bar, save_at) = (Controller::default(), None, Bar::default(), None);
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn, bar, save_at }.run(rx));
+            let (calls, tone) = (Incoming::default(), None);
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn, bar, save_at, calls, tone }.run(rx));
             rt.shutdown_timeout(Duration::from_millis(200)); // don't wait out blocking tasks on exit
         })
         .expect("spawn runtime thread");
@@ -145,6 +153,10 @@ struct Runtime {
     bar: Bar,
     /// Voice settings changed: written to settings.json at this time (at most once per second).
     save_at: Option<Instant>,
+    /// The incoming call we're prompting for.
+    calls: Incoming,
+    /// The ring's own output, while ringing outside voice (in voice it's mixed into the call).
+    tone: Option<RingOut>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -224,6 +236,7 @@ impl Runtime {
                 Some(Ok(l)) = self.thumbs.tasks.join_next() => Input::Thumb(l),
                 v = recv_conn(&mut self.conn) => Input::Voice(v),
                 _ = sleep_opt(self.voice.deadline()) => Input::VoiceTimeout,
+                _ = sleep_opt(self.calls.deadline()) => Input::RingTimeout,
                 _ = sleep_opt(self.save_at) => Input::SaveSettings,
             };
             match input {
@@ -239,6 +252,10 @@ impl Runtime {
                 Input::VoiceTimeout => {
                     let fx = self.voice.expire(Instant::now());
                     self.voice_effects(fx);
+                }
+                Input::RingTimeout => {
+                    self.calls.end();
+                    self.push_call();
                 }
                 Input::SaveSettings => {
                     if let Some(s) = self.unsaved_settings() {
@@ -299,6 +316,8 @@ impl Runtime {
         self.nav = Nav { settings: std::mem::take(&mut self.nav.settings), ..Default::default() };
         self.thumbs = images::Thumbs::new(); // drops the cache and aborts its fetches
         bridge::clear(&self.ui);
+        self.calls = Incoming::default();
+        self.push_call();
     }
 
     /// `error` stays on the login screen (QR updates don't replace it) until the next login attempt.
@@ -427,8 +446,34 @@ impl Runtime {
             Command::JoinVoice(ch) => {
                 let guild = self.store.channel(ch).filter(|c| c.kind == 2).and_then(|c| c.guild_id);
                 if let (Some(g), Some(_)) = (guild, &self.gw_cmds) {
-                    let fx = self.voice.join(g, ch, Instant::now());
+                    let fx = self.voice.join(Some(g), ch, Instant::now());
                     self.voice_effects(fx);
+                }
+            }
+            Command::StartCall(ch) => {
+                let dm = self.store.channel(ch).is_some_and(|c| matches!(c.kind, 1 | 3));
+                if dm && self.gw_cmds.is_some() {
+                    let fx = self.voice.call(ch, Instant::now());
+                    self.voice_effects(fx);
+                }
+            }
+            Command::AcceptCall => {
+                let Some(ch) = self.calls.end() else { return };
+                self.push_call(); // the ring stops before the call's audio starts
+                if self.gw_cmds.is_some() {
+                    let fx = self.voice.join(None, ch, Instant::now()); // moves out of any other voice channel
+                    self.voice_effects(fx);
+                }
+            }
+            Command::DeclineCall => {
+                let Some(ch) = self.calls.end() else { return };
+                self.push_call();
+                if let (Some(rest), Some(me)) = (self.rest.clone(), self.store.me().map(|u| u.id)) {
+                    tokio::spawn(async move {
+                        if let Err(e) = rest.stop_ringing(ch, me).await {
+                            tracing::warn!("stop ringing: {e}");
+                        }
+                    });
                 }
             }
             Command::LeaveVoice => {
@@ -589,6 +634,9 @@ impl Runtime {
             self.session_id = r.session_id.clone();
         }
         let changes = self.store.apply(&ev);
+        if ready || changes.iter().any(|c| matches!(c, Change::Call(_))) {
+            self.calls_changed();
+        }
         if matches!(ev, Event::VoiceStateUpdate(_) | Event::VoiceServerUpdate(_))
             && let Some(me) = self.store.me().map(|u| u.id)
         {
@@ -669,8 +717,40 @@ impl Runtime {
         self.save_at.take().map(|_| self.nav.settings.clone())
     }
 
+    /// Calls changed: a new incoming call gets its prompt and one notification; an ended one loses it.
+    fn calls_changed(&mut self) {
+        if let Some(ch) = self.calls.sync(&self.store.ringing_me(), Instant::now()) {
+            notify::show(&notify::call_title(&self.store, ch), "Incoming call");
+        }
+        self.push_call();
+    }
+
+    /// The prompt and the ring follow `calls`.
+    fn push_call(&mut self) {
+        let text = self.calls.channel().map(|c| notify::call_title(&self.store, c)).unwrap_or_default();
+        bridge::call_prompt(&self.ui, text);
+        self.sync_ring();
+    }
+
+    /// Rings while prompting: mixed into the call when in voice, else on its own output, opened only while
+    /// ringing.
+    fn sync_ring(&mut self) {
+        let on = self.calls.channel().is_some();
+        if let Some(k) = &self.conn {
+            self.tone = None;
+            return k.audio(ToAudio::Ring(on));
+        }
+        if !on {
+            self.tone = None;
+        } else if self.tone.is_none() {
+            // shortcut: opens the device on the runtime thread (a few ms, rarely more); move to spawn_blocking if it stalls
+            self.tone = RingOut::start(self.nav.settings.output_device.clone()).map_err(|e| tracing::warn!("ring output: {e}")).ok();
+        }
+    }
+
     /// Carries out what the voice controller decided. Old devices close before new ones open.
     fn voice_effects(&mut self, fx: Vec<Effect>) {
+        let had_conn = self.conn.is_some();
         for e in fx {
             match e {
                 // try_send: the gateway may be blocked handing us events; a wait here would deadlock
@@ -683,13 +763,28 @@ impl Runtime {
                 }
                 Effect::Connect { connect, channel } => {
                     self.conn = None;
-                    let k = Conn::start(connect, channel, AudioCfg::new(&self.nav.settings, self.voice.deafened()));
+                    self.tone = None; // its device closes before the call's opens
+                    let mut cfg = AudioCfg::new(&self.nav.settings, self.voice.deafened());
+                    cfg.ringing = self.calls.channel().is_some();
+                    let k = Conn::start(connect, channel, cfg);
                     k.set_muted(self.voice.muted());
                     self.conn = Some(k);
                 }
                 Effect::Disconnect => self.conn = None,
                 Effect::Notice(n) => bridge::voice_notice(&self.ui, n.into()),
+                Effect::Ring(ch) => {
+                    if let Some(rest) = self.rest.clone() {
+                        tokio::spawn(async move {
+                            if let Err(e) = rest.ring(ch).await {
+                                tracing::warn!("ring: {e}");
+                            }
+                        });
+                    }
+                }
             }
+        }
+        if had_conn && self.conn.is_none() {
+            self.sync_ring(); // still ringing: back on its own output
         }
         if !self.voice.connected() && !self.nav.speaking.is_empty() {
             self.nav.speaking.clear();
@@ -743,19 +838,26 @@ impl Runtime {
     /// The voice bar; only pushed when it changed (voice states of every server come through here).
     fn push_voice(&mut self) {
         let text = self.voice.channel().map(|(g, c)| {
-            let g = self.store.guilds().iter().find(|x| x.id == g).map(|x| x.name.as_str()).unwrap_or_default();
-            let c = self.store.channel(c).and_then(|c| c.name.as_deref()).unwrap_or_default();
+            let place = match g {
+                Some(g) => {
+                    let g = self.store.guilds().iter().find(|x| x.id == g).map(|x| x.name.as_str()).unwrap_or_default();
+                    let c = self.store.channel(c).and_then(|c| c.name.as_deref()).unwrap_or_default();
+                    format!("{g} / {c}")
+                }
+                None => self.store.channel(c).map(|c| crate::view::channel_row(&self.store, c).name).unwrap_or_default(),
+            };
             match &self.conn {
                 Some(k) if matches!(k.status, VoiceStatus::Reconnecting { .. }) => "Reconnecting voice…".into(),
                 k => {
                     let problems = k.as_ref().map_or(vec!["Connecting…"], |k| k.problems());
-                    std::iter::once(format!("🔊 {g} / {c}")).chain(problems.into_iter().map(String::from)).collect::<Vec<_>>().join(" · ")
+                    std::iter::once(format!("🔊 {place}")).chain(problems.into_iter().map(String::from)).collect::<Vec<_>>().join(" · ")
                 }
             }
         });
         let muted = self.voice.muted();
         let level = !muted && self.conn.as_ref().is_some_and(|k| k.level);
-        let bar = Bar { text: text.unwrap_or_default(), muted, deafened: self.voice.deafened(), level };
+        let channel = self.voice.channel().map_or(String::new(), |(_, c)| c.to_string());
+        let bar = Bar { text: text.unwrap_or_default(), channel, muted, deafened: self.voice.deafened(), level };
         if let Some(bar) = crate::voice::changed(&mut self.bar, bar) {
             bridge::voice_bar(&self.ui, bar);
         }

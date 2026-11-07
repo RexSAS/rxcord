@@ -99,6 +99,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let t = tx.clone();
     ui.on_hang_up(move || drop(t.send(Command::LeaveVoice)));
     let t = tx.clone();
+    ui.on_start_call(move |c| drop(id(c).map(|c| t.send(Command::StartCall(c)))));
+    let t = tx.clone();
+    ui.on_accept_call(move || drop(t.send(Command::AcceptCall)));
+    let t = tx.clone();
+    ui.on_decline_call(move || drop(t.send(Command::DeclineCall)));
+    let t = tx.clone();
     ui.on_toggle_mute(move || drop(t.send(Command::ToggleMute)));
     let t = tx.clone();
     ui.on_toggle_deafen(move || drop(t.send(Command::ToggleDeafen)));

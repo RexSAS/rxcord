@@ -174,7 +174,8 @@ pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>, spe
             for c in children {
                 in_category |= c.kind == 4;
                 let depth = if in_category && c.kind != 4 { 2 } else { 1 };
-                let members = if matches!(c.kind, 2 | 13) { s.voice_members(c.id) } else { vec![] };
+                // voice and stage channels, and DMs with a call
+                let members = if matches!(c.kind, 2 | 13 | 1 | 3) { s.voice_members(c.id) } else { vec![] };
                 out.push(TreeRow { node: false, depth, expanded: false, row: c, member: None });
                 out.extend(members.into_iter().map(|v| {
                     let m = voice_member(s, v, speaking, prefs);
@@ -434,6 +435,27 @@ mod tests {
         assert!(rows[5].row.enabled, "voice channels can be joined");
         let collapsed = tree_rows(&s, &HashSet::new(), &HashSet::new(), &HashSet::new(), &Settings::default());
         assert!(collapsed.iter().all(|r| r.member.is_none()));
+    }
+
+    #[test]
+    fn call_members_in_tree() {
+        let ready = json!({
+            "user": {"id": "1", "username": "me"},
+            "private_channels": [{"id": "7", "type": 1, "recipient_ids": ["2"]}, {"id": "8", "type": 1, "recipient_ids": ["3"]}],
+            "users": [{"id": "2", "username": "bob", "global_name": "Bob"}, {"id": "3", "username": "eve"}],
+        });
+        let mut s = Store::new();
+        s.apply(&Event::Ready(Box::new(serde_json::from_value(ready).unwrap())));
+        let call = json!({"channel_id": "7", "ringing": ["1"], "voice_states": [{"user_id": "2", "channel_id": "7", "self_mute": true}]});
+        s.apply(&Event::CallCreate(serde_json::from_value(call).unwrap()));
+        let open: HashSet<Id> = [DMS_NODE].into();
+        let rows = tree_rows(&s, &open, &HashSet::new(), &HashSet::new(), &Settings::default());
+        let shape: Vec<_> = rows.iter().map(|r| (r.row.name.as_str(), r.depth, r.member.is_some())).collect();
+        assert_eq!(shape, [("Direct Messages", 0, false), ("eve", 1, false), ("Bob", 1, false), ("Bob", 2, true)]);
+        assert!(rows[3].member.as_ref().unwrap().muted);
+        s.apply(&Event::CallDelete { channel_id: Id(7) });
+        let rows = tree_rows(&s, &open, &HashSet::new(), &HashSet::new(), &Settings::default());
+        assert!(rows.iter().all(|r| r.member.is_none()), "call ended: nobody listed");
     }
 
     #[test]

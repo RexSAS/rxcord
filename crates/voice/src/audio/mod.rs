@@ -5,6 +5,7 @@ pub mod devices;
 pub mod jitter;
 pub mod mixer;
 pub mod playback;
+pub mod tone;
 pub mod vad;
 
 #[derive(Debug, thiserror::Error)]

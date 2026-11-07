@@ -147,6 +147,7 @@ pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
 pub fn voice_bar(ui: &Weak<AppWindow>, bar: Bar) {
     with_ui(ui, move |ui| {
         ui.set_voice(bar.text.into());
+        ui.set_voice_channel(bar.channel.into());
         ui.set_voice_muted(bar.muted);
         ui.set_voice_deafened(bar.deafened);
         ui.set_voice_level(bar.level);
@@ -178,6 +179,11 @@ pub fn voice_settings(ui: &Weak<AppWindow>, s: &Settings, inputs: Vec<String>, o
 }
 
 /// A status bar notice for a few seconds (a newer one isn't cut short by an older timer).
+/// The incoming-call prompt ("" = none).
+pub fn call_prompt(ui: &Weak<AppWindow>, text: String) {
+    with_ui(ui, move |ui| ui.set_call_prompt(text.into()));
+}
+
 pub fn voice_notice(ui: &Weak<AppWindow>, text: String) {
     with_ui(ui, move |ui| {
         ui.set_notice(text.clone().into());

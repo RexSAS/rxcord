@@ -11,6 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use super::AudioError;
 use super::jitter::{Jitter, Popped};
 use super::mixer;
+use super::tone::Ring;
 
 const RATE: u32 = 48_000;
 /// 10 ms of 48 kHz stereo: what one `render` produces.
@@ -46,24 +47,7 @@ pub struct Playback {
 impl Playback {
     /// Open `device` (by name from `devices::outputs`), or the default output if it's unset or gone.
     pub fn start(device: Option<String>) -> Result<Playback, AudioError> {
-        let host = cpal::default_host();
-        let named = device.and_then(|name| {
-            let found = host.output_devices().ok()?.find(|d| d.to_string() == name);
-            if found.is_none() {
-                tracing::warn!("output device {name:?} not found, using the default");
-            }
-            found
-        });
-        let device = named.or_else(|| host.default_output_device()).ok_or(AudioError::NoDevice)?;
-        let config = device
-            .supported_output_configs()?
-            .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2)
-            .find_map(|c| c.try_with_sample_rate(RATE));
-        // shortcut: the fallback assumes the host accepts f32 at its default config (true for WASAPI shared, ALSA plug, Pulse/PipeWire)
-        let config = match config {
-            Some(c) => c.config(),
-            None => device.default_output_config()?.config(),
-        };
+        let (device, config) = output(device)?;
         let channels = config.channels as usize;
         let (ring, mut consumer) = rtrb::RingBuffer::new(config.sample_rate as usize * channels * 2 / 5); // 400 ms
         let failed = Arc::new(AtomicBool::new(false));
@@ -110,6 +94,11 @@ impl Playback {
         self.engine.set_deafened(deafened);
     }
 
+    /// Mix the incoming-call ring into the output.
+    pub fn set_ringing(&mut self, on: bool) {
+        self.engine.set_ringing(on);
+    }
+
     /// Who is speaking right now, for the UI.
     pub fn levels(&self) -> Vec<(u64, bool)> {
         self.engine.levels(Instant::now())
@@ -148,6 +137,30 @@ impl Playback {
             }
         }
     }
+}
+
+/// `device` (by name from `devices::outputs`), or the default output if it's unset or gone, with a
+/// 48 kHz stereo f32 config when it has one.
+pub(crate) fn output(device: Option<String>) -> Result<(cpal::Device, cpal::StreamConfig), AudioError> {
+    let host = cpal::default_host();
+    let named = device.and_then(|name| {
+        let found = host.output_devices().ok()?.find(|d| d.to_string() == name);
+        if found.is_none() {
+            tracing::warn!("output device {name:?} not found, using the default");
+        }
+        found
+    });
+    let device = named.or_else(|| host.default_output_device()).ok_or(AudioError::NoDevice)?;
+    let config = device
+        .supported_output_configs()?
+        .filter(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2)
+        .find_map(|c| c.try_with_sample_rate(RATE));
+    // shortcut: the fallback assumes the host accepts f32 at its default config (true for WASAPI shared, ALSA plug, Pulse/PipeWire)
+    let config = match config {
+        Some(c) => c.config(),
+        None => device.default_output_config()?.config(),
+    };
+    Ok((device, config))
 }
 
 /// Queue depth to keep: two device periods (a device with large periods drains a 40 ms queue at once),
@@ -242,6 +255,8 @@ pub(crate) struct Engine {
     users: HashMap<u64, User>,
     gains: HashMap<u64, f32>,
     deafened: bool,
+    /// The incoming-call ring, while ringing.
+    ring: Option<Ring>,
 }
 
 impl Engine {
@@ -275,6 +290,12 @@ impl Engine {
         self.deafened = deafened;
     }
 
+    pub(crate) fn set_ringing(&mut self, on: bool) {
+        if on != self.ring.is_some() {
+            self.ring = on.then(|| Ring::new(RATE));
+        }
+    }
+
     /// Mix the next 10 ms (`CHUNK` stereo samples at 48 kHz) into `out`.
     pub(crate) fn render(&mut self, now: Instant, out: &mut [f32]) {
         self.users.retain(|_, u| now.duration_since(u.last_seen) < IDLE);
@@ -295,6 +316,12 @@ impl Engine {
             })
             .collect();
         mixer::mix(out, &sources);
+        if let Some(r) = &mut self.ring {
+            for f in out.chunks_exact_mut(2) {
+                let s = r.next_sample();
+                f.iter_mut().for_each(|o| *o = (*o + s).clamp(-1.0, 1.0));
+            }
+        }
         for u in self.users.values_mut() {
             let n = u.pcm.len().min(CHUNK);
             u.pcm.drain(..n);
@@ -395,6 +422,20 @@ mod tests {
         assert_eq!(e.levels(t0 + Duration::from_millis(300)), vec![(7, false)]);
         e.render(t0 + Duration::from_secs(6), &mut chunk);
         assert!(e.levels(t0 + Duration::from_secs(6)).is_empty(), "unseen 5 s: dropped");
+    }
+
+    #[test]
+    fn ring_mixes_into_the_call() {
+        let (mut e, now) = (Engine::default(), Instant::now());
+        let mut chunk = [0.0; CHUNK];
+        e.set_ringing(true);
+        e.set_deafened(true); // the ring isn't a call voice: it still sounds
+        e.render(now, &mut chunk);
+        assert!(rms(&chunk) > 0.01, "ringing");
+        assert_eq!(chunk[0..CHUNK].chunks(2).filter(|f| f[0] != f[1]).count(), 0, "same on both channels");
+        e.set_ringing(false);
+        e.render(now, &mut chunk);
+        assert_eq!(rms(&chunk), 0.0, "stopped");
     }
 
     #[test]
