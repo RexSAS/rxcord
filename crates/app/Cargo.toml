@@ -15,6 +15,7 @@ qrcode.workspace = true
 chrono.workspace = true
 serde_json.workspace = true # demo fixtures (RXCORD_DEMO), settings.json
 serde.workspace = true
+rand.workspace = true
 image.workspace = true
 lru.workspace = true
 opener.workspace = true

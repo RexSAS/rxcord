@@ -6,6 +6,7 @@ use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
 use rxcord_api::remote_auth::{QrStatus, qr_login};
+use rxcord_api::rest::{InviteContext, JoinedGuild};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
 use std::sync::Arc;
@@ -34,6 +35,8 @@ pub enum Command {
     Edit { channel: Id, message: Id, content: String },
     Delete { channel: Id, message: Id },
     ThumbVisible(String /*url*/),
+    /// Join button of a server invite in message `message` of the active channel.
+    JoinInvite { message: Id, code: String },
 }
 
 /// Results of tasks spawned on the runtime, handled back on the loop.
@@ -46,6 +49,10 @@ enum Done {
     Edited(Id, Result<Box<Message>, ApiError>),
     Deleted { channel_id: Id, id: Id, result: Result<(), ApiError> },
     QrToken(Result<String, ApiError>),
+    /// `captcha`: this attempt already carried a solved captcha (don't ask again).
+    Joined { message: Id, code: String, ctx: InviteContext, captcha: bool, result: Result<Option<JoinedGuild>, ApiError> },
+    /// The local captcha page failed or nobody solved it.
+    CaptchaFailed { message: Id, code: String, error: String },
 }
 
 enum Input {
@@ -65,7 +72,7 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
             let (store, tasks, nav, thumbs) = (Store::new(), JoinSet::new(), Nav::default(), images::Thumbs::new());
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs, last_guild }.run(rx));
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id: String::new() }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -83,6 +90,8 @@ struct Runtime {
     focused: Arc<AtomicBool>,
     thumbs: images::Thumbs,
     last_guild: Arc<AtomicU64>,
+    /// Gateway session (from READY); joining an invite sends it.
+    session_id: String,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -279,6 +288,17 @@ impl Runtime {
                     Done::Deleted { channel_id: channel, id, result: rest.delete_message(channel, id).await }
                 });
             }
+            Command::JoinInvite { message, code } => {
+                let ch = self.nav.selected.and_then(|c| self.store.channel(c));
+                let (Some(rest), Some(ch)) = (self.rest.clone(), ch) else { return };
+                let ctx = InviteContext { guild: ch.guild_id, channel: ch.id, channel_type: ch.kind, message };
+                let session = self.session_id.clone();
+                bridge::row_note(&self.ui, message, "Joining…".into(), true, None);
+                self.tasks.spawn(async move {
+                    let result = rest.join_invite(&code, &session, ctx, None).await;
+                    Done::Joined { message, code, ctx, captcha: false, result }
+                });
+            }
             Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
         }
     }
@@ -296,6 +316,21 @@ impl Runtime {
         if let Some(id) = next {
             self.maybe_ack(id);
         }
+    }
+
+    /// Last resort for a captcha: the invite in a Firefox private window, where the user logs in as this
+    /// account (a normal window would join with whatever account is logged in there).
+    async fn captcha_fallback(&mut self, message: Id, code: &str, why: &str) {
+        let me = self.store.me().map(|u| u.username.clone()).unwrap_or_default();
+        let url = crate::invite::invite_url(code);
+        let u = url.clone();
+        let private = tokio::task::spawn_blocking(move || crate::invite::open_private(&u)).await.unwrap_or(false);
+        let (msg, open) = if private {
+            (format!("{why} In the private window that opened, log in as {me}, then join."), None)
+        } else {
+            (format!("{why} Open the invite in a private window, log in as {me}, then join."), Some(url))
+        };
+        bridge::row_note(&self.ui, message, msg, false, open);
     }
 
     fn used_guild(&self, g: Id) {
@@ -371,6 +406,9 @@ impl Runtime {
 
     fn event(&mut self, ev: Event) {
         let ready = matches!(ev, Event::Ready(_));
+        if let Event::Ready(r) = &ev {
+            self.session_id = r.session_id.clone();
+        }
         let changes = self.store.apply(&ev);
         if let Some(next) = self.nav.drop_missing_tabs(&mut self.store) {
             bridge::set_error(&self.ui, String::new());
@@ -464,6 +502,52 @@ impl Runtime {
             Done::Deleted { channel_id, id, result: Ok(()) } => {
                 let changes = self.store.apply(&Event::MessageDelete { id, channel_id });
                 return self.changed(changes);
+            }
+            Done::Joined { message, result: Ok(g), .. } => {
+                let name = g.as_ref().map(|g| g.name.clone()).filter(|n| !n.is_empty());
+                if let Some(g) = g {
+                    // Its channels arrive with GUILD_CREATE; open its node so they show up right away.
+                    self.nav.expanded.insert(g.id);
+                    self.used_guild(g.id);
+                    bridge::push_tree(&self.ui, &self.store, &mut self.nav);
+                }
+                let msg = name.map_or("Joined the server".into(), |n| format!("Joined {n}"));
+                return bridge::row_note(&self.ui, message, msg, true, None);
+            }
+            Done::Joined { message, code, ctx, captcha: false, result: Err(ApiError::Http { status: 400, body }) }
+                if let Some(ch) = crate::captcha::parse_challenge(&body) =>
+            {
+                // Shown on a local page in the browser; the solved token comes back here and the join is retried.
+                let (Some(rest), ui, session) = (self.rest.clone(), self.ui.clone(), self.session_id.clone()) else { return };
+                bridge::row_note(&self.ui, message, "Discord wants a captcha: solve it in the browser tab that opened".into(), true, None);
+                self.tasks.spawn(async move {
+                    let ready = |url: String| bridge::open_url(&ui, url);
+                    match crate::captcha::solve(ch, ready).await {
+                        Ok(answer) => {
+                            bridge::row_note(&ui, message, "Joining…".into(), true, None);
+                            let result = rest.join_invite(&code, &session, ctx, Some(&answer)).await;
+                            Done::Joined { message, code, ctx, captcha: true, result }
+                        }
+                        Err(error) => Done::CaptchaFailed { message, code, error },
+                    }
+                });
+                return;
+            }
+            Done::CaptchaFailed { message, code, error } => {
+                tracing::warn!("captcha: {error}");
+                return self.captcha_fallback(message, &code, &format!("The captcha didn't work: {error}.")).await;
+            }
+            Done::Joined { message, code, result: Err(e), .. } if e.is_captcha() => {
+                return self.captcha_fallback(message, &code, "Discord still wants a captcha.").await;
+            }
+            Done::Joined { message, result: Err(e), .. } => {
+                let msg = match &e {
+                    ApiError::Http { status: 404, .. } => "This invite is invalid or expired".to_string(),
+                    ApiError::Http { status: 403, .. } => "You can't join this server (banned, or the server is full)".to_string(),
+                    _ => "Couldn't join the server".to_string(),
+                };
+                bridge::row_note(&self.ui, message, msg, false, None);
+                e
             }
             Done::QrToken(Ok(t)) => return self.login(t).await,
             Done::QrToken(Err(e)) => {

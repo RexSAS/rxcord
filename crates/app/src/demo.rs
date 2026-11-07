@@ -28,7 +28,7 @@ pub fn events() -> (Event, Vec<Event>) {
     }));
     let texts = [
         "hello **world**, this is *italic* and ~~struck~~ with `inline code`",
-        "a link: https://www.rust-lang.org and <@1>",
+        "a link: https://www.rust-lang.org and <@1>, join us: https://discord.gg/rust-lang",
         "```rust\nfn main() {\n    println!(\"hi\");\n}\n```",
         "a long line that should wrap around the message list because it keeps going and going and going on",
     ];

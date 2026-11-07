@@ -269,6 +269,7 @@ mod tests {
             blocks: vec![],
             thumbs: vec![t],
             files: vec![],
+            invites: vec![],
             reply_preview: None,
             edited: false,
             mine: false,

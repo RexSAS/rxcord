@@ -4677,6 +4677,7 @@ dependencies = [
  "notify-rust",
  "opener",
  "qrcode",
+ "rand 0.9.5",
  "rxcord-api",
  "rxcord-store",
  "serde",
