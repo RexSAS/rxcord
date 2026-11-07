@@ -98,6 +98,12 @@ impl Store {
         if guild.is_some() {
             c.guild_id = guild;
         }
+        for u in std::mem::take(&mut c.recipients) {
+            if !c.recipient_ids.contains(&u.id) {
+                c.recipient_ids.push(u.id);
+            }
+            self.users.entry(u.id).or_insert(u);
+        }
         self.channels.insert(c.id, c);
     }
 

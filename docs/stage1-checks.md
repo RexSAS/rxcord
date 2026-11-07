@@ -2,7 +2,7 @@
 
 ## Manual checks (need a real Discord account)
 
-- [ ] Before first live login: replace every `// UPDATE FROM OFFICIAL CLIENT` value in crates/api/src/client_props.rs with the current official desktop client's values.
+- [x] Client identity now mimics the Discord web app in Firefox (captured 2026-11-07). Refresh CLIENT_BUILD_NUMBER and FIREFOX_VERSION in crates/api/src/client_props.rs from a browser capture every few weeks.
 - [ ] Task 4: `RXCORD_TOKEN=... cargo run -p rxcord-api --example capture` → READY + other files in crates/api/tests/fixtures/captured; `grep -r '"content":"[^x]' crates/api/tests/fixtures/captured` prints nothing; `cargo test -p rxcord-api captured_fixtures_parse` passes on real data. Decide whether to commit captured fixtures (contain real snowflake IDs).
 - [ ] Task 4: gateway stays connected >10 min (heartbeats work); kill network for 60 s → reconnects and resumes.
 - [ ] Task 6: QR login end-to-end with the phone app (checked as part of Task 9 login).
@@ -12,8 +12,8 @@
 - [ ] Task 12: a channel with images shows thumbnails; fast scrolling doesn't freeze; RSS stays below ~150 MB after scrolling through many images (`ps -o rss= -p $(pgrep -x rxcord)`); clicking a thumbnail opens the browser.
 - [ ] Task 13: DM from a second account → OS notification (Linux, and Windows when available); mention in a guild → notification; focused on that channel → none; redelivery after reconnect → no duplicate notification.
 - [ ] Task 14: logged in, idle on a quiet channel, `scripts/idle-check` → exit 0; also `SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` shows no frames while idle; then the in-game FPS comparison vs the official client, recorded in docs/benchmarks.md.
-- [ ] BEFORE FIRST LIVE LOGIN (final review I5/I6): capture the official desktop client's identify payload and REST headers (devtools Network/WS tab) and match in client_props.rs the FULL `properties` field set (browser_user_agent, browser_version, os_version, native_build_number, client_event_source, …), the REST header set (X-Discord-Timezone, X-Debug-Options, Origin/Referer…), and the values. CAPABILITIES had two bits cleared on purpose (256, 16384) because rxcord doesn't implement token refresh / passive guild updates — re-enable only together with that support.
-- [ ] Run the `capture` example and `cargo test -p rxcord-api captured_fixtures_parse` on real data BEFORE daily use (confirms your READY parses).
+- [x] BEFORE FIRST LIVE LOGIN (final review I5/I6): capture the official desktop client's identify payload and REST headers (devtools Network/WS tab) and match in client_props.rs the FULL `properties` field set (browser_user_agent, browser_version, os_version, native_build_number, client_event_source, …), the REST header set (X-Discord-Timezone, X-Debug-Options, Origin/Referer…), and the values. CAPABILITIES had two bits cleared on purpose (256, 16384) because rxcord doesn't implement token refresh / passive guild updates — re-enable only together with that support.
+- [x] (2026-11-07, spare account: READY parses; DM names fixed) Run the `capture` example and `cargo test -p rxcord-api captured_fixtures_parse` on real data BEFORE daily use (confirms your READY parses).
 
 ## Follow-ups (known gaps, in priority order)
 

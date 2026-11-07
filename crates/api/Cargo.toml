@@ -18,7 +18,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 reqwest.workspace = true
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
+iana-time-zone = "0.1"
 
 [dev-dependencies]
 wiremock.workspace = true
+keyring.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

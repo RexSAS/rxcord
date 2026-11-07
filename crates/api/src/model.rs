@@ -42,6 +42,9 @@ pub struct Channel {
     pub parent_id: Option<Id>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub recipient_ids: Vec<Id>,
+    /// Full user objects: CHANNEL_CREATE for a new DM sends these instead of `recipient_ids`.
+    #[serde(default, deserialize_with = "null_as_default", skip_serializing)]
+    pub recipients: Vec<User>,
     #[serde(default)]
     pub last_message_id: Option<Id>,
 }

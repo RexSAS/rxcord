@@ -250,3 +250,13 @@ fn prepend_dedupes_within_batch() {
     s.prepend_history(GCH, vec![msg(2, GCH, Id(7)), msg(2, GCH, Id(7)), msg(1, GCH, Id(7))]);
     assert_eq!(s.messages(GCH).len(), 2);
 }
+
+#[test]
+fn channel_create_dm_with_full_recipients_names_the_dm() {
+    let mut s = ready_store();
+    let c = serde_json::from_str(r#"{"id":"777","type":1,"recipients":[{"id":"555","username":"bob","global_name":"Bob"}]}"#).unwrap();
+    s.apply(&Event::ChannelCreate(c));
+    let ch = s.channel(Id(777)).unwrap();
+    assert_eq!(ch.recipient_ids, vec![Id(555)]);
+    assert_eq!(s.user(Id(555)).unwrap().display_name(), "Bob");
+}

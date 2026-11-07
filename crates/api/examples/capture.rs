@@ -1,10 +1,17 @@
-//! Captures scrubbed raw dispatches: `RXCORD_TOKEN=... cargo run -p rxcord-api --example capture`.
+//! Captures scrubbed raw dispatches: `cargo run -p rxcord-api --example capture`.
+//! Uses the token rxcord saved in the OS keyring (or RXCORD_TOKEN if set).
 use rxcord_api::{gateway::run_gateway_raw, scrub};
 use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() {
-    let token = std::env::var("RXCORD_TOKEN").expect("set RXCORD_TOKEN");
+    let token = match std::env::var("RXCORD_TOKEN") {
+        Ok(t) => t,
+        Err(_) => tokio::task::spawn_blocking(|| keyring::Entry::new("rxcord", "token")?.get_password())
+            .await
+            .unwrap()
+            .expect("no saved login: log in with rxcord first or set RXCORD_TOKEN"),
+    };
     let secs: u64 = std::env::var("RXCORD_CAPTURE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/captured");
     std::fs::create_dir_all(dir).unwrap();

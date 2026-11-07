@@ -4694,6 +4694,8 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "futures-util",
+ "iana-time-zone",
+ "keyring",
  "rand 0.9.5",
  "reqwest",
  "rsa",
