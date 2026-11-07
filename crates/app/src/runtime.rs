@@ -1,5 +1,6 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
 use crate::nav::{Ack, DMS_NODE, HISTORY_PAGE, Nav};
+use crate::voice::{AudioNote, Conn, ConnIn, Controller, Effect};
 use crate::{AppWindow, bridge, compose, images, notify, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::GatewayCmd;
@@ -10,6 +11,8 @@ use rxcord_api::remote_auth::{QrStatus, qr_login};
 use rxcord_api::rest::{InviteContext, JoinedGuild};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
+use rxcord_voice::driver::{VoiceEvent, VoiceStatus};
+use rxcord_voice::session::LeaveReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -40,6 +43,10 @@ pub enum Command {
     InstallUpdate,
     /// Join button of a server invite in message `message` of the active channel.
     JoinInvite { message: Id, code: String },
+    /// Join this guild voice channel (moving out of any other).
+    JoinVoice(Id),
+    /// The voice bar's hang-up.
+    LeaveVoice,
 }
 
 /// Results of tasks spawned on the runtime, handled back on the loop.
@@ -64,6 +71,8 @@ enum Input {
     Qr(Option<QrStatus>),
     Done(Done),
     Thumb(images::Loaded),
+    Voice(ConnIn),
+    VoiceTimeout,
 }
 
 /// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
@@ -80,7 +89,8 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_
                 rt.spawn(crate::update::run(ui.clone(), update_rx));
             }
             let session_id = String::new();
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx }.run(rx));
+            let (voice, conn) = (Controller::default(), None);
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -91,7 +101,7 @@ struct Runtime {
     store: Store,
     rest: Option<Arc<Rest>>,
     gw: Option<mpsc::Receiver<GatewayEvent>>,
-    /// Main-gateway commands (voice state); Task 8 sends on it.
+    /// Main-gateway commands (voice state).
     gw_cmds: Option<mpsc::Sender<GatewayCmd>>,
     qr: Option<mpsc::Receiver<QrStatus>>,
     /// Session tasks; replacing the set aborts them all (logout, new login).
@@ -104,11 +114,29 @@ struct Runtime {
     session_id: String,
     /// Asks the updater (update.rs) to install the release it found.
     update_tx: UnboundedSender<()>,
+    /// The voice channel we're in or joining.
+    voice: Controller,
+    /// While connected to voice: the driver and the audio thread.
+    conn: Option<Conn>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
     match r {
         Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_conn(c: &mut Option<Conn>) -> ConnIn {
+    match c {
+        Some(c) => c.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_opt(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
 }
@@ -127,6 +155,8 @@ impl Runtime {
                 self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
                 msgs.into_iter().for_each(|m| self.event(m));
                 self.command(crate::demo::failed_send()).await;
+                self.nav.speaking.insert(Id(2)); // Ferris talking in the demo voice channel
+                bridge::push_tree(&self.ui, &self.store, &mut self.nav);
             }
         } else {
             match tokio::task::spawn_blocking(token::load).await.ok().flatten() {
@@ -144,6 +174,8 @@ impl Runtime {
                 q = recv_opt(&mut self.qr) => Input::Qr(q),
                 Some(Ok(d)) = self.tasks.join_next() => Input::Done(d),
                 Some(Ok(l)) = self.thumbs.tasks.join_next() => Input::Thumb(l),
+                v = recv_conn(&mut self.conn) => Input::Voice(v),
+                _ = sleep_opt(self.voice.deadline()) => Input::VoiceTimeout,
             };
             match input {
                 Input::Cmd(c) => self.command(c).await,
@@ -154,6 +186,11 @@ impl Runtime {
                 Input::Qr(None) => self.qr = None,
                 Input::Done(d) => self.done(d).await,
                 Input::Thumb(l) => bridge::push_thumb(&self.ui, self.thumbs.loaded(l, &self.nav.shown)),
+                Input::Voice(v) => self.voice_in(v),
+                Input::VoiceTimeout => {
+                    let fx = self.voice.expire(Instant::now());
+                    self.voice_effects(fx);
+                }
             }
         }
     }
@@ -178,6 +215,8 @@ impl Runtime {
 
     /// Dropping the gateway receiver stops `run_gateway`; dropping the task set aborts everything else.
     fn end_session(&mut self) {
+        let fx = self.voice.hang_up(); // while the gateway can still send it
+        self.voice_effects(fx);
         self.tasks = JoinSet::new();
         self.gw = None;
         self.gw_cmds = None;
@@ -314,6 +353,17 @@ impl Runtime {
                     Done::Joined { message, code, ctx, captcha: false, result }
                 });
             }
+            Command::JoinVoice(ch) => {
+                let guild = self.store.channel(ch).filter(|c| c.kind == 2).and_then(|c| c.guild_id);
+                if let (Some(g), Some(_)) = (guild, &self.gw_cmds) {
+                    let fx = self.voice.join(g, ch, Instant::now());
+                    self.voice_effects(fx);
+                }
+            }
+            Command::LeaveVoice => {
+                let fx = self.voice.hang_up();
+                self.voice_effects(fx);
+            }
             Command::InstallUpdate => drop(self.update_tx.send(())),
             Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
         }
@@ -426,6 +476,12 @@ impl Runtime {
             self.session_id = r.session_id.clone();
         }
         let changes = self.store.apply(&ev);
+        if matches!(ev, Event::VoiceStateUpdate(_) | Event::VoiceServerUpdate(_))
+            && let Some(me) = self.store.me().map(|u| u.id)
+        {
+            let fx = self.voice.event(&ev, me);
+            self.voice_effects(fx);
+        }
         if let Some(next) = self.nav.drop_missing_tabs(&mut self.store) {
             bridge::set_error(&self.ui, String::new());
             self.show_tab(next, true);
@@ -458,6 +514,84 @@ impl Runtime {
             bridge::push_messages(&self.ui, &self.store, &mut self.nav);
         }
         self.changed(changes);
+    }
+
+    /// Carries out what the voice controller decided. Old devices close before new ones open.
+    fn voice_effects(&mut self, fx: Vec<Effect>) {
+        for e in fx {
+            match e {
+                // try_send: the gateway may be blocked handing us events; a wait here would deadlock
+                Effect::Gateway(c) => {
+                    if let Some(tx) = &self.gw_cmds
+                        && tx.try_send(c).is_err()
+                    {
+                        tracing::warn!("voice state not sent: gateway busy");
+                    }
+                }
+                Effect::Connect { connect, channel } => {
+                    self.conn = None;
+                    self.conn = Some(Conn::start(connect, channel));
+                }
+                Effect::Disconnect => self.conn = None,
+                Effect::Notice(n) => bridge::voice_notice(&self.ui, n.into()),
+            }
+        }
+        if !self.voice.connected() && !self.nav.speaking.is_empty() {
+            self.nav.speaking.clear();
+            bridge::push_tree(&self.ui, &self.store, &mut self.nav);
+        }
+        self.push_voice();
+    }
+
+    fn voice_in(&mut self, v: ConnIn) {
+        let Some(conn) = &mut self.conn else { return };
+        let speaking = match v {
+            ConnIn::Event(VoiceEvent::Media { user_id, seq, opus, .. }) => return conn.media(user_id, seq, opus),
+            ConnIn::Event(VoiceEvent::Speaking { user_id, on, .. }) => {
+                let mut s = self.nav.speaking.clone();
+                if on { s.insert(Id(user_id)) } else { s.remove(&Id(user_id)) };
+                s
+            }
+            // the decoded audio says who's talking right now
+            ConnIn::Audio(AudioNote::Levels(l)) => l.into_iter().filter(|u| u.1).map(|u| Id(u.0)).collect(),
+            ConnIn::Audio(AudioNote::Speaker(ok)) => {
+                conn.speaker = ok;
+                return self.push_voice();
+            }
+            ConnIn::Event(VoiceEvent::Status(s)) => {
+                conn.status = s;
+                return self.push_voice();
+            }
+            ConnIn::Event(VoiceEvent::Left(r)) => {
+                let fx = self.voice.left(&r);
+                return self.voice_effects(fx);
+            }
+            ConnIn::Closed => {
+                let fx = self.voice.left(&LeaveReason::Fatal(0));
+                return self.voice_effects(fx);
+            }
+            ConnIn::Event(VoiceEvent::PrivacyCode(_)) => return,
+        };
+        if speaking != self.nav.speaking {
+            self.nav.speaking = speaking;
+            bridge::push_tree(&self.ui, &self.store, &mut self.nav);
+        }
+    }
+
+    /// The voice bar: "" when not in voice.
+    fn push_voice(&self) {
+        let text = self.voice.channel().map(|(g, c)| {
+            let g = self.store.guilds().iter().find(|x| x.id == g).map(|x| x.name.as_str()).unwrap_or_default();
+            let c = self.store.channel(c).and_then(|c| c.name.as_deref()).unwrap_or_default();
+            let state = match &self.conn {
+                Some(k) if matches!(k.status, VoiceStatus::Reconnecting { .. }) => return "Reconnecting voice…".into(),
+                Some(k) if !k.speaker => " · No speaker",
+                Some(k) if k.status == VoiceStatus::Connected => "",
+                _ => " · Connecting…",
+            };
+            format!("🔊 {g} / {c}{state}")
+        });
+        bridge::voice_bar(&self.ui, text.unwrap_or_default());
     }
 
     async fn status(&mut self, s: ConnStatus) {

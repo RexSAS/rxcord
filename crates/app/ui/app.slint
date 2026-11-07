@@ -39,6 +39,11 @@ export component AppWindow inherits Window {
     in property <string> update-label;
     in property <string> update-action;
     callback update-clicked(string);
+    // voice bar text ("" = not in voice) and a short-lived status bar notice
+    in property <string> voice;
+    in property <string> notice;
+    callback join-voice(string);
+    callback hang-up();
     // height of the tree above the divider (saved in settings.json)
     in-out property <length> tree-height: 280px;
     // expand/collapse a tree node (guild id or "0" for DMs)
@@ -117,6 +122,7 @@ export component AppWindow inherits Window {
                 active: root.selected-channel;
                 toggle(id) => { root.toggle-node(id); }
                 open(id) => { root.select-channel(id); }
+                join(id) => { root.join-voice(id); }
             }
             // divider: drag to resize the tree (5px to grab, drawn as a 2px line)
             Rectangle {
@@ -184,6 +190,36 @@ export component AppWindow inherits Window {
                 edit-last => { root.start-edit(""); }
             }
             Rectangle { height: 1px; background: root.line; }
+            if root.voice != "": Rectangle {
+                height: 22px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 4px;
+                    spacing: 6px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.voice;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        font-size: 12px;
+                    }
+                    hang := TouchArea {
+                        width: 20px;
+                        accessible-role: button;
+                        accessible-label: "Leave voice";
+                        accessible-action-default => { root.hang-up(); }
+                        clicked => { root.hang-up(); }
+                        Text {
+                            text: "✖";
+                            vertical-alignment: center;
+                            color: #ed4245;
+                            opacity: hang.has-hover ? 1.0 : 0.7;
+                        }
+                    }
+                }
+            }
+            if root.voice != "": Rectangle { height: 1px; background: root.line; }
             // status bar
             Rectangle {
                 height: 22px;
@@ -200,7 +236,7 @@ export component AppWindow inherits Window {
                     }
                     Text {
                         horizontal-stretch: 1;
-                        text: root.banner != "" ? root.banner : "Connected · " + root.me-name;
+                        text: root.banner != "" ? root.banner : root.notice != "" ? root.notice : "Connected · " + root.me-name;
                         color: root.banner != "" ? white : Palette.foreground;
                         vertical-alignment: center;
                         overflow: elide;

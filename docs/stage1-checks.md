@@ -17,6 +17,10 @@
 
 - [ ] TeamSpeak layout (live account): tree expands/collapses, collapsed servers show the dot/badge; clicking a channel opens/activates a tab; 9th tab closes the least recently used; × and middle-click close; right-click a message → Reply/Edit/Open attachment/Delete…; links in messages open the browser; window size/position/divider restored after restart (position not on Wayland); delete the active channel (second account) → text moves to the next tab with a notice.
 
+## Voice (stage 2, need a real account and a second one talking)
+
+- [ ] Task 8: double-click a voice channel → you appear under it, the voice bar shows "🔊 Server / Channel", the second account's voice plays and its row turns green while it talks; double-click another voice channel → you move (one op 4); ✖ → you leave at once (the second account sees it); a moderator disconnecting you → "Disconnected from voice"; unplug the headset mid-call → "No speaker", plug back → audio resumes within ~5 s; kill the network for 5 s → "Reconnecting voice…" then back; restart the main gateway (network off ~60 s) while in voice → voice keeps playing, no duplicate rows (VERIFY LIVE: does a replayed op 4 bring a new VOICE_SERVER_UPDATE with the same endpoint?); idle with no voice → `scripts/idle-check` still < 0.5 %.
+
 ## Follow-ups (known gaps, in priority order)
 
 1. **Text typed in a channel that gets deleted** — fixed for the active tab (moves to the next tab). Still lost: the saved draft of a deleted *background* tab, and unsent (pending/failed) messages of a deleted channel (rare). Fix: after `store.apply`, collect pending entries of channels that no longer exist plus the composer draft of a deleted selected channel; push them into the composer via one `orphan-text` callback with the note "Channel was deleted — unsent text moved here"; make `Drafts::switch` carry the composer text forward when the target is `None`.

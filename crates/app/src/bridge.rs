@@ -7,7 +7,7 @@ use crate::{AppWindow, FileItem, MessageItem, TabItem, ThumbItem, TreeItem};
 use rxcord_api::id::Id;
 use rxcord_api::remote_auth::QrStatus;
 use rxcord_store::Store;
-use slint::{Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, StyledText, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, StyledText, VecModel, Weak};
 
 pub fn with_ui(ui: &Weak<AppWindow>, f: impl FnOnce(AppWindow) + Send + 'static) {
     let ui = ui.clone();
@@ -122,7 +122,7 @@ pub fn row_note(ui: &Weak<AppWindow>, id: Id, msg: String, ok: bool, open: Optio
 
 /// Tree and tabs. Rows that didn't change aren't touched, so a busy server doesn't redraw the tree.
 pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
-    let rows = view::tree_rows(s, &nav.expanded, &nav.forbidden);
+    let rows = view::tree_rows(s, &nav.expanded, &nav.forbidden, &nav.speaking);
     let tabs: Vec<TabItem> = view::tab_rows(s, nav.tabs.ids()).into_iter().map(tab_item).collect();
     let edits: Option<Vec<(usize, TreeRow)>> = (rows.len() == nav.tree.len())
         .then(|| rows.iter().enumerate().filter(|(i, r)| nav.tree[*i] != **r).map(|(i, r)| (i, r.clone())).collect());
@@ -141,8 +141,33 @@ pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
     });
 }
 
+/// The voice bar ("" hides it).
+pub fn voice_bar(ui: &Weak<AppWindow>, text: String) {
+    with_ui(ui, move |ui| ui.set_voice(text.into()));
+}
+
+/// A status bar notice for a few seconds (a newer one isn't cut short by an older timer).
+pub fn voice_notice(ui: &Weak<AppWindow>, text: String) {
+    with_ui(ui, move |ui| {
+        ui.set_notice(text.clone().into());
+        let w = ui.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_secs(5), move || {
+            if let Some(ui) = w.upgrade()
+                && ui.get_notice() == text.as_str()
+            {
+                ui.set_notice("".into());
+            }
+        });
+    });
+}
+
 fn tree_item(r: TreeRow) -> TreeItem {
+    let m = r.member.as_ref();
     TreeItem {
+        member: m.is_some(),
+        speaking: m.is_some_and(|m| m.speaking),
+        muted: m.is_some_and(|m| m.muted),
+        deafened: m.is_some_and(|m| m.deafened),
         id: r.row.id.to_string().into(),
         name: if r.row.kind == 4 && !r.node { r.row.name.to_uppercase() } else { r.row.name }.into(),
         node: r.node,

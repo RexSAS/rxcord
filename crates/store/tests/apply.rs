@@ -287,6 +287,7 @@ fn vs(user: Id, ch: Option<Id>, guild: Option<Id>) -> VoiceState {
         self_deaf: false,
         mute: false,
         deaf: false,
+        member: None,
     }
 }
 

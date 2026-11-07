@@ -104,6 +104,8 @@ pub struct Nav {
     pub ack_later: HashSet<Id>,
     /// Channels whose history returned 403; they don't light the guild's unread dot.
     pub forbidden: HashSet<Id>,
+    /// Voice members highlighted as talking (from the voice connection).
+    pub speaking: HashSet<Id>,
 }
 
 impl Nav {

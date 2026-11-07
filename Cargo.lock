@@ -5693,6 +5693,7 @@ dependencies = [
  "rand 0.9.5",
  "rxcord-api",
  "rxcord-store",
+ "rxcord-voice",
  "serde",
  "serde_json",
  "sha2",

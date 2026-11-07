@@ -14,6 +14,7 @@ mod settings;
 mod token;
 mod update;
 mod view;
+mod voice;
 
 use compose::OutgoingError;
 use rxcord_api::id::Id;
@@ -92,6 +93,10 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_logout(move || drop(t.send(Command::Logout)));
     let t = tx.clone();
     ui.on_toggle_node(move |n| drop(id(n).map(|n| t.send(Command::ToggleNode(n)))));
+    let t = tx.clone();
+    ui.on_join_voice(move |c| drop(id(c).map(|c| t.send(Command::JoinVoice(c)))));
+    let t = tx.clone();
+    ui.on_hang_up(move || drop(t.send(Command::LeaveVoice)));
     let t = tx.clone();
     ui.on_close_tab(move |c| drop(id(c).map(|c| t.send(Command::CloseTab(c)))));
     let t = tx.clone();

@@ -222,6 +222,17 @@ pub struct VoiceState {
     pub mute: bool,
     #[serde(default)]
     pub deaf: bool,
+    /// Sent with VOICE_STATE_UPDATE in guilds; absent from GUILD_CREATE/READY lists.
+    #[serde(default)]
+    pub member: Option<VoiceMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VoiceMember {
+    #[serde(default)]
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
 }
 
 #[derive(Clone, PartialEq, Deserialize)]
