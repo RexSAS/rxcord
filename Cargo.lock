@@ -1246,6 +1246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rxcord-store"
+version = "0.1.0"
+dependencies = [
+ "rxcord-api",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

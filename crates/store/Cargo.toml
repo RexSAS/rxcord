@@ -1,0 +1,11 @@
+[package]
+name = "rxcord-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rxcord-api = { path = "../api" }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
