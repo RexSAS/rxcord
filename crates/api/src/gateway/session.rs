@@ -1,9 +1,16 @@
 //! Sans-IO gateway session: the driver feeds it text/timer/close events and executes the `Action`s.
 use crate::client_props;
+use crate::id::Id;
 use crate::event::{Event, parse_dispatch};
 use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
 use std::{fmt, time::Duration};
+
+/// Commands the app sends over the main gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayCmd {
+    VoiceState { guild_id: Option<Id>, channel_id: Option<Id>, self_mute: bool, self_deaf: bool },
+}
 
 pub enum Action {
     Send(String),
@@ -37,6 +44,11 @@ pub struct Session {
     seq: Option<u64>,
     interval: Option<Duration>,
     awaiting_ack: bool,
+    /// Between READY/RESUMED and the next close or Hello: commands can go out.
+    online: bool,
+    last_voice: Option<GatewayCmd>,
+    /// `last_voice` was set while offline and never sent.
+    voice_unsent: bool,
 }
 
 impl fmt::Debug for Session {
@@ -68,7 +80,7 @@ struct ReadyInfo {
 
 impl Session {
     pub fn new(token: String) -> Self {
-        Self { token, session_id: None, resume_url: None, seq: None, interval: None, awaiting_ack: false }
+        Self { token, session_id: None, resume_url: None, seq: None, interval: None, awaiting_ack: false, online: false, last_voice: None, voice_unsent: false }
     }
 
     pub fn resume_url(&self) -> Option<&str> {
@@ -97,7 +109,29 @@ impl Session {
         vec![self.heartbeat()]
     }
 
+    /// Op 4. Sent now if connected; otherwise remembered and replayed after the next READY/RESUMED.
+    pub fn command(&mut self, cmd: GatewayCmd) -> Option<Action> {
+        let GatewayCmd::VoiceState { .. } = cmd;
+        self.last_voice = Some(cmd);
+        self.voice_unsent = !self.online;
+        self.online.then(|| self.voice_action()).flatten()
+    }
+
+    fn voice_action(&mut self) -> Option<Action> {
+        self.voice_unsent = false;
+        let GatewayCmd::VoiceState { guild_id, channel_id, self_mute, self_deaf } = self.last_voice?;
+        let d = json!({
+            "guild_id": guild_id.map(|g| g.to_string()),
+            "channel_id": channel_id.map(|c| c.to_string()),
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
+            "self_video": false,
+        });
+        Some(Action::Send(json!({"op": 4, "d": d}).to_string()))
+    }
+
     pub fn on_close(&mut self, code: Option<u16>) -> Action {
+        self.online = false;
         match code {
             Some(4004) => Action::AuthFailed,
             Some(c @ 4010..=4014) => Action::Fatal(c),
@@ -135,8 +169,12 @@ impl Session {
         match env.op {
             0 => self.dispatch(env.t.as_deref().unwrap_or(""), env.s, env.d.as_deref()),
             1 => vec![self.heartbeat()],
-            7 => vec![Action::Reconnect { resume: true }],
+            7 => {
+                self.online = false;
+                vec![Action::Reconnect { resume: true }]
+            }
             9 => {
+                self.online = false;
                 let resume = d == "true";
                 if !resume {
                     self.clear();
@@ -152,6 +190,7 @@ impl Session {
                     Ok(h) => {
                         self.interval = Some(Duration::from_millis(h.heartbeat_interval));
                         self.awaiting_ack = false;
+                        self.online = false;
                         vec![Action::Send(self.handshake().to_string())]
                     }
                     Err(e) => {
@@ -193,7 +232,23 @@ impl Session {
                 return if name == "READY" { vec![Action::ReadyFailed] } else { vec![] };
             }
         };
-        vec![Action::Dispatch(event)]
+        let mut out = vec![];
+        let replay = match &event {
+            Event::Ready(_) => {
+                self.online = true;
+                matches!(self.last_voice, Some(GatewayCmd::VoiceState { channel_id: Some(_), .. }))
+            }
+            Event::Resumed => {
+                self.online = true;
+                self.voice_unsent
+            }
+            _ => false,
+        };
+        out.push(Action::Dispatch(event));
+        if replay {
+            out.extend(self.voice_action());
+        }
+        out
     }
 }
 
@@ -324,6 +379,55 @@ mod tests {
         assert_eq!(s.resume_url(), Some("wss://r"));
         let v = sent(&s.on_text(&hello()), 0);
         assert_eq!((v["op"].as_u64(), v["d"]["seq"].as_u64()), (Some(6), Some(3)));
+    }
+
+    fn vs(channel: Option<u64>) -> GatewayCmd {
+        GatewayCmd::VoiceState { guild_id: None, channel_id: channel.map(Id), self_mute: true, self_deaf: false }
+    }
+
+    #[test]
+    fn voice_state_json_shape() {
+        let mut s = ready_session();
+        let a = s.command(vs(Some(7))).unwrap();
+        assert_eq!(
+            sent(&[a], 0),
+            json!({"op":4,"d":{"guild_id":null,"channel_id":"7","self_mute":true,"self_deaf":false,"self_video":false}})
+        );
+        let GatewayCmd::VoiceState { guild_id, .. } = vs(None);
+        assert_eq!(guild_id, None);
+        let a = s.command(GatewayCmd::VoiceState { guild_id: Some(Id(3)), channel_id: None, self_mute: false, self_deaf: false });
+        let v = sent(&[a.unwrap()], 0);
+        assert_eq!((v["d"]["guild_id"].as_str(), v["d"]["channel_id"].is_null()), (Some("3"), true));
+    }
+
+    #[test]
+    fn voice_state_not_sent_offline_and_replayed_after_identify() {
+        let mut s = Session::new(TOKEN.into());
+        assert!(s.command(vs(Some(7))).is_none());
+        s.on_text(&hello());
+        let r = json!({"op":0,"t":"READY","s":1,"d":{"user":{"id":"1","username":"u"},"session_id":"x","resume_gateway_url":"wss://r"}});
+        let a = s.on_text(&r.to_string());
+        assert!(matches!(a[0], Action::Dispatch(_)));
+        assert_eq!(sent(&a, 1)["d"]["channel_id"], "7");
+        // Dropped connection: not online until the next READY; re-identify replays.
+        s.on_close(None);
+        assert!(s.command(vs(Some(8))).is_none());
+        s.on_text(&json!({"op":9,"d":false}).to_string());
+        s.on_text(&hello());
+        let a = s.on_text(&r.to_string());
+        assert_eq!(sent(&a, 1)["d"]["channel_id"], "8");
+    }
+
+    #[test]
+    fn leave_is_not_replayed_on_identify_but_is_on_resume() {
+        let mut s = ready_session();
+        s.on_close(None);
+        assert!(s.command(vs(None)).is_none());
+        let a = s.on_text(&json!({"op":0,"t":"RESUMED","s":6,"d":{}}).to_string());
+        assert_eq!(sent(&a, 1)["d"]["channel_id"], serde_json::Value::Null);
+        // A later READY must not resend a leave.
+        let r = json!({"op":0,"t":"READY","s":7,"d":{"user":{"id":"1"},"session_id":"x","resume_gateway_url":"wss://r"}});
+        assert_eq!(s.on_text(&r.to_string()).len(), 1);
     }
 
     #[test]

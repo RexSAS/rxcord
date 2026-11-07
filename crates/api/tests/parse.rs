@@ -101,3 +101,42 @@ fn ready_null_collections_parse() {
     let Event::MessageCreate(m) = parse("MESSAGE_CREATE", m).unwrap() else { panic!() };
     assert!(m.mentions.is_empty() && m.attachments.is_empty());
 }
+
+#[test]
+fn voice_events_parse() {
+    let Event::VoiceStateUpdate(v) = parse("VOICE_STATE_UPDATE", r#"{"user_id":"1","channel_id":"2","guild_id":null,"session_id":"s","self_mute":true,"self_deaf":false,"mute":false,"deaf":false}"#).unwrap() else { panic!() };
+    assert_eq!((v.user_id.0, v.channel_id.map(|c| c.0), v.guild_id, v.self_mute), (1, Some(2), None, true));
+    let Event::VoiceStateUpdate(v) = parse("VOICE_STATE_UPDATE", r#"{"user_id":"1","channel_id":null}"#).unwrap() else { panic!() };
+    assert_eq!((v.channel_id, v.session_id.as_str()), (None, ""));
+    let Event::VoiceServerUpdate(v) = parse("VOICE_SERVER_UPDATE", r#"{"token":"t","guild_id":null,"channel_id":"5","endpoint":null}"#).unwrap() else { panic!() };
+    assert_eq!((v.endpoint, v.channel_id.map(|c| c.0)), (None, Some(5)));
+}
+
+#[test]
+fn voice_server_debug_redacts() {
+    let Event::VoiceServerUpdate(v) = parse("VOICE_SERVER_UPDATE", r#"{"token":"SECRETVOICE","endpoint":"e.discord.media:443"}"#).unwrap() else { panic!() };
+    let d = format!("{v:?}");
+    assert!(!d.contains("SECRETVOICE") && d.contains("e.discord.media"));
+}
+
+#[test]
+fn call_events_parse() {
+    let Event::CallCreate(c) = parse("CALL_CREATE", r#"{"channel_id":"9","message_id":"1","ringing":["2","3"],"voice_states":[{"user_id":"2","channel_id":"9"}]}"#).unwrap() else { panic!() };
+    assert_eq!((c.ringing.len(), c.voice_states.len()), (2, 1));
+    let Event::CallUpdate(c) = parse("CALL_UPDATE", r#"{"channel_id":"9","ringing":null}"#).unwrap() else { panic!() };
+    assert!(c.ringing.is_empty() && c.voice_states.is_empty());
+    assert!(matches!(parse("CALL_DELETE", r#"{"channel_id":"9"}"#).unwrap(), Event::CallDelete { channel_id } if channel_id.0 == 9));
+}
+
+#[test]
+fn guild_voice_states_both_shapes() {
+    let vs = r#"[{"user_id":"1","channel_id":"2"}]"#;
+    let legacy = format!(r#"{{"id":"5","name":"G","voice_states":{vs}}}"#);
+    let caps = format!(r#"{{"id":"5","properties":{{"name":"G"}},"voice_states":{vs}}}"#);
+    for j in [legacy, caps] {
+        let Event::GuildCreate(g) = parse("GUILD_CREATE", &j).unwrap() else { panic!() };
+        assert_eq!(g.voice_states.len(), 1);
+    }
+    let Event::GuildCreate(g) = parse("GUILD_CREATE", r#"{"id":"5","name":"G","voice_states":null}"#).unwrap() else { panic!() };
+    assert!(g.voice_states.is_empty());
+}

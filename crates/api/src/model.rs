@@ -56,6 +56,7 @@ pub struct Guild {
     pub name: String,
     pub icon: Option<String>,
     pub channels: Vec<Channel>,
+    pub voice_states: Vec<VoiceState>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +67,8 @@ struct RawGuild {
     properties: Option<GuildProps>,
     #[serde(default, deserialize_with = "null_as_default")]
     channels: Vec<Channel>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    voice_states: Vec<VoiceState>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +85,7 @@ impl From<RawGuild> for Guild {
             name: r.name.or(pname).unwrap_or_default(),
             icon: r.icon.or(picon),
             channels: r.channels,
+            voice_states: r.voice_states,
         }
     }
 }
@@ -198,4 +202,66 @@ fn read_state<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ReadStateEntry>, D:
         Some(R::List(v) | R::Wrapped { entries: v }) => v,
         None => vec![],
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VoiceState {
+    pub user_id: Id,
+    #[serde(default)]
+    pub channel_id: Option<Id>,
+    /// Absent inside GUILD_CREATE and CALL_CREATE lists; the container knows the guild.
+    #[serde(default)]
+    pub guild_id: Option<Id>,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub self_mute: bool,
+    #[serde(default)]
+    pub self_deaf: bool,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub deaf: bool,
+    /// Sent with VOICE_STATE_UPDATE in guilds; absent from GUILD_CREATE/READY lists.
+    #[serde(default)]
+    pub member: Option<VoiceMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VoiceMember {
+    #[serde(default)]
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct VoiceServer {
+    pub token: String,
+    #[serde(default)]
+    pub guild_id: Option<Id>,
+    #[serde(default)]
+    pub channel_id: Option<Id>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for VoiceServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceServer")
+            .field("token", &"<redacted>")
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Call {
+    pub channel_id: Id,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub ringing: Vec<Id>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub voice_states: Vec<VoiceState>,
 }

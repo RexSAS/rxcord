@@ -1,5 +1,6 @@
 //! Per-session navigation state and the pure rules for history paging and read acks.
-use crate::view::{MessageRow, TreeRow};
+use crate::settings::Settings;
+use crate::view::{ChannelRow, MessageRow, TreeRow};
 use rxcord_api::ApiError;
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
@@ -94,6 +95,7 @@ pub struct Nav {
     pub selected: Option<Id>,
     pub at_bottom: bool,
     pub tree: Vec<TreeRow>, // what the UI's tree model holds
+    pub tab_rows: Vec<ChannelRow>, // what the UI's tabs model holds
     pub shown: Vec<MessageRow>, // what the UI's message model holds
     pub shown_channel: Option<Id>,
     /// Bumped on READY: history responses from an older generation are ignored entirely.
@@ -104,6 +106,10 @@ pub struct Nav {
     pub ack_later: HashSet<Id>,
     /// Channels whose history returned 403; they don't light the guild's unread dot.
     pub forbidden: HashSet<Id>,
+    /// Voice members highlighted as talking (from the voice connection).
+    pub speaking: HashSet<Id>,
+    /// Voice settings and per-person volumes (not per session: a logout keeps them).
+    pub settings: Settings,
 }
 
 impl Nav {
@@ -114,7 +120,7 @@ impl Nav {
             match *c {
                 Change::Me => {}
                 Change::Messages(c) => msgs |= Some(c) == self.selected,
-                Change::GuildList | Change::Channels { .. } | Change::DmList | Change::Unread(_) => tree = true,
+                Change::GuildList | Change::Channels { .. } | Change::DmList | Change::Unread(_) | Change::Voice(_) | Change::Call(_) => tree = true,
             }
         }
         (tree, msgs)

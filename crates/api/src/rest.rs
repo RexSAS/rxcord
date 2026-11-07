@@ -152,6 +152,19 @@ impl Rest {
         self.send(Method::POST, route, format!("/channels/{channel}/messages/{message}/ack"), Some(json!({"token": null}))).await.map(drop)
     }
 
+    /// Rings the DM/group call. VERIFY LIVE
+    pub async fn ring(&self, channel: Id) -> Result<(), ApiError> {
+        let route = format!("POST /channels/{channel}/call/ring");
+        self.send(Method::POST, route, format!("/channels/{channel}/call/ring"), Some(json!({"recipients": null}))).await.map(drop)
+    }
+
+    /// Stops our own ringing for the call. VERIFY LIVE
+    pub async fn stop_ringing(&self, channel: Id, me: Id) -> Result<(), ApiError> {
+        let route = format!("POST /channels/{channel}/call/stop-ringing");
+        let body = json!({"recipients": [me.to_string()]});
+        self.send(Method::POST, route, format!("/channels/{channel}/call/stop-ringing"), Some(body)).await.map(drop)
+    }
+
     /// CDN fetch: no Authorization, only a User-Agent. A body over `max` bytes is an error.
     pub async fn get_bytes(&self, url: &str, max: usize) -> Result<Vec<u8>, ApiError> {
         let resp = self.http.get(url).header("User-Agent", crate::client_props::user_agent()).send().await?;

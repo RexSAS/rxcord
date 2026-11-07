@@ -14,6 +14,7 @@ mod settings;
 mod token;
 mod update;
 mod view;
+mod voice;
 
 use compose::OutgoingError;
 use rxcord_api::id::Id;
@@ -57,7 +58,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // Window focus, shared with the runtime (acks now, notifications in Task 13). Starts false: winit
     // reports Focused(true) when the window gets focus.
     let focused = Arc::new(AtomicBool::new(false));
-    let tx = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild.clone());
+    let (tx, runtime) = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild.clone());
+    let quit = tx.clone();
     let (t, w) = (tx.clone(), ui.as_weak());
     ui.on_update_clicked(move |action| match update::parse_click(&action) {
         Some(update::Click::Install) => drop(t.send(Command::InstallUpdate)),
@@ -92,6 +94,35 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_logout(move || drop(t.send(Command::Logout)));
     let t = tx.clone();
     ui.on_toggle_node(move |n| drop(id(n).map(|n| t.send(Command::ToggleNode(n)))));
+    let t = tx.clone();
+    ui.on_join_voice(move |c| drop(id(c).map(|c| t.send(Command::JoinVoice(c)))));
+    let t = tx.clone();
+    ui.on_hang_up(move || drop(t.send(Command::LeaveVoice)));
+    let t = tx.clone();
+    ui.on_start_call(move |c| drop(id(c).map(|c| t.send(Command::StartCall(c)))));
+    let t = tx.clone();
+    ui.on_accept_call(move || drop(t.send(Command::AcceptCall)));
+    let t = tx.clone();
+    ui.on_decline_call(move || drop(t.send(Command::DeclineCall)));
+    let t = tx.clone();
+    ui.on_toggle_mute(move || drop(t.send(Command::ToggleMute)));
+    let t = tx.clone();
+    ui.on_toggle_deafen(move || drop(t.send(Command::ToggleDeafen)));
+    let t = tx.clone();
+    ui.on_set_user_volume(move |u, v| drop(id(u).map(|u| t.send(Command::UserVolume(u, v)))));
+    let t = tx.clone();
+    ui.on_set_user_muted(move |u, m| drop(id(u).map(|u| t.send(Command::UserMuted(u, m)))));
+    let t = tx.clone();
+    ui.on_open_voice_settings(move || drop(t.send(Command::VoiceSettings)));
+    let device = |d: slint::SharedString| (!d.is_empty()).then(|| d.to_string());
+    let t = tx.clone();
+    ui.on_voice_input(move |d| drop(t.send(Command::SetInput(device(d)))));
+    let t = tx.clone();
+    ui.on_voice_output(move |d| drop(t.send(Command::SetOutput(device(d)))));
+    let t = tx.clone();
+    ui.on_voice_threshold(move |v| drop(t.send(Command::SetThreshold(v))));
+    let t = tx.clone();
+    ui.on_voice_noise(move |n| drop(t.send(Command::SetNoiseSuppression(n))));
     let t = tx.clone();
     ui.on_close_tab(move |c| drop(id(c).map(|c| t.send(Command::CloseTab(c)))));
     let t = tx.clone();
@@ -156,7 +187,27 @@ fn main() -> Result<(), slint::PlatformError> {
             std::thread::spawn(move || opener::open_browser(&u).map_err(|e| tracing::warn!("open {u}: {e}")));
         }
     });
-    ui.run()
+    let r = ui.run();
+    // Leave voice before the process ends (op 4 null); the runtime bounds this to ~0.5 s.
+    let _ = quit.send(Command::Quit);
+    if !join_within(runtime, std::time::Duration::from_secs(1)) {
+        tracing::warn!("runtime didn't stop in time; exiting anyway");
+    }
+    r
+}
+
+/// Waits at most `limit` for `t`: a runtime parked in an await (e.g. a keyring prompt) must not keep a
+/// windowless process alive. Returns whether it finished.
+fn join_within(t: std::thread::JoinHandle<()>, limit: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while !t.is_finished() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = t.join();
+    true
 }
 
 /// Window size/position, divider and last server, for the next start.
@@ -165,13 +216,12 @@ fn save_settings(ui: &AppWindow, last_guild: &AtomicU64) {
     let size = win.size().to_logical(win.scale_factor());
     let pos = win.position();
     let g = last_guild.load(Ordering::Relaxed);
-    settings::save(&settings::Settings {
-        width: size.width,
-        height: size.height,
-        x: Some(pos.x),
-        y: Some(pos.y),
-        tree_height: ui.get_tree_height(),
-        last_guild: (g != 0).then_some(g),
+    let tree_height = ui.get_tree_height();
+    settings::update(|s| {
+        (s.width, s.height) = (size.width, size.height);
+        (s.x, s.y) = (Some(pos.x), Some(pos.y));
+        s.tree_height = tree_height;
+        s.last_guild = (g != 0).then_some(g);
     });
 }
 
@@ -207,6 +257,15 @@ fn log_filter(env: Option<&str>) -> EnvFilter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quit_join_is_bounded() {
+        let parked = std::thread::spawn(std::thread::park);
+        let t0 = std::time::Instant::now();
+        assert!(!super::join_within(parked, std::time::Duration::from_millis(100)));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500), "gave up on the parked thread");
+        assert!(super::join_within(std::thread::spawn(|| {}), std::time::Duration::from_secs(1)));
+    }
+
     #[test]
     fn log_filter_silences_websocket_frames() {
         for env in [None, Some("trace"), Some("trace,tungstenite=trace,tokio_tungstenite=debug"), Some("bad=[")] {

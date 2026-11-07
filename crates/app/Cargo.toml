@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 rxcord-api = { path = "../api" }
 rxcord-store = { path = "../store" }
+rxcord-voice = { path = "../voice" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

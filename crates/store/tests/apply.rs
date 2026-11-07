@@ -1,6 +1,6 @@
 use rxcord_api::event::Event;
 use rxcord_api::id::Id;
-use rxcord_api::model::{Message, Ready, User};
+use rxcord_api::model::{Call, Message, Ready, User, VoiceState};
 use rxcord_store::{Change, MESSAGE_CAP, Pending, Store};
 
 fn fx(name: &str) -> String {
@@ -272,4 +272,113 @@ fn forget_channel_stops_keeping_messages() {
     create(&mut s, msg(2, GCH, Id(2)));
     assert!(s.messages(GCH).is_empty(), "closed channel keeps no messages");
     assert!(s.is_unread(GCH), "but its unread state still updates");
+}
+
+const VCH: Id = Id(300000000000000002);
+const VCH2: Id = Id(300000000000000003);
+
+fn vs(user: Id, ch: Option<Id>, guild: Option<Id>) -> VoiceState {
+    VoiceState {
+        user_id: user,
+        channel_id: ch,
+        guild_id: guild,
+        session_id: "s".into(),
+        self_mute: false,
+        self_deaf: false,
+        mute: false,
+        deaf: false,
+        member: None,
+    }
+}
+
+fn users(s: &Store, ch: Id) -> Vec<Id> {
+    s.voice_members(ch).iter().map(|v| v.user_id).collect()
+}
+
+#[test]
+fn voice_join_move_leave() {
+    let mut s = ready_store();
+    let g = s.guilds()[0].id;
+    let ev = |ch| Event::VoiceStateUpdate(vs(Id(7), ch, Some(g)));
+    assert_eq!(s.apply(&ev(Some(VCH))), vec![Change::Voice(VCH)]);
+    s.apply(&Event::VoiceStateUpdate(vs(Id(5), Some(VCH), Some(g))));
+    assert_eq!(users(&s, VCH), [Id(5), Id(7)]);
+    assert_eq!(s.apply(&ev(Some(VCH2))), vec![Change::Voice(VCH), Change::Voice(VCH2)]);
+    assert_eq!(users(&s, VCH), [Id(5)]);
+    assert_eq!(users(&s, VCH2), [Id(7)]);
+    assert_eq!(s.apply(&ev(None)), vec![Change::Voice(VCH2)]);
+    assert!(s.voice_members(VCH2).is_empty());
+    // leaving while not tracked changes nothing
+    assert_eq!(s.apply(&ev(None)), vec![]);
+}
+
+#[test]
+fn ready_replaces_voice_states_without_duplicates() {
+    let mut r: Ready = serde_json::from_str(&fx("ready_legacy.json")).unwrap();
+    let g = r.guilds[0].id;
+    r.guilds[0].voice_states = vec![vs(Id(7), Some(VCH), None)];
+    let mut s = Store::new();
+    s.apply(&Event::Ready(Box::new(r.clone())));
+    s.apply(&Event::Ready(Box::new(r)));
+    assert_eq!(users(&s, VCH), [Id(7)]);
+    assert_eq!(s.voice_members(VCH)[0].guild_id, Some(g));
+    // a re-ready forgets states the new READY does not carry
+    s.apply(&Event::VoiceStateUpdate(vs(Id(9), Some(VCH), Some(g))));
+    let r: Ready = serde_json::from_str(&fx("ready_legacy.json")).unwrap();
+    s.apply(&Event::Ready(Box::new(r)));
+    assert!(s.voice_members(VCH).is_empty());
+}
+
+#[test]
+fn guild_create_replaces_guild_voice_states() {
+    let mut r: Ready = serde_json::from_str(&fx("ready_legacy.json")).unwrap();
+    r.guilds[0].voice_states = vec![vs(Id(7), Some(VCH), None)];
+    let mut s = Store::new();
+    s.apply(&Event::Ready(Box::new(r.clone())));
+    let mut g = r.guilds[0].clone();
+    g.voice_states = vec![vs(Id(8), Some(VCH), None)];
+    s.apply(&Event::GuildCreate(g));
+    assert_eq!(users(&s, VCH), [Id(8)]);
+}
+
+#[test]
+fn guild_delete_drops_voice() {
+    let mut s = ready_store();
+    let g = s.guilds()[0].id;
+    s.apply(&Event::VoiceStateUpdate(vs(Id(7), Some(VCH), Some(g))));
+    s.apply(&Event::GuildDelete { id: g, unavailable: true });
+    assert_eq!(users(&s, VCH), [Id(7)]);
+    s.apply(&Event::GuildDelete { id: g, unavailable: false });
+    assert!(s.voice_members(VCH).is_empty());
+}
+
+#[test]
+fn call_ringing_me() {
+    let mut s = ready_store();
+    let dm = dm_id(&s);
+    assert!(s.ringing_me().is_empty());
+    let call = Call { channel_id: dm, ringing: vec![ME], voice_states: vec![vs(Id(7), Some(dm), None)] };
+    assert_eq!(s.apply(&Event::CallCreate(call.clone())), vec![Change::Call(dm), Change::Voice(dm)]);
+    assert_eq!(s.ringing_me(), [dm]);
+    assert_eq!(s.call(dm).unwrap().ringing, [ME]);
+    assert_eq!(users(&s, dm), [Id(7)]);
+    s.apply(&Event::CallUpdate(Call { ringing: vec![], ..call }));
+    assert!(s.ringing_me().is_empty());
+    assert!(s.call(dm).is_some());
+    assert_eq!(s.apply(&Event::CallDelete { channel_id: dm }), vec![Change::Call(dm), Change::Voice(dm)]);
+    assert!(s.call(dm).is_none());
+    assert!(s.voice_members(dm).is_empty());
+    assert_eq!(s.apply(&Event::CallDelete { channel_id: dm }), vec![]);
+}
+
+#[test]
+fn my_voice_tracks_self() {
+    let mut s = ready_store();
+    assert!(s.my_voice().is_none());
+    s.apply(&Event::VoiceStateUpdate(vs(Id(7), Some(VCH), None)));
+    assert!(s.my_voice().is_none());
+    s.apply(&Event::VoiceStateUpdate(vs(ME, Some(VCH), None)));
+    assert_eq!(s.my_voice().unwrap().channel_id, Some(VCH));
+    s.apply(&Event::VoiceStateUpdate(vs(ME, None, None)));
+    assert!(s.my_voice().is_none());
 }

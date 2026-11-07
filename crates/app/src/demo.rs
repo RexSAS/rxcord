@@ -20,10 +20,12 @@ pub fn events() -> (Event, Vec<Event>) {
         "guilds": [
             {"id": GUILD.to_string(), "name": "Rust Users", "channels": [
                 ch(50, 4, "Text Channels", 0, None), ch(CHANNEL, 0, "general", 0, Some("50")),
-                ch(101, 0, "help", 1, Some("50")), ch(102, 2, "Voice", 2, Some("50")), ch(103, 0, "rules", 0, None)]},
+                ch(101, 0, "help", 1, Some("50")), ch(102, 2, "Voice", 2, Some("50")), ch(103, 0, "rules", 0, None)],
+             // in the voice channel, no audio (no driver runs in demo mode)
+             "voice_states": [{"user_id": "2", "channel_id": "102"}, {"user_id": "3", "channel_id": "102", "self_mute": true}]},
             {"id": "11", "name": "Slint", "channels": [ch(110, 0, "chat", 0, None)]}],
         "private_channels": [{"id": "200", "type": 1, "recipient_ids": ["2"], "last_message_id": "900"}],
-        "users": [{"id": "2", "username": "ferris", "global_name": "Ferris"}],
+        "users": [{"id": "2", "username": "ferris", "global_name": "Ferris"}, {"id": "3", "username": "corro"}],
         "read_state": {"entries": [{"id": "101", "last_message_id": "1", "mention_count": 2}]},
     }));
     let texts = [
