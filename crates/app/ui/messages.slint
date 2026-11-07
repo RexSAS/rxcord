@@ -9,6 +9,7 @@ export component MessageList inherits Rectangle {
     // true while the newest message is on screen
     callback bottom-visible(bool);
     callback thumb-visible(string);
+    callback open-url(string);
     // inline error under the row with this id
     in property <string> row-error-id;
     in property <string> row-error;
@@ -36,6 +37,7 @@ export component MessageList inherits Rectangle {
             msg: m;
             error: m.id == root.row-error-id ? root.row-error : "";
             thumb-visible(u) => { root.thumb-visible(u); }
+            open-url(u) => { root.open-url(u); }
             start-reply(id, author) => { root.start-reply(id, author); }
             start-edit(id) => { root.start-edit(id); }
             delete(id) => { root.delete(id); }

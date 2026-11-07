@@ -32,11 +32,20 @@ pub fn events() -> (Event, Vec<Event>) {
         "```rust\nfn main() {\n    println!(\"hi\");\n}\n```",
         "a long line that should wrap around the message list because it keeps going and going and going on",
     ];
+    // Same image in several rows (one fetch); offline it fails and keeps the placeholder.
+    let attachments = json!([
+        {"id": "1", "filename": "ferris.png", "url": "https://cdn.discordapp.com/attachments/100/1/ferris.png",
+         "proxy_url": "https://media.discordapp.net/attachments/100/1/ferris.png", "width": 800, "height": 533,
+         "content_type": "image/png", "size": 1},
+        {"id": "2", "filename": "notes.txt", "url": "https://cdn.discordapp.com/attachments/100/2/notes.txt",
+         "proxy_url": "https://media.discordapp.net/attachments/100/2/notes.txt", "content_type": "text/plain", "size": 1}
+    ]);
     let msgs = (0..40)
         .map(|i| {
             ev("MESSAGE_CREATE", json!({"id": (500 + i).to_string(), "channel_id": CHANNEL.to_string(),
                 "author": {"id": (1 + i % 2).to_string(), "username": if i % 2 == 0 { "me" } else { "ferris" }},
-                "content": texts[i % texts.len()], "timestamp": "2026-11-07T12:00:00+00:00"}))
+                "content": texts[i % texts.len()], "timestamp": "2026-11-07T12:00:00+00:00",
+                "attachments": if i % 10 == 9 { attachments.clone() } else { json!([]) }}))
         })
         .collect();
     (ready, msgs)

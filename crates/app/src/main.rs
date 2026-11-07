@@ -2,6 +2,7 @@ mod bridge;
 mod compose;
 #[cfg(debug_assertions)]
 mod demo;
+mod images;
 mod markdown;
 mod nav;
 mod runtime;
@@ -94,6 +95,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let t = tx.clone();
     ui.on_bottom_visible(move |b| drop(t.send(Command::BottomVisible(b))));
     ui.on_thumb_visible(move |u| drop(tx.send(Command::ThumbVisible(u.into()))));
+    ui.on_open_url(|u| {
+        // only web links: never hand other schemes from message data to the OS opener
+        if u.starts_with("https://") || u.starts_with("http://") {
+            let u = u.to_string();
+            std::thread::spawn(move || opener::open_browser(&u).map_err(|e| tracing::warn!("open {u}: {e}")));
+        }
+    });
     ui.run()
 }
 

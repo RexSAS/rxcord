@@ -21,3 +21,6 @@ keyring = { version = "3", features = ["async-secret-service", "tokio", "crypto-
 qrcode = { version = "0.14", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+lru = "0.16"
+opener = "0.8"

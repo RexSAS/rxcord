@@ -1,6 +1,6 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
 use crate::nav::{Ack, HISTORY_PAGE, Nav};
-use crate::{AppWindow, bridge, compose, token};
+use crate::{AppWindow, bridge, compose, images, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
 use rxcord_api::id::Id;
@@ -31,7 +31,6 @@ pub enum Command {
     StartEdit(Option<Id>),
     Edit { channel: Id, message: Id, content: String },
     Delete { channel: Id, message: Id },
-    #[allow(dead_code)] // image loading: Task 12
     ThumbVisible(String /*url*/),
 }
 
@@ -52,6 +51,7 @@ enum Input {
     Gw(Option<GatewayEvent>),
     Qr(Option<QrStatus>),
     Done(Done),
+    Thumb(images::Loaded),
 }
 
 /// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
@@ -61,8 +61,8 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>) -> Un
         .name("rxcord-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
-            let (store, tasks, nav) = (Store::new(), JoinSet::new(), Nav::default());
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused }.run(rx));
+            let (store, tasks, nav, thumbs) = (Store::new(), JoinSet::new(), Nav::default(), images::Thumbs::new());
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -78,6 +78,7 @@ struct Runtime {
     tasks: JoinSet<Done>,
     nav: Nav,
     focused: Arc<AtomicBool>,
+    thumbs: images::Thumbs, // outlives sessions: CDN fetches need no token
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -114,6 +115,7 @@ impl Runtime {
                 g = recv_opt(&mut self.gw) => Input::Gw(g),
                 q = recv_opt(&mut self.qr) => Input::Qr(q),
                 Some(Ok(d)) = self.tasks.join_next() => Input::Done(d),
+                Some(Ok(l)) = self.thumbs.tasks.join_next() => Input::Thumb(l),
             };
             match input {
                 Input::Cmd(c) => self.command(c).await,
@@ -123,6 +125,7 @@ impl Runtime {
                 Input::Qr(Some(s)) => bridge::qr_status(&self.ui, s),
                 Input::Qr(None) => self.qr = None,
                 Input::Done(d) => self.done(d).await,
+                Input::Thumb(l) => bridge::push_thumb(&self.ui, self.thumbs.loaded(l, &self.nav.shown)),
             }
         }
     }
@@ -255,7 +258,7 @@ impl Runtime {
                     Done::Deleted { channel_id: channel, id, result: rest.delete_message(channel, id).await }
                 });
             }
-            Command::ThumbVisible(_) => {} // image loading: Task 12
+            Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url)),
         }
     }
 

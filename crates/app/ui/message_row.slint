@@ -8,14 +8,30 @@ export struct BlockItem {
     raw: string,
 }
 
+export struct ThumbItem {
+    // sized proxy URL (cache key)
+    url: string,
+    // full-size URL, opened on click
+    full: string,
+    width: int,
+    height: int,
+    // empty until loaded (or for good if the fetch failed)
+    image: image,
+}
+
+export struct FileItem {
+    name: string,
+    url: string,
+}
+
 export struct MessageItem {
     id: string,
     author: string,
     time: string,
     blocks: [BlockItem],
     reply: string,
-    thumbs: [string],
-    files: [string],
+    thumbs: [ThumbItem],
+    files: [FileItem],
     edited: bool,
     pending: bool,
     failed: bool,
@@ -42,6 +58,7 @@ export component MessageRow inherits TouchArea {
     // inline error for this row ("" = none)
     in property <string> error;
     callback thumb-visible(string);
+    callback open-url(string);
     callback start-reply(string, string);
     callback start-edit(string);
     callback delete(string);
@@ -123,18 +140,36 @@ export component MessageRow inherits TouchArea {
                 }
             }
         }
-        for f in root.msg.files: Text {
-            text: "📎 " + f;
-            color: Palette.accent-background;
+        for f in root.msg.files: HorizontalLayout {
+            alignment: start;
+            Action {
+                text: "📎 " + f.name;
+                clicked => { root.open-url(f.url); }
+            }
         }
         for t in root.msg.thumbs: HorizontalLayout {
             alignment: start;
-            Rectangle {
-                width: 200px;
-                height: 120px;
-                border-radius: 4px;
-                background: Palette.alternate-background;
-                init => { root.thumb-visible(t); }
+            // fixed size from the attachment's dimensions: no layout jump when the image arrives
+            TouchArea {
+                width: t.width * 1px;
+                height: t.height * 1px;
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Open image";
+                accessible-action-default => { root.open-url(t.full); }
+                init => { root.thumb-visible(t.url); }
+                clicked => { root.open-url(t.full); }
+                Rectangle {
+                    border-radius: 4px;
+                    clip: true;
+                    background: Palette.alternate-background;
+                    Image {
+                        source: t.image;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: contain;
+                    }
+                }
             }
         }
         if root.msg.failed: HorizontalLayout {

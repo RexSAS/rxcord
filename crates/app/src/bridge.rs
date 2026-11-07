@@ -1,8 +1,9 @@
 //! How data reaches the UI: view rows -> Slint structs/models, pushed via `invoke_from_event_loop`.
 use crate::markdown::{Block, Span};
 use crate::nav::Nav;
-use crate::view::{self, ChannelRow, GuildRow, MessageRow};
-use crate::{AppWindow, BlockItem, ChannelItem, GuildItem, MessageItem};
+use crate::images::Pixels;
+use crate::view::{self, ChannelRow, GuildRow, MessageRow, Thumb};
+use crate::{AppWindow, BlockItem, ChannelItem, FileItem, GuildItem, MessageItem, ThumbItem};
 use rxcord_api::id::Id;
 use rxcord_api::remote_auth::QrStatus;
 use rxcord_store::Store;
@@ -225,13 +226,34 @@ fn message_item(r: MessageRow) -> MessageItem {
         time: r.time.into(),
         blocks: model(blocks.collect()),
         reply: r.reply_preview.unwrap_or_default().into(),
-        thumbs: model(r.thumbs.into_iter().map(Into::into).collect()),
-        files: model(r.files.into_iter().map(|(name, _)| name.into()).collect()),
+        thumbs: model(r.thumbs.into_iter().map(thumb_item).collect()),
+        files: model(r.files.into_iter().map(|(name, url)| FileItem { name: name.into(), url: url.into() }).collect()),
         edited: r.edited,
         pending: r.pending,
         failed: r.failed,
         mine: r.mine,
     }
+}
+
+fn thumb_item(t: Thumb) -> ThumbItem {
+    let (width, height) = (t.width as i32, t.height as i32);
+    ThumbItem { url: t.url.into(), full: t.full.into(), width, height, image: Default::default() }
+}
+
+/// A thumbnail to show (`None`: nothing): it goes into each shown row with `url` and no image yet.
+pub fn push_thumb(ui: &Weak<AppWindow>, thumb: Option<(String, Pixels)>) {
+    let Some((url, px)) = thumb else { return };
+    with_ui(ui, move |ui| {
+        let image = slint::Image::from_rgba8(px);
+        for row in ui.get_messages().iter() {
+            for (i, mut t) in row.thumbs.iter().enumerate() {
+                if t.url == url && t.image.size().width == 0 {
+                    t.image = image.clone();
+                    row.thumbs.set_row_data(i, t);
+                }
+            }
+        }
+    });
 }
 
 fn styled(spans: &[Span]) -> StyledText {

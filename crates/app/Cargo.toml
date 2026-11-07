@@ -14,6 +14,9 @@ keyring.workspace = true
 qrcode.workspace = true
 chrono.workspace = true
 serde_json.workspace = true # demo fixtures (RXCORD_DEMO)
+image.workspace = true
+lru.workspace = true
+opener.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

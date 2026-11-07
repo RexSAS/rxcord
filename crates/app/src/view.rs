@@ -1,8 +1,9 @@
 //! Plain `Send` view structs built from the store on the runtime thread.
+use crate::images::{THUMB_MAX, fit, thumb_url};
 use crate::markdown::{Block, Mention, parse};
 use chrono::{DateTime, FixedOffset, Local};
 use rxcord_api::id::Id;
-use rxcord_api::model::{Channel, Message, User};
+use rxcord_api::model::{Attachment, Channel, Message, User};
 use rxcord_store::Store;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,13 +31,22 @@ pub struct MessageRow {
     pub author: String,
     pub time: String, // local HH:MM
     pub blocks: Vec<Block>,
-    pub thumbs: Vec<String>,
-    pub files: Vec<(String, String)>,
+    pub thumbs: Vec<Thumb>,
+    pub files: Vec<(String, String)>, // (filename, url)
     pub reply_preview: Option<String>,
     pub edited: bool,
     pub mine: bool,
     pub pending: bool,
     pub failed: bool,
+}
+
+/// An image attachment; the row reserves `width` x `height` px before the image arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thumb {
+    pub url: String, // sized proxy URL, also the cache key
+    pub full: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub fn format_time(ts: &str, offset: FixedOffset) -> String {
@@ -126,6 +136,11 @@ fn preview(m: &Message) -> String {
     format!("{}: {text}", m.author.display_name())
 }
 
+fn thumb(a: &Attachment) -> Thumb {
+    let (width, height) = fit(a.width, a.height, THUMB_MAX).unwrap_or((THUMB_MAX / 2, THUMB_MAX / 2));
+    Thumb { url: thumb_url(&a.proxy_url, a.width, a.height, THUMB_MAX), full: a.url.clone(), width, height }
+}
+
 /// Stored messages, then pending ones. Times use the current local offset.
 pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
     let offset = *Local::now().offset();
@@ -142,7 +157,7 @@ pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
                 author: m.author.display_name().to_string(),
                 time: format_time(&m.timestamp, offset),
                 blocks: resolve_mentions(s, &m.mentions, parse(&m.content)),
-                thumbs: img.into_iter().map(|a| a.proxy_url.clone()).collect(),
+                thumbs: img.into_iter().map(thumb).collect(),
                 files: other.into_iter().map(|a| (a.filename.clone(), a.url.clone())).collect(),
                 reply_preview: m.referenced_message.as_deref().map(preview),
                 edited: m.edited_timestamp.is_some(),
@@ -195,7 +210,13 @@ mod tests {
         let ch = Id(100);
         s.open_channel(ch);
         let m = json!({"id": "500", "channel_id": "100", "author": {"id": "2", "username": "bob"},
-            "content": "hi", "timestamp": "2026-11-07T12:00:00+00:00"});
+            "content": "hi", "timestamp": "2026-11-07T12:00:00+00:00", "attachments": [
+                {"id": "1", "filename": "a.png", "url": "https://cdn/a.png", "proxy_url": "https://media/a.png",
+                 "width": 800, "height": 400, "content_type": "image/png", "size": 1},
+                {"id": "2", "filename": "b.png", "url": "https://cdn/b.png", "proxy_url": "https://media/b.png",
+                 "content_type": "image/png", "size": 1},
+                {"id": "3", "filename": "c.txt", "url": "https://cdn/c.txt", "proxy_url": "https://media/c.txt", "size": 1}
+            ]});
         s.apply(&Event::MessageCreate(Box::new(serde_json::from_value(m).unwrap())));
         s.add_pending(Pending { nonce: "n1".into(), channel: ch, content: "yo".into(), reply_to: None, failed: false });
         let rows = message_rows(&s, ch);
@@ -203,6 +224,12 @@ mod tests {
         assert_eq!(rows[0].id, Some(Id(500)));
         assert_eq!(rows[0].author, "bob");
         assert!(!rows[0].pending && !rows[0].mine);
+        let t = |url: &str, full: &str, width, height| Thumb { url: url.into(), full: full.into(), width, height };
+        assert_eq!(rows[0].thumbs, [
+            t("https://media/a.png?width=400&height=200", "https://cdn/a.png", 400, 200),
+            t("https://media/b.png", "https://cdn/b.png", 200, 200), // size unknown: square placeholder
+        ]);
+        assert_eq!(rows[0].files, [("c.txt".to_string(), "https://cdn/c.txt".to_string())]);
         let p = &rows[1];
         assert_eq!((p.id, p.nonce.as_deref(), p.pending, p.mine), (None, Some("n1"), true, true));
         assert_eq!(p.author, "me");
