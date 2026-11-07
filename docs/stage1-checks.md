@@ -39,6 +39,7 @@
 
 ## Follow-ups (known gaps, in priority order)
 
+0. **Voice: a moderator move can drop the call in one ordering** — if the move's VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE arrive before the old voice socket's 4014 close, the old socket's late `Left(Kicked)` can tear down the restarted connection ("Disconnected from voice"). Fix: tag `VoiceCmd::Restart` and `VoiceEvent::Left` with a connection epoch and ignore `Left` from an older epoch; test "move state + server → Connect → Left(Kicked)". Check the live order first (see the Voice checklist).
 1. **Text typed in a channel that gets deleted** — fixed for the active tab (moves to the next tab). Still lost: the saved draft of a deleted *background* tab, and unsent (pending/failed) messages of a deleted channel (rare). Fix: after `store.apply`, collect pending entries of channels that no longer exist plus the composer draft of a deleted selected channel; push them into the composer via one `orphan-text` callback with the note "Channel was deleted — unsent text moved here"; make `Drafts::switch` carry the composer text forward when the target is `None`.
 2. **QR login socket failure (e.g. offline at first launch) shows an empty login screen** — set `login-error` in `Done::QrToken(Err)`.
 3. **Channel permissions (VIEW_CHANNEL)** aren't computed: inaccessible channels are listed (they're dropped from the unread dot once they return 403). Needed before daily use in big servers — also reduces 403 requests the official client would never make.
