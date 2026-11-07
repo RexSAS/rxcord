@@ -4,7 +4,7 @@
 use rxcord_api::event::Event;
 use rxcord_api::gateway::GatewayCmd;
 use rxcord_api::id::Id;
-use rxcord_voice::audio::capture::{Capture, CaptureOut};
+use rxcord_voice::audio::capture::{Capture, CaptureOut, SILENCE, SILENCE_FRAMES};
 use rxcord_voice::audio::playback::Playback;
 use rxcord_voice::driver::{VoiceCmd, VoiceEvent, VoiceStatus, run_voice};
 use rxcord_voice::session::{Connect, LeaveReason};
@@ -338,6 +338,8 @@ impl Audio {
     /// meanwhile). Returns when `media` closes.
     fn run<O: Output, I: Input>(&self, mut open_out: impl FnMut() -> Option<O>, mut open_mic: impl FnMut() -> Option<I>, media: std_mpsc::Receiver<(u64, u16, Vec<u8>)>) {
         let (mut out, mut mic, mut levels) = (Slot::<O>::new(), Slot::<I>::new(), vec![]);
+        // the mic's last Speaking: its silence tail is ours to send if it dies mid-speech
+        let mut speaking = false;
         let mut next_tick = std::time::Instant::now();
         loop {
             loop {
@@ -362,7 +364,12 @@ impl Audio {
             if let Some(open) = mic.keep(now, self.reopen, I::failed, &mut open_mic) {
                 if !open {
                     tracing::warn!("no audio input");
-                    let _ = self.cmds.try_send(VoiceCmd::Speaking(false)); // in case it died mid-sentence
+                    if std::mem::take(&mut speaking) {
+                        for _ in 0..SILENCE_FRAMES {
+                            let _ = self.cmds.try_send(VoiceCmd::Opus(SILENCE.to_vec()));
+                        }
+                        let _ = self.cmds.try_send(VoiceCmd::Speaking(false));
+                    }
                 }
                 let _ = self.notes.send(AudioNote::Mic(open));
             }
@@ -380,7 +387,10 @@ impl Audio {
                     // never block the audio thread: a busy driver loses the packet
                     let _ = match o {
                         CaptureOut::Opus(f) => self.cmds.try_send(VoiceCmd::Opus(f)).map_err(drop),
-                        CaptureOut::Speaking(on) => self.cmds.try_send(VoiceCmd::Speaking(on)).map_err(drop),
+                        CaptureOut::Speaking(on) => {
+                            speaking = on;
+                            self.cmds.try_send(VoiceCmd::Speaking(on)).map_err(drop)
+                        }
                         CaptureOut::Level(on) => self.notes.send(AudioNote::Level(on)).map_err(drop),
                     };
                 }
@@ -606,7 +616,10 @@ mod tests {
         }
         failed.store(true, Ordering::Relaxed); // unplugged
         assert_eq!(notes.blocking_recv(), Some(AudioNote::Mic(false)), "\"No microphone\", still connected");
-        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(false))), "we stop speaking");
+        for i in 0..5 {
+            assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Opus(f)) if f == SILENCE), "silence frame {i}");
+        }
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(false))), "then we stop speaking");
         assert_eq!(notes.blocking_recv(), Some(AudioNote::Mic(true)), "reopened after the retry interval");
         assert_eq!(opens.load(Ordering::Relaxed), 2);
         drop(media);

@@ -21,8 +21,8 @@ const SCALE: f32 = 32768.0;
 const HANGOVER: u32 = 10;
 pub const DEFAULT_THRESHOLD: f32 = 0.6;
 /// Opus silence, sent 5 times when speech stops so receivers don't interpolate.
-const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
-const SILENCE_FRAMES: usize = 5;
+pub const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
+pub const SILENCE_FRAMES: usize = 5;
 const BITRATE: i32 = 64_000;
 const MAX_PACKET: usize = 4000;
 
@@ -231,12 +231,9 @@ impl Engine {
                     Err(e) => tracing::debug!("opus encode: {e}"),
                 }
             }
-            (false, GateOut::Stop) if self.speaking => {
+            // speech ended or muted mid-speech: a silence tail so receivers don't interpolate
+            (false, GateOut::Stop) | (true, _) if self.speaking => {
                 out.extend((0..SILENCE_FRAMES).map(|_| CaptureOut::Opus(SILENCE.to_vec())));
-                self.speaking = false;
-                out.push(CaptureOut::Speaking(false));
-            }
-            (true, _) if self.speaking => {
                 self.speaking = false;
                 out.push(CaptureOut::Speaking(false));
             }
@@ -294,7 +291,11 @@ mod tests {
         let mut e = open_engine();
         assert_eq!(packets(&push(&mut e, FRAME)), 1);
         e.muted = true;
-        assert_eq!(push(&mut e, FRAME * 5), [CaptureOut::Speaking(false)], "no packets, Speaking(false) once");
+        let silence = CaptureOut::Opus(SILENCE.to_vec());
+        let out = push(&mut e, FRAME * 5);
+        assert_eq!(out.len(), SILENCE_FRAMES + 1, "{out:?}");
+        assert!(out[..SILENCE_FRAMES].iter().all(|o| *o == silence), "silence tail: {out:?}");
+        assert_eq!(out[SILENCE_FRAMES], CaptureOut::Speaking(false), "then Speaking(false) once");
         assert!(push(&mut e, FRAME * 5).is_empty());
         e.muted = false;
         let out = push(&mut e, FRAME);
