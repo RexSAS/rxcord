@@ -1,6 +1,6 @@
 use rxcord_api::event::Event;
 use rxcord_api::id::Id;
-use rxcord_api::model::{Channel, Guild, Message, User};
+use rxcord_api::model::{Call, Channel, Guild, Message, User, VoiceState};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 static EMPTY: VecDeque<Message> = VecDeque::new();
@@ -15,6 +15,10 @@ pub enum Change {
     DmList,
     Messages(Id),
     Unread(Id),
+    /// Who is in this voice channel changed.
+    Voice(Id),
+    /// The DM call in this channel changed.
+    Call(Id),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -41,6 +45,9 @@ pub struct Store {
     read: HashMap<Id, Read>,
     msgs: HashMap<Id, VecDeque<Message>>,
     pending: Vec<Pending>,
+    /// Keyed by user: one voice connection at a time.
+    voice: HashMap<Id, VoiceState>,
+    calls: HashMap<Id, Call>,
 }
 
 fn is_dm(c: &Channel) -> bool {
@@ -81,6 +88,35 @@ impl Store {
         let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
         let read = self.read.get(&channel).and_then(|r| r.last_read);
         last.is_some() && last > read
+    }
+
+    /// Ordered by user id.
+    pub fn voice_members(&self, channel: Id) -> Vec<&VoiceState> {
+        let mut v: Vec<_> = self.voice.values().filter(|v| v.channel_id == Some(channel)).collect();
+        v.sort_by_key(|v| v.user_id);
+        v
+    }
+    pub fn my_voice(&self) -> Option<&VoiceState> {
+        self.voice.get(&self.me.as_ref()?.id)
+    }
+    pub fn call(&self, channel: Id) -> Option<&Call> {
+        self.calls.get(&channel)
+    }
+    /// DM channels whose call rings me, by channel id.
+    pub fn ringing_me(&self) -> Vec<Id> {
+        let Some(me) = self.me.as_ref().map(|u| u.id) else {
+            return vec![];
+        };
+        let mut v: Vec<Id> = self.calls.values().filter(|c| c.ringing.contains(&me)).map(|c| c.channel_id).collect();
+        v.sort();
+        v
+    }
+
+    /// Inserts `states`, stamped with `guild` (`None` for a call).
+    fn put_voice(&mut self, states: &[VoiceState], guild: Option<Id>) {
+        for v in states {
+            self.voice.insert(v.user_id, VoiceState { guild_id: guild, ..v.clone() });
+        }
     }
 
     pub fn channels_of(&self, guild: Id) -> Vec<&Channel> {
@@ -131,8 +167,10 @@ impl Store {
                     for c in &g.channels {
                         self.put_channel(c.clone(), Some(g.id));
                     }
+                    self.put_voice(&g.voice_states, Some(g.id));
                     let mut g = g.clone();
                     g.channels.clear();
+                    g.voice_states.clear();
                     self.guilds.push(g);
                 }
                 for c in &r.private_channels {
@@ -147,8 +185,11 @@ impl Store {
                 for c in &g.channels {
                     self.put_channel(c.clone(), Some(g.id));
                 }
+                self.voice.retain(|_, v| v.guild_id != Some(g.id));
+                self.put_voice(&g.voice_states, Some(g.id));
                 let mut g = g.clone();
                 g.channels.clear();
+                g.voice_states.clear();
                 match self.guilds.iter_mut().find(|x| x.id == g.id) {
                     Some(x) => *x = g,
                     None => self.guilds.push(g),
@@ -159,6 +200,7 @@ impl Store {
             Event::GuildDelete { unavailable: true, .. } => vec![],
             Event::GuildDelete { id, .. } => {
                 self.guilds.retain(|g| g.id != *id);
+                self.voice.retain(|_, v| v.guild_id != Some(*id));
                 let gone: Vec<Id> = self.channels.values().filter(|c| c.guild_id == Some(*id)).map(|c| c.id).collect();
                 for c in gone {
                     self.drop_channel(c);
@@ -206,14 +248,35 @@ impl Store {
                 self.mark_read(*channel_id, *message_id);
                 vec![Change::Unread(*channel_id)]
             }
-            // Voice and call events: handled in Task 6.
-            Event::Resumed
-            | Event::Unknown(_)
-            | Event::VoiceStateUpdate(_)
-            | Event::VoiceServerUpdate(_)
-            | Event::CallCreate(_)
-            | Event::CallUpdate(_)
-            | Event::CallDelete { .. } => vec![],
+            Event::VoiceStateUpdate(v) => {
+                let old = match v.channel_id {
+                    Some(_) => self.voice.insert(v.user_id, v.clone()),
+                    None => self.voice.remove(&v.user_id),
+                };
+                let mut out: Vec<Change> = old.and_then(|o| o.channel_id).map(Change::Voice).into_iter().collect();
+                if let Some(c) = v.channel_id.filter(|c| out.first() != Some(&Change::Voice(*c))) {
+                    out.push(Change::Voice(c));
+                }
+                out
+            }
+            Event::CallCreate(c) | Event::CallUpdate(c) => {
+                self.voice.retain(|_, v| v.channel_id != Some(c.channel_id));
+                self.put_voice(&c.voice_states, None);
+                let mut c = c.clone();
+                c.voice_states.clear();
+                let id = c.channel_id;
+                self.calls.insert(id, c);
+                vec![Change::Call(id), Change::Voice(id)]
+            }
+            Event::CallDelete { channel_id } => {
+                if self.calls.remove(channel_id).is_none() {
+                    return vec![];
+                }
+                self.voice.retain(|_, v| v.channel_id != Some(*channel_id));
+                vec![Change::Call(*channel_id), Change::Voice(*channel_id)]
+            }
+            // The app consumes it once to connect; it is not state.
+            Event::Resumed | Event::Unknown(_) | Event::VoiceServerUpdate(_) => vec![],
         }
     }
 

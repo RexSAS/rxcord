@@ -114,7 +114,7 @@ impl Nav {
             match *c {
                 Change::Me => {}
                 Change::Messages(c) => msgs |= Some(c) == self.selected,
-                Change::GuildList | Change::Channels { .. } | Change::DmList | Change::Unread(_) => tree = true,
+                Change::GuildList | Change::Channels { .. } | Change::DmList | Change::Unread(_) | Change::Voice(_) | Change::Call(_) => tree = true,
             }
         }
         (tree, msgs)
