@@ -21,6 +21,8 @@ pub enum ApiError {
     /// QR login failed outside HTTP: protocol error, cancel, timeout, or socket closed.
     #[error("remote auth: {0}")]
     RemoteAuth(String),
+    #[error("response over {0} bytes")]
+    TooLarge(usize),
 }
 
 pub struct Rest {
@@ -79,14 +81,24 @@ impl Rest {
         self.send(Method::POST, route, format!("/channels/{channel}/messages/{message}/ack"), Some(json!({"token": null}))).await.map(drop)
     }
 
-    /// CDN fetch: no Authorization, only a User-Agent.
-    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ApiError> {
-        let resp = self.http.get(url).header("User-Agent", crate::client_props::user_agent()).send().await?;
+    /// CDN fetch: no Authorization, only a User-Agent. A body over `max` bytes is an error.
+    pub async fn get_bytes(&self, url: &str, max: usize) -> Result<Vec<u8>, ApiError> {
+        let mut resp = self.http.get(url).header("User-Agent", crate::client_props::user_agent()).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(ApiError::Http { status: status.as_u16(), body: resp.text().await.unwrap_or_default() });
+            return Err(ApiError::Http { status: status.as_u16(), body: String::new() }); // untrusted body: not read
         }
-        Ok(resp.bytes().await?.to_vec())
+        if resp.content_length().is_some_and(|n| n > max as u64) {
+            return Err(ApiError::TooLarge(max));
+        }
+        let mut out = vec![];
+        while let Some(chunk) = resp.chunk().await? {
+            if out.len() + chunk.len() > max {
+                return Err(ApiError::TooLarge(max));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     async fn json<T: DeserializeOwned>(&self, m: Method, route: String, path: String, body: Option<Value>) -> Result<T, ApiError> {

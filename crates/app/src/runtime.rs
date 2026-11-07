@@ -78,7 +78,7 @@ struct Runtime {
     tasks: JoinSet<Done>,
     nav: Nav,
     focused: Arc<AtomicBool>,
-    thumbs: images::Thumbs, // outlives sessions: CDN fetches need no token
+    thumbs: images::Thumbs,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -155,6 +155,7 @@ impl Runtime {
         bridge::restore_drafts(&self.ui, compose::unsent_drafts(self.store.all_pending()));
         self.store = Store::new();
         self.nav = Nav::default();
+        self.thumbs = images::Thumbs::new(); // drops the cache and aborts its fetches
         bridge::clear(&self.ui);
     }
 
@@ -258,7 +259,7 @@ impl Runtime {
                     Done::Deleted { channel_id: channel, id, result: rest.delete_message(channel, id).await }
                 });
             }
-            Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url)),
+            Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
         }
     }
 
@@ -348,6 +349,7 @@ impl Runtime {
 
     async fn status(&mut self, s: ConnStatus) {
         tracing::info!(?s, "gateway status");
+        if s == ConnStatus::Connected { self.thumbs.forget_failures() } // a network blip shouldn't leave placeholders
         let banner = match s {
             ConnStatus::AuthFailed => return self.logout("Login failed or session expired. Please log in again.").await,
             ConnStatus::Connected => String::new(),

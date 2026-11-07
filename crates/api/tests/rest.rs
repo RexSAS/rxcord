@@ -64,3 +64,13 @@ async fn gives_up_after_three_retries() {
     let r = Rest::with_base("tok".into(), s.uri());
     assert!(matches!(r.delete_message(Id(1), Id(2)).await, Err(ApiError::Http { status: 429, .. })));
 }
+
+#[tokio::test]
+async fn get_bytes_caps_body() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/a.png")).respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 100])).mount(&s).await;
+    let r = Rest::new(String::new());
+    let url = format!("{}/a.png", s.uri());
+    assert_eq!(r.get_bytes(&url, 100).await.unwrap().len(), 100);
+    assert!(matches!(r.get_bytes(&url, 99).await, Err(ApiError::TooLarge(99))));
+}

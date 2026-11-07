@@ -150,7 +150,10 @@ pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
         .iter()
         .map(|m| {
             let (img, other): (Vec<_>, Vec<_>) =
-                m.attachments.iter().partition(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")));
+                m.attachments.iter().partition(|a| {
+                    // what `images::decode` handles; other images (svg, avif, ...) stay file links
+                    matches!(a.content_type.as_deref(), Some("image/png" | "image/jpeg" | "image/webp" | "image/gif"))
+                });
             MessageRow {
                 id: Some(m.id),
                 nonce: None,
@@ -215,6 +218,8 @@ mod tests {
                  "width": 800, "height": 400, "content_type": "image/png", "size": 1},
                 {"id": "2", "filename": "b.png", "url": "https://cdn/b.png", "proxy_url": "https://media/b.png",
                  "content_type": "image/png", "size": 1},
+                {"id": "4", "filename": "d.svg", "url": "https://cdn/d.svg", "proxy_url": "https://media/d.svg",
+                 "width": 10, "height": 10, "content_type": "image/svg+xml", "size": 1},
                 {"id": "3", "filename": "c.txt", "url": "https://cdn/c.txt", "proxy_url": "https://media/c.txt", "size": 1}
             ]});
         s.apply(&Event::MessageCreate(Box::new(serde_json::from_value(m).unwrap())));
@@ -227,9 +232,10 @@ mod tests {
         let t = |url: &str, full: &str, width, height| Thumb { url: url.into(), full: full.into(), width, height };
         assert_eq!(rows[0].thumbs, [
             t("https://media/a.png?width=400&height=200", "https://cdn/a.png", 400, 200),
-            t("https://media/b.png", "https://cdn/b.png", 200, 200), // size unknown: square placeholder
+            t("https://media/b.png?width=400&height=400", "https://cdn/b.png", 200, 200), // size unknown
         ]);
-        assert_eq!(rows[0].files, [("c.txt".to_string(), "https://cdn/c.txt".to_string())]);
+        let f = |n: &str| (n.to_string(), format!("https://cdn/{n}"));
+        assert_eq!(rows[0].files, [f("d.svg"), f("c.txt")]);
         let p = &rows[1];
         assert_eq!((p.id, p.nonce.as_deref(), p.pending, p.mine), (None, Some("n1"), true, true));
         assert_eq!(p.author, "me");

@@ -1,7 +1,7 @@
 //! How data reaches the UI: view rows -> Slint structs/models, pushed via `invoke_from_event_loop`.
 use crate::markdown::{Block, Span};
 use crate::nav::Nav;
-use crate::images::Pixels;
+use crate::images::ThumbUpdate;
 use crate::view::{self, ChannelRow, GuildRow, MessageRow, Thumb};
 use crate::{AppWindow, BlockItem, ChannelItem, FileItem, GuildItem, MessageItem, ThumbItem};
 use rxcord_api::id::Id;
@@ -240,17 +240,23 @@ fn thumb_item(t: Thumb) -> ThumbItem {
     ThumbItem { url: t.url.into(), full: t.full.into(), width, height, image: Default::default() }
 }
 
-/// A thumbnail to show (`None`: nothing): it goes into each shown row with `url` and no image yet.
-pub fn push_thumb(ui: &Weak<AppWindow>, thumb: Option<(String, Pixels)>) {
-    let Some((url, px)) = thumb else { return };
+/// Puts a thumbnail into the shown rows with its URL and no image yet, and drops the images the cache
+/// evicted, so rows never hold more than the cache's byte budget.
+pub fn push_thumb(ui: &Weak<AppWindow>, u: ThumbUpdate) {
+    if u.show.is_none() && u.evicted.is_empty() {
+        return;
+    }
     with_ui(ui, move |ui| {
-        let image = slint::Image::from_rgba8(px);
+        let show = u.show.map(|(url, px)| (url, slint::Image::from_rgba8(px)));
         for row in ui.get_messages().iter() {
             for (i, mut t) in row.thumbs.iter().enumerate() {
-                if t.url == url && t.image.size().width == 0 {
-                    t.image = image.clone();
-                    row.thumbs.set_row_data(i, t);
+                let loaded = t.image.size().width != 0;
+                match &show {
+                    Some((url, img)) if !loaded && t.url == url.as_str() => t.image = img.clone(),
+                    _ if loaded && u.evicted.iter().any(|e| t.url == e.as_str()) => t.image = Default::default(),
+                    _ => continue,
                 }
+                row.thumbs.set_row_data(i, t);
             }
         }
     });
