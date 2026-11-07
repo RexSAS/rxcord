@@ -66,6 +66,9 @@ export component AppWindow inherits Window {
     in-out property <string> composer-error;
     in-out property <string> row-error-id;
     in property <string> row-error;
+    in property <bool> row-error-ok;
+    // Join button of a server invite in a message
+    callback join-invite(string /*message id*/, string /*code*/);
     callback send(string);
     // "" = your newest message in the channel
     callback start-edit(string);
@@ -144,6 +147,8 @@ export component AppWindow inherits Window {
                     open-url(u) => { root.open-url(u); }
                     row-error-id: root.row-error-id;
                     row-error: root.row-error;
+                    row-error-ok: root.row-error-ok;
+                    join-invite(m, c) => { root.join-invite(m, c); }
                     start-reply(id, author) => {
                         composer.cancel();
                         root.reply-id = id;

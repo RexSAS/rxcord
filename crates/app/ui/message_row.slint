@@ -25,6 +25,8 @@ export struct MessageItem {
     reply: string,
     thumbs: [ThumbItem],
     files: [FileItem],
+    // server invite codes found in the text
+    invites: [string],
     edited: bool,
     pending: bool,
     failed: bool,
@@ -51,6 +53,9 @@ export component MessageRow inherits VerticalLayout {
     in property <MessageItem> msg;
     // inline error for this row ("" = none)
     in property <string> error;
+    // the note under the row is good news (e.g. "Joined …"), not an error
+    in property <bool> error-ok;
+    callback join(string /*invite code*/);
     callback thumb-visible(string);
     callback open-url(string);
     callback start-reply(string, string);
@@ -88,13 +93,28 @@ export component MessageRow inherits VerticalLayout {
                 text: root.msg.body;
                 opacity: root.msg.pending && !root.msg.failed ? 0.5 : 1.0;
                 default-color: root.msg.failed ? #da373c : Palette.foreground;
-                link-clicked(url) => { root.open-url(url); }
+                link-color: Palette.color-scheme == ColorScheme.dark ? #6cb4f5 : #1a6bc4;
+            link-clicked(url) => { root.open-url(url); }
             }
             for f in root.msg.files: HorizontalLayout {
                 alignment: start;
                 Action {
                     text: "📎 " + f.name;
                     clicked => { root.open-url(f.url); }
+                }
+            }
+            for code in root.msg.invites: HorizontalLayout {
+                alignment: start;
+                spacing: 8px;
+                Text {
+                    text: "Server invite · " + code;
+                    font-size: 12px;
+                    opacity: 0.8;
+                    vertical-alignment: center;
+                }
+                Action {
+                    text: "Join";
+                    clicked => { root.join(code); }
                 }
             }
             for t in root.msg.thumbs: HorizontalLayout {
@@ -157,7 +177,7 @@ export component MessageRow inherits VerticalLayout {
             }
             if root.error != "": Text {
                 text: root.error;
-                color: #da373c;
+                color: root.error-ok ? #3ba55c : #da373c;
                 font-size: 11px;
             }
         }

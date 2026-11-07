@@ -99,6 +99,20 @@ pub fn delete_failed(ui: &Weak<AppWindow>, id: Id) {
 fn row_error(ui: &AppWindow, id: Id, msg: &str) {
     ui.set_row_error_id(id.to_string().into());
     ui.set_row_error(msg.into());
+    ui.set_row_error_ok(false);
+}
+
+/// A note under message `id` (`ok`: green), e.g. the result of joining an invite. `open`: also open
+/// this https URL in the browser.
+pub fn row_note(ui: &Weak<AppWindow>, id: Id, msg: String, ok: bool, open: Option<String>) {
+    with_ui(ui, move |ui| {
+        ui.set_row_error_id(id.to_string().into());
+        ui.set_row_error(msg.into());
+        ui.set_row_error_ok(ok);
+        if let Some(u) = open {
+            ui.invoke_open_url(u.into());
+        }
+    });
 }
 
 /// Tree and tabs. Rows that didn't change aren't touched, so a busy server doesn't redraw the tree.
@@ -210,6 +224,7 @@ fn message_item(r: MessageRow) -> MessageItem {
         reply: r.reply_preview.unwrap_or_default().into(),
         thumbs: model(r.thumbs.into_iter().map(thumb_item).collect()),
         files: model(r.files.into_iter().map(|(name, url)| FileItem { name: name.into(), url: url.into() }).collect()),
+        invites: model(r.invites.into_iter().map(Into::into).collect()),
         edited: r.edited,
         pending: r.pending,
         failed: r.failed,
@@ -428,6 +443,7 @@ mod tests {
             ],
             thumbs: vec![],
             files: vec![],
+            invites: vec![],
             reply_preview: None,
             edited: true,
             mine: false,
@@ -451,6 +467,7 @@ mod tests {
             blocks: crate::markdown::parse(text),
             thumbs: vec![],
             files: vec![],
+            invites: vec![],
             reply_preview: None,
             edited: false,
             mine: false,

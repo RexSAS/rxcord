@@ -35,6 +35,8 @@ pub struct MessageRow {
     pub blocks: Vec<Block>,
     pub thumbs: Vec<Thumb>,
     pub files: Vec<(String, String)>, // (filename, url)
+    /// Server invite codes found in the text (a Join button each).
+    pub invites: Vec<String>,
     pub reply_preview: Option<String>,
     pub edited: bool,
     pub mine: bool,
@@ -212,6 +214,7 @@ pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
                 blocks: resolve_mentions(s, &m.mentions, parse(&m.content)),
                 thumbs: img.into_iter().map(thumb).collect(),
                 files: other.into_iter().map(|a| (a.filename.clone(), a.url.clone())).collect(),
+                invites: crate::invite::invite_codes(&m.content),
                 reply_preview: m.referenced_message.as_deref().map(preview),
                 edited: m.edited_timestamp.is_some(),
                 mine: me.is_some_and(|u| u.id == m.author.id),
@@ -228,6 +231,7 @@ pub fn message_rows(s: &Store, channel: Id) -> Vec<MessageRow> {
         blocks: resolve_mentions(s, &[], parse(&p.content)),
         thumbs: vec![],
         files: vec![],
+        invites: vec![], // not sent yet: nothing to join from
         reply_preview: p.reply_to.and_then(|r| msgs.iter().find(|m| m.id == r)).map(preview),
         edited: false,
         mine: true,

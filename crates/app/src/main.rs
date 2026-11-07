@@ -4,6 +4,7 @@ mod compose;
 #[cfg(debug_assertions)]
 mod demo;
 mod images;
+mod invite;
 mod markdown;
 mod nav;
 mod notify;
@@ -103,6 +104,12 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_delete_message(move |m| {
         if let (Some(channel), Some(message)) = (selected(&w), id(m)) {
             let _ = t.send(Command::Delete { channel, message });
+        }
+    });
+    let t = tx.clone();
+    ui.on_join_invite(move |m, code| {
+        if let Some(message) = id(m) {
+            let _ = t.send(Command::JoinInvite { message, code: code.into() });
         }
     });
     let t = tx.clone();

@@ -8,6 +8,34 @@ use std::time::Duration;
 const BASE: &str = "https://discord.com/api/v9";
 const MAX_RETRIES: u32 = 3;
 
+/// Where a join click happened; sent like the official client's invite button (X-Context-Properties).
+#[derive(Debug, Clone, Copy)]
+pub struct InviteContext {
+    pub guild: Option<Id>,
+    pub channel: Id,
+    pub channel_type: u8,
+    pub message: Id,
+}
+
+/// The guild joined via an invite (only what the app shows).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct JoinedGuild {
+    pub id: Id,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct InviteJoin {
+    #[serde(default)]
+    guild: Option<JoinedGuild>,
+}
+
+/// Invite codes go into the URL path: letters, digits and dashes only.
+pub fn valid_invite_code(code: &str) -> bool {
+    (2..=32).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("unauthorized")]
@@ -23,6 +51,13 @@ pub enum ApiError {
     RemoteAuth(String),
     #[error("response over {0} bytes")]
     TooLarge(usize),
+}
+
+impl ApiError {
+    /// Discord wants an hCaptcha solved before it accepts the request (rxcord can't show one).
+    pub fn is_captcha(&self) -> bool {
+        matches!(self, ApiError::Http { status: 400, body } if body.contains("captcha_key"))
+    }
 }
 
 pub struct Rest {
@@ -45,6 +80,23 @@ impl Rest {
 
     pub fn with_base(token: String, base: String) -> Self {
         Self { http: client_builder().build().expect("http client"), base, token, limiter: RateLimiter::default() }
+    }
+
+    /// Joins the guild of invite `code`. `None` guild: Discord didn't say which (the gateway will).
+    pub async fn join_invite(&self, code: &str, session_id: &str, ctx: InviteContext) -> Result<Option<JoinedGuild>, ApiError> {
+        if !valid_invite_code(code) {
+            return Err(ApiError::Http { status: 404, body: "invalid invite code".into() });
+        }
+        let props = json!({
+            "location": "Invite Button Embed",
+            "location_guild_id": ctx.guild.map(|g| g.to_string()),
+            "location_channel_id": ctx.channel.to_string(),
+            "location_channel_type": ctx.channel_type,
+            "location_message_id": ctx.message.to_string(),
+        });
+        let extra = [("X-Context-Properties", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, props.to_string()))];
+        let body = self.send_with(Method::POST, "POST /invites".into(), format!("/invites/{code}"), Some(json!({"session_id": session_id})), &extra).await?;
+        Ok(serde_json::from_slice::<InviteJoin>(&body)?.guild)
     }
 
     pub async fn messages(&self, channel: Id, before: Option<Id>, limit: u8) -> Result<Vec<Message>, ApiError> {
@@ -106,6 +158,17 @@ impl Rest {
     }
 
     async fn send(&self, m: Method, route: String, path: String, body: Option<Value>) -> Result<Vec<u8>, ApiError> {
+        self.send_with(m, route, path, body, &[]).await
+    }
+
+    async fn send_with(
+        &self,
+        m: Method,
+        route: String,
+        path: String,
+        body: Option<Value>,
+        extra: &[(&str, String)],
+    ) -> Result<Vec<u8>, ApiError> {
         let url = format!("{}{path}", self.base);
         let mut retries = 0;
         loop {
@@ -113,6 +176,9 @@ impl Rest {
             let mut req = self.http.request(m.clone(), &url).header("Authorization", &self.token);
             for (k, v) in base_headers() {
                 req = req.header(k, v);
+            }
+            for (k, v) in extra {
+                req = req.header(*k, v);
             }
             if let Some(b) = &body {
                 req = req.json(b);

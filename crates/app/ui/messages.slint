@@ -13,6 +13,8 @@ export component MessageList inherits Rectangle {
     // inline error under the row with this id
     in property <string> row-error-id;
     in property <string> row-error;
+    in property <bool> row-error-ok;
+    callback join-invite(string /*message id*/, string /*code*/);
     callback start-reply(string, string);
     callback start-edit(string);
     callback delete(string);
@@ -36,6 +38,8 @@ export component MessageList inherits Rectangle {
         for m in root.messages: MessageRow {
             msg: m;
             error: m.id == root.row-error-id ? root.row-error : "";
+            error-ok: root.row-error-ok;
+            join(code) => { root.join-invite(m.id, code); }
             thumb-visible(u) => { root.thumb-visible(u); }
             open-url(u) => { root.open-url(u); }
             start-reply(id, author) => { root.start-reply(id, author); }
