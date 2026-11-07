@@ -497,8 +497,18 @@ impl Runtime {
                 return bridge::row_note(&self.ui, message, msg, true, None);
             }
             Done::Joined { message, code, result: Err(e) } if e.is_captcha() => {
-                let msg = "Discord wants a captcha: finish joining in the browser".to_string();
-                return bridge::row_note(&self.ui, message, msg, false, Some(format!("https://discord.com/invite/{code}")));
+                // rxcord can't show a captcha. Joining in a normal browser window would use whatever
+                // account is logged in there, so a private window, where the user logs in as this account.
+                let me = self.store.me().map(|u| u.username.clone()).unwrap_or_default();
+                let url = crate::invite::invite_url(&code);
+                let u = url.clone();
+                let private = tokio::task::spawn_blocking(move || crate::invite::open_private(&u)).await.unwrap_or(false);
+                let (msg, open) = if private {
+                    (format!("Discord wants a captcha. In the private window that opened, log in as {me}, then join."), None)
+                } else {
+                    (format!("Discord wants a captcha. Open the invite in a private window, log in as {me}, then join."), Some(url))
+                };
+                return bridge::row_note(&self.ui, message, msg, false, open);
             }
             Done::Joined { message, result: Err(e), .. } => {
                 let msg = match &e {

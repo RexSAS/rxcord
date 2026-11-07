@@ -26,9 +26,48 @@ pub fn invite_codes(text: &str) -> Vec<String> {
     out
 }
 
+/// The invite's web page; `code` must have passed `valid_invite_code`.
+pub fn invite_url(code: &str) -> String {
+    format!("https://discord.com/invite/{code}")
+}
+
+/// Firefox binaries to try, in order.
+fn firefox_candidates() -> Vec<std::path::PathBuf> {
+    let mut v = vec![];
+    if cfg!(windows) {
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(dir) = std::env::var_os(var) {
+                v.push(std::path::Path::new(&dir).join("Mozilla Firefox").join("firefox.exe"));
+            }
+        }
+    }
+    v.push("firefox".into()); // on PATH (Linux, incl. snap)
+    v
+}
+
+/// Opens `url` in a Firefox private window, which doesn't share the logins of normal windows (so the
+/// user can log in there with this account). False when Firefox couldn't be started.
+pub fn open_private(url: &str) -> bool {
+    firefox_candidates().into_iter().any(|bin| {
+        std::process::Command::new(bin)
+            .arg("--private-window")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::invite_codes;
+    use super::{invite_codes, invite_url};
+
+    #[test]
+    fn url_of_code() {
+        assert_eq!(invite_url("abc-1"), "https://discord.com/invite/abc-1");
+    }
 
     #[test]
     fn finds_invites() {
