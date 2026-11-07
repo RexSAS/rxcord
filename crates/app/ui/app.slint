@@ -16,6 +16,9 @@ export component AppWindow inherits Window {
     in property <bool> logged-in;
     in property <image> qr;
     in property <string> login-status;
+    in property <string> login-error;
+    // saved-login session started, READY not yet received
+    in property <bool> connecting;
     // Connection banner text; empty when connected.
     in property <string> banner;
     callback login-token(string);
@@ -163,8 +166,11 @@ export component AppWindow inherits Window {
             background: Palette.background;
             qr: root.qr;
             status: root.login-status;
+            error: root.login-error;
+            connecting: root.connecting;
             login-token(t) => { root.login-token(t); }
             start-qr => { root.start-qr(); }
+            logout => { root.logout(); }
         }
         }
     }

@@ -7,6 +7,7 @@ use crate::{AppWindow, BlockItem, ChannelItem, FileItem, GuildItem, MessageItem,
 use rxcord_api::id::Id;
 use rxcord_api::remote_auth::QrStatus;
 use rxcord_store::Store;
+use std::collections::HashSet;
 use slint::{Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, StyledText, VecModel, Weak};
 
 /// Guild id the UI uses for the "Direct Messages" entry.
@@ -106,10 +107,10 @@ fn row_error(ui: &AppWindow, id: Id, msg: &str) {
     ui.set_row_error(msg.into());
 }
 
-pub fn push_guilds(ui: &Weak<AppWindow>, s: &Store) {
+pub fn push_guilds(ui: &Weak<AppWindow>, s: &Store, forbidden: &HashSet<Id>) {
     let dms = view::dm_rows(s);
     let summary = (dms.iter().any(|d| d.unread), dms.iter().map(|d| d.mentions).sum());
-    set_guilds(ui, view::guild_rows(s), summary);
+    set_guilds(ui, view::guild_rows(s, forbidden), summary);
 }
 
 /// Channels of `guild`, or the DM list for `None`.
@@ -367,7 +368,10 @@ pub fn qr_status(ui: &Weak<AppWindow>, s: QrStatus) {
             });
         }
         QrStatus::Scanned(name) => {
-            with_ui(ui, move |ui| ui.set_login_status(format!("Scanned by {name}. Confirm on your phone.").into()));
+            with_ui(ui, move |ui| {
+                ui.set_login_error("".into()); // a new login attempt
+                ui.set_login_status(format!("Scanned by {name}. Confirm on your phone.").into());
+            });
         }
         QrStatus::Expired => {
             with_ui(ui, |ui| {

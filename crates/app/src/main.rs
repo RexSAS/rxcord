@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod bridge;
 mod compose;
 #[cfg(debug_assertions)]
@@ -24,7 +25,7 @@ slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
     // Software by default; SLINT_BACKEND set by the user wins. Keep winit: the focus hook needs it.
     if std::env::var_os("SLINT_BACKEND").is_none() {
@@ -133,4 +134,23 @@ fn send(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Command>, text: 
     let _ = tx.send(Command::Send { channel, content, reply_to: id(ui.get_reply_id()) });
     ui.set_composer_text("".into());
     ui.set_reply_id("".into());
+}
+
+/// RUST_LOG (default `warn`), but websocket frame traces never: they may contain the Identify token.
+fn log_filter(env: Option<&str>) -> EnvFilter {
+    let f = env.and_then(|e| EnvFilter::try_new(e).ok()).unwrap_or_else(|| EnvFilter::new("warn"));
+    let off = |t: &str| t.parse().expect("static directive");
+    f.add_directive(off("tungstenite=off")).add_directive(off("tokio_tungstenite=off"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_filter_silences_websocket_frames() {
+        for env in [None, Some("trace"), Some("trace,tungstenite=trace,tokio_tungstenite=debug"), Some("bad=[")] {
+            let f = super::log_filter(env).to_string();
+            assert!(f.contains("tungstenite=off") && f.contains("tokio_tungstenite=off"), "{env:?}: {f}");
+            assert!(!f.contains("tungstenite=trace") && !f.contains("tungstenite=debug"), "{env:?}: {f}");
+        }
+    }
 }

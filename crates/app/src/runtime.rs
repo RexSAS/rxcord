@@ -139,6 +139,7 @@ impl Runtime {
         let (tx, rx) = mpsc::channel(256);
         self.rest = Some(Arc::new(Rest::new(token.clone())));
         self.gw = Some(rx);
+        self.with_ui(|ui| ui.set_connecting(true)); // until READY shows the app
         self.tasks.spawn(async move {
             run_gateway(token, tx).await;
             Done::Nothing
@@ -159,12 +160,15 @@ impl Runtime {
         bridge::clear(&self.ui);
     }
 
-    fn show_login(&mut self, status: &str) {
-        let status = status.to_string();
+    /// `error` stays on the login screen (QR updates don't replace it) until the next login attempt.
+    fn show_login(&mut self, error: &str) {
+        let error = error.to_string();
         self.with_ui(move |ui| {
             ui.set_logged_in(false);
+            ui.set_connecting(false);
             ui.set_banner("".into());
-            ui.set_login_status(status.into());
+            ui.set_login_status("".into());
+            ui.set_login_error(error.into());
         });
         self.start_qr();
     }
@@ -183,12 +187,17 @@ impl Runtime {
 
     async fn command(&mut self, c: Command) {
         match c {
+            // A connecting session must not be ended by a stale login-screen action.
+            Command::LoginToken(_) | Command::StartQr if self.gw.is_some() => {}
             Command::LoginToken(t) => {
                 let t = t.trim().to_string();
                 if t.is_empty() {
                     return;
                 }
-                self.with_ui(|ui| ui.set_login_status("Logging in…".into()));
+                self.with_ui(|ui| {
+                    ui.set_login_error("".into());
+                    ui.set_login_status("Logging in…".into());
+                });
                 self.login(t).await;
             }
             Command::StartQr => self.show_login(""),
@@ -303,7 +312,7 @@ impl Runtime {
     fn changed(&mut self, changes: Vec<Change>) {
         let (guilds, chans, msgs) = self.nav.affected(&self.store, &changes);
         if guilds {
-            bridge::push_guilds(&self.ui, &self.store);
+            bridge::push_guilds(&self.ui, &self.store, &self.nav.forbidden);
         }
         if chans {
             bridge::push_channels(&self.ui, &self.store, self.nav.guild);
@@ -331,6 +340,11 @@ impl Runtime {
     fn event(&mut self, ev: Event) {
         let ready = matches!(ev, Event::Ready(_));
         let changes = self.store.apply(&ev);
+        if self.nav.drop_missing_selection(&self.store) {
+            bridge::set_error(&self.ui, String::new());
+            bridge::push_selection(&self.ui, &self.store, self.nav.guild, None);
+            bridge::push_messages(&self.ui, &self.store, &mut self.nav);
+        }
         // Unread(channel) is only reported for a create the store saw as new, so redeliveries stay silent.
         if let Event::MessageCreate(m) = &ev
             && changes.contains(&Change::Unread(m.channel_id))
@@ -365,6 +379,8 @@ impl Runtime {
             ConnStatus::Connected => String::new(),
             ConnStatus::Connecting => "Connecting…".into(),
             ConnStatus::Reconnecting { attempt } => format!("Reconnecting (attempt {attempt})…"),
+            ConnStatus::Fatal(code) => format!("Discord closed the connection (code {code})"),
+            ConnStatus::ReadyFailed => "Couldn't read account data from Discord".into(),
         };
         self.with_ui(move |ui| ui.set_banner(banner.into()));
     }
@@ -379,6 +395,9 @@ impl Runtime {
             Done::History { channel, generation, result: Err(e), .. } => {
                 if let Some(msg) = self.nav.history_failed(&self.store, channel, generation, &e) {
                     bridge::set_error(&self.ui, msg.into());
+                }
+                if self.nav.forbidden.contains(&channel) {
+                    bridge::push_guilds(&self.ui, &self.store, &self.nav.forbidden);
                 }
                 e
             }

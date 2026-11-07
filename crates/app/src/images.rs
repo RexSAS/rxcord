@@ -14,7 +14,7 @@ const MAX_FETCHES: usize = 4;
 /// Download cap: thumbnails are requested at <= 400 px, so this only stops a hostile or broken server.
 const MAX_DOWNLOAD: usize = 20 * 1024 * 1024;
 /// Decode limits (decompression bombs): longest side, and bytes the decoder may allocate.
-const MAX_DECODE_SIDE: u32 = 8192;
+const MAX_DECODE_SIDE: u32 = 4096;
 const MAX_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
 
 pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;

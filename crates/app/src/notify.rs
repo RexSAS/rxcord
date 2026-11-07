@@ -27,7 +27,7 @@ pub fn notification_text(msg: &Message, store: &Store) -> (String, String) {
 pub fn show(title: &str, body: &str) {
     let (t, b) = (title.to_owned(), body.to_owned());
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = notify_rust::Notification::new().summary(&t).body(&b).show() {
+        if let Err(e) = notify_rust::Notification::new().appname("rxcord").summary(&t).body(&b).show() {
             tracing::debug!("notification failed: {e}");
         }
     });

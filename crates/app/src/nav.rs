@@ -51,6 +51,8 @@ pub struct Nav {
     pub history_end: HashMap<Id, Id>,
     pub acked: HashMap<Id, Instant>,
     pub ack_later: HashSet<Id>,
+    /// Channels whose history returned 403; they don't light the guild's unread dot.
+    pub forbidden: HashSet<Id>,
 }
 
 impl Nav {
@@ -128,6 +130,9 @@ impl Nav {
 
     /// A history request of `ch` failed: the notice to show, if the channel is open with nothing loaded.
     pub fn history_failed(&mut self, s: &Store, ch: Id, generation: u64, e: &ApiError) -> Option<&'static str> {
+        if matches!(e, ApiError::Http { status: 403, .. }) {
+            self.forbidden.insert(ch);
+        }
         if !self.finish_request(ch, generation) || self.selected != Some(ch) || !s.messages(ch).is_empty() {
             return None;
         }
@@ -135,6 +140,15 @@ impl Nav {
             ApiError::Http { status: 403, .. } => "You don't have access to this channel",
             _ => "Couldn't load messages — click to retry",
         })
+    }
+
+    /// The selected channel is gone (deleted, or its guild left): deselect it. True when it was cleared.
+    pub fn drop_missing_selection(&mut self, s: &Store) -> bool {
+        let gone = self.selected.is_some_and(|c| s.channel(c).is_none());
+        if gone {
+            self.selected = None;
+        }
+        gone
     }
 
     /// Decides (and records) an ack for `ch`. Needs the channel selected, loaded, on screen and the window focused.
@@ -239,6 +253,28 @@ mod tests {
         n.guild = None;
         assert_eq!(n.affected(&s, &[Change::DmList, Change::Unread(Id(200))]), (true, true, false));
         assert_eq!(n.affected(&s, &[Change::Channels { guild: Some(Id(10)) }]), (false, false, false));
+    }
+
+    #[test]
+    fn forbidden_recorded_on_403() {
+        let (s, mut n) = (store(), Nav::default());
+        let e = |status| ApiError::Http { status, body: String::new() };
+        n.history_failed(&s, Id(100), n.generation, &e(500));
+        assert!(n.forbidden.is_empty());
+        n.history_failed(&s, Id(100), n.generation, &e(403)); // even when not selected
+        assert!(n.forbidden.contains(&Id(100)));
+    }
+
+    #[test]
+    fn deleted_selection_cleared() {
+        let mut s = store();
+        let mut n = Nav { selected: Some(Id(100)), ..Default::default() };
+        assert!(!n.drop_missing_selection(&s));
+        let Some(c) = s.channel(Id(100)).cloned() else { panic!() };
+        s.apply(&Event::ChannelDelete(c));
+        assert!(n.drop_missing_selection(&s));
+        assert_eq!(n.selected, None);
+        assert!(!n.drop_missing_selection(&s));
     }
 
     #[test]

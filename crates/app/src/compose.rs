@@ -80,7 +80,8 @@ pub fn after_edit(composer: &str, submitted: &str, stash: &str) -> String {
 impl Drafts {
     /// A session for user `me` started: another account's drafts are dropped, the same user's kept.
     pub fn set_user(&mut self, me: Id) {
-        if self.owner.replace(me) != Some(me) {
+        if self.owner.replace(me) != Some(me) && !self.saved.is_empty() {
+            tracing::info!(dropped = self.saved.len(), "account switch: dropping the previous user's drafts");
             self.saved.clear();
         }
     }

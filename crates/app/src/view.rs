@@ -5,6 +5,7 @@ use chrono::{DateTime, FixedOffset, Local};
 use rxcord_api::id::Id;
 use rxcord_api::model::{Attachment, Channel, Message, User};
 use rxcord_store::Store;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuildRow {
@@ -68,11 +69,18 @@ pub fn channel_row(s: &Store, c: &Channel) -> ChannelRow {
     }
 }
 
-pub fn guild_rows(s: &Store) -> Vec<GuildRow> {
+/// Whether `c`'s unread state counts for its guild's dot: only channels the user can open and read.
+pub fn counts_for_guild(c: &Channel, forbidden: &HashSet<Id>) -> bool {
+    !matches!(c.kind, 2 | 13 | 4) && !forbidden.contains(&c.id) // voice, stage, category; history 403
+}
+
+/// `forbidden`: channels whose history returned 403 this session.
+pub fn guild_rows(s: &Store, forbidden: &HashSet<Id>) -> Vec<GuildRow> {
     s.guilds()
         .iter()
         .map(|g| {
-            let chans = s.channels_of(g.id);
+            let mut chans = s.channels_of(g.id);
+            chans.retain(|c| counts_for_guild(c, forbidden));
             GuildRow {
                 id: g.id,
                 name: g.name.clone(),
@@ -193,6 +201,7 @@ mod tests {
     use rxcord_api::event::Event;
     use rxcord_store::Pending;
     use serde_json::json;
+    use std::collections::HashSet;
 
     fn store() -> Store {
         let ready = json!({
@@ -253,6 +262,28 @@ mod tests {
         let Block::Para(spans) = &message_rows(&s, ch)[0].blocks[0] else { panic!() };
         let text: String = spans.iter().map(|x| x.text.as_str()).collect();
         assert_eq!(text, "@me @Carl @unknown-user #general #unknown-channel @role @here");
+    }
+
+    #[test]
+    fn guild_aggregate_counts_only_openable_channels() {
+        let ready = json!({
+            "user": {"id": "1", "username": "me"},
+            "guilds": [{"id": "10", "name": "G", "channels": [
+                {"id": "100", "type": 0, "name": "text"},
+                {"id": "101", "type": 2, "name": "voice", "last_message_id": "9"},
+                {"id": "102", "type": 13, "name": "stage", "last_message_id": "9"},
+                {"id": "103", "type": 4, "name": "cat", "last_message_id": "9"},
+                {"id": "104", "type": 0, "name": "secret", "last_message_id": "9"}
+            ]}],
+            "read_state": [{"id": "101", "mention_count": 1}, {"id": "104", "mention_count": 2}],
+        });
+        let mut s = Store::new();
+        s.apply(&Event::Ready(Box::new(serde_json::from_value(ready).unwrap())));
+        let forbidden = HashSet::from([Id(104)]);
+        let g = &guild_rows(&s, &forbidden)[0];
+        assert_eq!((g.unread, g.mentions), (false, 0), "voice/stage/category/forbidden don't count");
+        let g = &guild_rows(&s, &HashSet::new())[0];
+        assert_eq!((g.unread, g.mentions), (true, 2), "an openable channel does");
     }
 
     #[test]
