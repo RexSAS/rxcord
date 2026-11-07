@@ -392,6 +392,8 @@ pub struct Conn {
     pub op5: HashSet<u64>,
     /// The decoded audio: users heard recently and whether they're talking now.
     pub heard: Vec<(u64, bool)>,
+    /// DAVE's privacy code for this call, once end-to-end encryption is up.
+    pub privacy: Option<String>,
 }
 
 impl Conn {
@@ -421,7 +423,7 @@ impl Conn {
     /// `audio`: the audio thread runs (otherwise there's no mic and no speaker, for good).
     fn new(cmds: mpsc::Sender<VoiceCmd>, events: mpsc::Receiver<VoiceEvent>, media: std_mpsc::Sender<ToAudio>, notes: mpsc::UnboundedReceiver<AudioNote>, muted: Arc<AtomicBool>, audio: bool) -> Conn {
         let (op5, heard) = (HashSet::new(), vec![]);
-        Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connecting, speaker: audio, mic: audio, level: false, op5, heard }
+        Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connecting, speaker: audio, mic: audio, level: false, op5, heard, privacy: None }
     }
 
     /// Who's talking: the decoded audio for people we hear, op 5 only for those we haven't heard yet.
@@ -470,7 +472,7 @@ impl Conn {
     pub fn restart(&mut self, connect: Connect, channel: Id) -> Result<(), Connect> {
         let Ok(slot) = self.cmds.try_reserve() else { return Err(connect) };
         slot.send(VoiceCmd::Restart(connect, channel.0));
-        (self.status, self.op5) = (VoiceStatus::Connecting, HashSet::new());
+        (self.status, self.op5, self.privacy) = (VoiceStatus::Connecting, HashSet::new(), None);
         Ok(())
     }
 

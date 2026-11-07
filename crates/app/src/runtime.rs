@@ -875,7 +875,10 @@ impl Runtime {
                 let fx = self.voice.left(&LeaveReason::Fatal(0), Instant::now());
                 return self.voice_effects(fx);
             }
-            ConnIn::Event(VoiceEvent::PrivacyCode(_)) => return,
+            ConnIn::Event(VoiceEvent::PrivacyCode(c)) => {
+                conn.privacy = Some(c);
+                return self.push_voice();
+            }
         }
         let speaking = conn.speaking();
         if speaking != self.nav.speaking {
@@ -899,7 +902,9 @@ impl Runtime {
                 Some(k) if matches!(k.status, VoiceStatus::Reconnecting { .. }) => "Reconnecting voice…".into(),
                 k => {
                     let problems = k.as_ref().map_or(vec!["Connecting…"], |k| k.problems());
-                    std::iter::once(format!("🔊 {place}")).chain(problems.into_iter().map(String::from)).collect::<Vec<_>>().join(" · ")
+                    // DAVE's privacy code, to compare with the others' clients
+                    let code = k.as_ref().and_then(|k| k.privacy.as_ref()).map(|c| format!("🔒 {c}"));
+                    std::iter::once(format!("🔊 {place}")).chain(problems.into_iter().map(String::from)).chain(code).collect::<Vec<_>>().join(" · ")
                 }
             }
         });
