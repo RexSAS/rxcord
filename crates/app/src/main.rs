@@ -190,8 +190,24 @@ fn main() -> Result<(), slint::PlatformError> {
     let r = ui.run();
     // Leave voice before the process ends (op 4 null); the runtime bounds this to ~0.5 s.
     let _ = quit.send(Command::Quit);
-    let _ = runtime.join();
+    if !join_within(runtime, std::time::Duration::from_secs(1)) {
+        tracing::warn!("runtime didn't stop in time; exiting anyway");
+    }
     r
+}
+
+/// Waits at most `limit` for `t`: a runtime parked in an await (e.g. a keyring prompt) must not keep a
+/// windowless process alive. Returns whether it finished.
+fn join_within(t: std::thread::JoinHandle<()>, limit: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while !t.is_finished() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = t.join();
+    true
 }
 
 /// Window size/position, divider and last server, for the next start.
@@ -241,6 +257,15 @@ fn log_filter(env: Option<&str>) -> EnvFilter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quit_join_is_bounded() {
+        let parked = std::thread::spawn(std::thread::park);
+        let t0 = std::time::Instant::now();
+        assert!(!super::join_within(parked, std::time::Duration::from_millis(100)));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500), "gave up on the parked thread");
+        assert!(super::join_within(std::thread::spawn(|| {}), std::time::Duration::from_secs(1)));
+    }
+
     #[test]
     fn log_filter_silences_websocket_frames() {
         for env in [None, Some("trace"), Some("trace,tungstenite=trace,tokio_tungstenite=debug"), Some("bad=[")] {

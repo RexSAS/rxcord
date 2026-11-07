@@ -95,6 +95,8 @@ enum Input {
     VoiceTimeout,
     RingTimeout,
     SaveSettings,
+    /// The gateway's queue has room for the unsent op 4 (None: the gateway is gone).
+    Op4Room(Option<mpsc::OwnedPermit<GatewayCmd>>),
 }
 
 /// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
@@ -118,7 +120,7 @@ pub fn spawn_runtime(
             let session_id = String::new();
             let (voice, conn, bar, save_at) = (Controller::default(), None, Bar::default(), None);
             let (calls, tone) = (Incoming::default(), None);
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn, bar, save_at, calls, tone }.run(rx));
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn, bar, save_at, calls, tone, op4_unsent: None }.run(rx));
             rt.shutdown_timeout(Duration::from_millis(200)); // don't wait out blocking tasks on exit
         })
         .expect("spawn runtime thread");
@@ -157,6 +159,28 @@ struct Runtime {
     calls: Incoming,
     /// The ring's own output, while ringing outside voice (in voice it's mixed into the call).
     tone: Option<Ringer>,
+    /// The latest voice state (op 4) the gateway's full queue didn't take; sent once it has room.
+    op4_unsent: Option<GatewayCmd>,
+}
+
+/// Op 4 to the gateway without waiting (it may be blocked handing us events; a wait would deadlock). A
+/// full queue keeps the latest one for later; an older unsent one is replaced, never sent after it.
+fn queue_op4(tx: Option<&mpsc::Sender<GatewayCmd>>, unsent: &mut Option<GatewayCmd>, c: GatewayCmd) {
+    let Some(tx) = tx else { return };
+    if unsent.is_some() {
+        *unsent = Some(c);
+    } else if let Err(e) = tx.try_send(c) {
+        tracing::debug!("voice state queued: gateway busy");
+        *unsent = Some(e.into_inner());
+    }
+}
+
+/// Room in the gateway's queue for the unsent op 4; never resolves when there's nothing to send.
+async fn op4_room(tx: Option<mpsc::Sender<GatewayCmd>>, pending: bool) -> Option<mpsc::OwnedPermit<GatewayCmd>> {
+    match tx.filter(|_| pending) {
+        Some(tx) => tx.reserve_owned().await.ok(),
+        None => std::future::pending().await,
+    }
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -238,6 +262,7 @@ impl Runtime {
                 _ = sleep_opt(self.voice.deadline()) => Input::VoiceTimeout,
                 _ = sleep_opt(self.calls.deadline()) => Input::RingTimeout,
                 _ = sleep_opt(self.save_at) => Input::SaveSettings,
+                p = op4_room(self.gw_cmds.clone(), self.op4_unsent.is_some()) => Input::Op4Room(p),
             };
             match input {
                 Input::Cmd(c) => self.command(c).await,
@@ -254,15 +279,35 @@ impl Runtime {
                     self.voice_effects(fx);
                 }
                 Input::RingTimeout => {
-                    self.calls.end();
+                    if let Some(ch) = self.calls.end() {
+                        self.stop_ringing(ch); // nobody answered: stop ringing our other clients too
+                    }
                     self.push_call();
                 }
                 Input::SaveSettings => {
                     if let Some(s) = self.unsaved_settings() {
                         tokio::task::spawn_blocking(move || settings::update(|f| f.take_voice(&s)));
                     }
+                    // volume drags skip the tree; its rows (the sliders' model) catch up here
+                    bridge::push_tree(&self.ui, &self.store, &mut self.nav);
+                }
+                Input::Op4Room(p) => {
+                    if let (Some(p), Some(c)) = (p, self.op4_unsent.take()) {
+                        p.send(c);
+                    }
                 }
             }
+        }
+    }
+
+    /// Fire-and-forget: Discord stops ringing us (all our clients) for the call in `ch`.
+    fn stop_ringing(&self, ch: Id) {
+        if let (Some(rest), Some(me)) = (self.rest.clone(), self.store.me().map(|u| u.id)) {
+            tokio::spawn(async move {
+                if let Err(e) = rest.stop_ringing(ch, me).await {
+                    tracing::warn!("stop ringing: {e}");
+                }
+            });
         }
     }
 
@@ -283,8 +328,13 @@ impl Runtime {
 
     /// Closing its commands stops `run_gateway` once it has sent them (bounded, see `finish_gateway`);
     /// returns the wait. Nothing to wait for without a gateway.
+    /// Best effort: an op 4 still unsent (queue full) gets one more try, and a gateway that's mid-resume
+    /// or backing off sends what's queued only if it's back within `GATEWAY_FLUSH`; otherwise Discord
+    /// drops us from voice when our session times out.
     fn close_gateway(&mut self) -> Option<JoinHandle<()>> {
-        self.gw_cmds = None;
+        if let (Some(tx), Some(c)) = (self.gw_cmds.take(), self.op4_unsent.take()) {
+            let _ = tx.try_send(c);
+        }
         let task = self.gw_task.take()?;
         Some(tokio::spawn(finish_gateway(task, self.gw.take())))
     }
@@ -472,13 +522,7 @@ impl Runtime {
             Command::DeclineCall => {
                 let Some(ch) = self.calls.end() else { return };
                 self.push_call();
-                if let (Some(rest), Some(me)) = (self.rest.clone(), self.store.me().map(|u| u.id)) {
-                    tokio::spawn(async move {
-                        if let Err(e) = rest.stop_ringing(ch, me).await {
-                            tracing::warn!("stop ringing: {e}");
-                        }
-                    });
-                }
+                self.stop_ringing(ch);
             }
             Command::LeaveVoice => {
                 let fx = self.voice.hang_up();
@@ -494,12 +538,13 @@ impl Runtime {
             }
             Command::UserVolume(u, v) => {
                 self.nav.settings.set_volume(u.to_string(), v);
-                self.user_gain(u);
+                self.user_gain(u); // a slider drag: the tree follows with the settings save
             }
             Command::UserMuted(u, on) => {
                 let (set, k) = (&mut self.nav.settings.user_muted, u.to_string());
                 if on { set.insert(k) } else { set.remove(&k) };
                 self.user_gain(u);
+                bridge::push_tree(&self.ui, &self.store, &mut self.nav);
             }
             Command::VoiceSettings => {
                 let (ui, s) = (self.ui.clone(), self.nav.settings.clone());
@@ -690,13 +735,12 @@ impl Runtime {
         self.voice_effects(fx);
     }
 
-    /// Per-person volume or "mute for me" changed: playback, the tree, settings.json.
+    /// Per-person volume or "mute for me" changed: playback now, settings.json (and the tree) soon.
     fn user_gain(&mut self, u: Id) {
         if let Some(k) = &self.conn {
             k.audio(ToAudio::Gain(u.0, self.nav.settings.gain(&u.to_string())));
         }
         self.save_soon();
-        bridge::push_tree(&self.ui, &self.store, &mut self.nav);
     }
 
     fn reopen_input(&mut self) {
@@ -757,15 +801,16 @@ impl Runtime {
         let had_conn = self.conn.is_some();
         for e in fx {
             match e {
-                // try_send: the gateway may be blocked handing us events; a wait here would deadlock
-                Effect::Gateway(c) => {
-                    if let Some(tx) = &self.gw_cmds
-                        && tx.try_send(c).is_err()
-                    {
-                        tracing::warn!("voice state not sent: gateway busy");
-                    }
-                }
+                Effect::Gateway(c) => queue_op4(self.gw_cmds.as_ref(), &mut self.op4_unsent, c),
                 Effect::Connect { connect, channel } => {
+                    // a new voice server mid-call: only the driver starts over, the devices stay open
+                    let connect = match &mut self.conn {
+                        Some(k) => match k.restart(connect, channel) {
+                            Ok(()) => continue,
+                            Err(c) => c, // its queue is full: start a new connection instead
+                        },
+                        None => connect,
+                    };
                     self.conn = None;
                     self.tone = None; // the ring moves into the call's output
                     let mut cfg = AudioCfg::new(&self.nav.settings, self.voice.deafened());
@@ -996,6 +1041,31 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn op4(ch: u64) -> GatewayCmd {
+        GatewayCmd::VoiceState { guild_id: Some(Id(1)), channel_id: Some(Id(ch)), self_mute: false, self_deaf: false }
+    }
+    fn ch(c: GatewayCmd) -> Option<Id> {
+        let GatewayCmd::VoiceState { channel_id, .. } = c;
+        channel_id
+    }
+
+    #[tokio::test]
+    async fn op4_kept_when_gateway_busy_then_sent() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut unsent = None;
+        queue_op4(Some(&tx), &mut unsent, op4(1));
+        assert!(unsent.is_none(), "room: sent at once");
+        queue_op4(Some(&tx), &mut unsent, op4(2)); // full
+        queue_op4(Some(&tx), &mut unsent, op4(3)); // still unsent: replaces 2
+        assert_eq!(unsent.map(ch), Some(Some(Id(3))), "the latest is kept");
+        assert_eq!(ch(rx.recv().await.unwrap()), Some(Id(1)));
+        let p = op4_room(Some(tx.clone()), true).await.expect("room again");
+        p.send(unsent.take().unwrap());
+        assert_eq!(ch(rx.recv().await.unwrap()), Some(Id(3)), "retried; 2 never goes out after 3");
+        let idle = tokio::time::timeout(Duration::from_millis(50), op4_room(Some(tx), false)).await;
+        assert!(idle.is_err(), "nothing unsent: the arm never fires");
+    }
 
     #[tokio::test]
     async fn finish_gateway_drains_events_until_the_driver_stops() {
