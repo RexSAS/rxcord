@@ -26,6 +26,12 @@ fn main() -> Result<(), slint::PlatformError> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
         .init();
+    // Software by default; SLINT_BACKEND set by the user wins. Keep winit: the focus hook needs it.
+    if std::env::var_os("SLINT_BACKEND").is_none() {
+        let renderer = if std::env::var("RXCORD_RENDERER").is_ok_and(|v| v == "gpu") { "femtovg" } else { "software" };
+        tracing::info!(renderer, "selecting renderer");
+        slint::BackendSelector::new().backend_name("winit".into()).renderer_name(renderer.into()).select()?;
+    }
     let ui = AppWindow::new()?;
     bridge::clear(&ui.as_weak()); // queued: runs once the event loop starts
     // Window focus, shared with the runtime (acks now, notifications in Task 13). Starts false: winit

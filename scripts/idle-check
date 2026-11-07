@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Usage: idle-check [--secs N] [PID]  -- CPU% of one core over N seconds (default 60); exit 1 if >= 0.5
+set -euo pipefail
+secs=60
+if [[ ${1:-} == --secs ]]; then secs=${2:?--secs needs a value}; shift 2; fi
+pid=${1:-}
+if [[ -z $pid ]]; then
+  mapfile -t pids < <(pgrep -x rxcord || true)
+  [[ ${#pids[@]} -eq 1 ]] || { echo "expected exactly 1 rxcord process, found ${#pids[@]}" >&2; exit 2; }
+  pid=${pids[0]}
+fi
+ticks() { # utime+stime; fields 14,15 overall = 12,13 after the last ')' (comm may contain spaces)
+  local s; s=$(<"/proc/$pid/stat"); s=${s##*) }; read -ra f <<<"$s"; echo $((f[11] + f[12]))
+}
+a=$(ticks); sleep "$secs"; b=$(ticks)
+cpu=$(awk -v d=$((b - a)) -v hz="$(getconf CLK_TCK)" -v s="$secs" 'BEGIN{printf "%.2f", d/hz/s*100}')
+echo "cpu: ${cpu}%"
+awk -v c="$cpu" 'BEGIN{exit !(c >= 0.5)}' && exit 1 || exit 0
