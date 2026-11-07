@@ -61,11 +61,15 @@ pub enum LeaveReason {
     Kicked,
     BadEncryption,
     Fatal(u16),
+    /// Close 4006 again right after a fresh Identify: the main gateway must rejoin (op 4).
+    SessionInvalid,
 }
 
 pub enum Action {
     Send(Frame),
     HeartbeatEvery(Duration),
+    /// Op 6: the server answered our last heartbeat.
+    HeartbeatAck,
     Discover {
         ip: String,
         port: u16,
@@ -98,6 +102,7 @@ impl fmt::Debug for Action {
         match self {
             Action::Send(x) => f.debug_tuple("Send").field(x).finish(),
             Action::HeartbeatEvery(d) => f.debug_tuple("HeartbeatEvery").field(d).finish(),
+            Action::HeartbeatAck => f.write_str("HeartbeatAck"),
             Action::Discover { ip, port, ssrc } => f
                 .debug_struct("Discover")
                 .field("ip", ip)
@@ -139,6 +144,8 @@ pub struct Session {
     max_dave: u16,
     seq: Option<u64>,
     ran: bool,
+    /// A 4006 closed the last session and no Ready followed yet.
+    invalid: bool,
     mode: Option<Mode>,
     ssrc: u32,
 }
@@ -215,6 +222,7 @@ impl Session {
             max_dave,
             seq: None,
             ran: false,
+            invalid: false,
             mode: None,
             ssrc: 0,
         }
@@ -283,7 +291,7 @@ impl Session {
                     let Some(mode) = Mode::from_name(&s.mode) else {
                         return Some(vec![Action::Leave(LeaveReason::BadEncryption)]);
                     };
-                    this.ran = true;
+                    (this.ran, this.invalid) = (true, false);
                     vec![Action::Ready {
                         mode,
                         key: s.secret_key,
@@ -299,6 +307,7 @@ impl Session {
                         on: s.speaking != 0,
                     }]
                 }
+                6 => vec![Action::HeartbeatAck],
                 9 => vec![Action::Resumed],
                 11 => vec![Action::UsersJoined(
                     serde_json::from_value::<Joined>(d).ok()?.user_ids,
@@ -324,7 +333,7 @@ impl Session {
                         version: e.protocol_version,
                     })]
                 }
-                _ => vec![], // 3/6 heartbeat + ack, and anything unknown
+                _ => vec![], // anything unknown
             })
         };
         parsed(self).unwrap_or_else(|| {
@@ -392,7 +401,9 @@ impl Session {
         match code {
             Some(4014) => Action::Leave(LeaveReason::Kicked),
             Some(4016) => Action::Leave(LeaveReason::BadEncryption),
+            Some(4006) if self.invalid => Action::Leave(LeaveReason::SessionInvalid),
             Some(4006) => {
+                self.invalid = true;
                 self.ran = false;
                 self.seq = None;
                 Action::Reconnect { resume: false }
@@ -481,7 +492,8 @@ mod tests {
             ),
             (json!(3), json!(1234), json!(-1))
         );
-        s.on_text(&json!({"op":6,"seq":7,"d":{"t":1234}}).to_string());
+        let ack = s.on_text(&json!({"op":6,"seq":7,"d":{"t":1234}}).to_string());
+        assert!(matches!(ack[..], [Action::HeartbeatAck]), "the driver tracks ACKs");
         assert_eq!(js(&s.heartbeat(5))["d"]["seq_ack"], 7);
     }
 
@@ -637,6 +649,26 @@ mod tests {
         assert_eq!(v["d"]["session_id"], "sess");
         s.on_close(Some(4006));
         assert_eq!(js(&s.on_open()[0])["op"], 0);
+    }
+
+    #[test]
+    fn session_invalid_twice_leaves() {
+        let mut s = Session::new(conn(), 1);
+        ready(&mut s);
+        assert!(matches!(s.on_close(Some(4006)), Action::Reconnect { resume: false }));
+        s.on_open();
+        assert!(
+            matches!(s.on_close(Some(4006)), Action::Leave(LeaveReason::SessionInvalid)),
+            "the fresh Identify failed too: the app rejoins through the main gateway"
+        );
+        let mut s = Session::new(conn(), 1);
+        ready(&mut s);
+        s.on_close(Some(4006));
+        ready(&mut s);
+        assert!(
+            matches!(s.on_close(Some(4006)), Action::Reconnect { resume: false }),
+            "a Ready in between: a new first failure"
+        );
     }
 
     #[test]

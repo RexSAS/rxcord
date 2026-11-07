@@ -823,11 +823,11 @@ impl Runtime {
                 return self.push_voice();
             }
             ConnIn::Event(VoiceEvent::Left(r)) => {
-                let fx = self.voice.left(&r);
+                let fx = self.voice.left(&r, Instant::now());
                 return self.voice_effects(fx);
             }
             ConnIn::Closed => {
-                let fx = self.voice.left(&LeaveReason::Fatal(0));
+                let fx = self.voice.left(&LeaveReason::Fatal(0), Instant::now());
                 return self.voice_effects(fx);
             }
             ConnIn::Event(VoiceEvent::PrivacyCode(_)) => return,

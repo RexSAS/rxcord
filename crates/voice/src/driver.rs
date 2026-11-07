@@ -15,6 +15,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const GIVE_UP: Duration = Duration::from_secs(30);
 const PENDING_AGE: Duration = Duration::from_secs(1);
 const PENDING_MAX: usize = 50;
+/// This many unanswered heartbeats in a row: the link is dead.
+const MISSED_ACKS: u32 = 2;
 /// RTP timestamp step of one 20 ms frame at 48 kHz.
 const FRAME_TS: u32 = 960;
 
@@ -47,6 +49,9 @@ pub enum VoiceCmd {
     Opus(Vec<u8>),
     Speaking(bool),
     Leave,
+    /// A new voice server (VOICE_SERVER_UPDATE) or channel: start over there (fresh Identify, UDP and
+    /// DAVE group) on these same channels, so the app's audio keeps flowing.
+    Restart(Connect, u64),
 }
 
 /// Runs until `VoiceCmd::Leave`, either channel closing, a leave-worthy close/error (`Left`), or 30 s of
@@ -57,7 +62,7 @@ pub async fn run_voice(
     events: mpsc::Sender<VoiceEvent>,
     cmds: mpsc::Receiver<VoiceCmd>,
 ) {
-    run_voice_at(c, channel_id, events, cmds, None).await
+    run_voice_at(c, channel_id, events, cmds, true).await
 }
 
 fn voice_url(endpoint: &str) -> String {
@@ -72,14 +77,31 @@ fn heartbeat_period(d: Duration) -> Duration {
     d.max(Duration::from_secs(1))
 }
 
+/// `tls` false: plain `ws://{endpoint}` (tests' local fakes).
 async fn run_voice_at(
+    mut c: Connect,
+    mut channel_id: u64,
+    events: mpsc::Sender<VoiceEvent>,
+    mut cmds: mpsc::Receiver<VoiceCmd>,
+    tls: bool,
+) {
+    loop {
+        let url = if tls { voice_url(&c.endpoint) } else { format!("ws://{}", c.endpoint) };
+        match one_server(c, channel_id, events.clone(), &mut cmds, &url).await {
+            Outcome::Restart(next, ch) => (c, channel_id) = (next, ch),
+            _ => return,
+        }
+    }
+}
+
+/// One voice server, until it's left (`Done`) or the app moves us elsewhere (`Restart`).
+async fn one_server(
     c: Connect,
     channel_id: u64,
     events: mpsc::Sender<VoiceEvent>,
-    mut cmds: mpsc::Receiver<VoiceCmd>,
-    url: Option<String>,
-) {
-    let url = url.unwrap_or_else(|| voice_url(&c.endpoint));
+    cmds: &mut mpsc::Receiver<VoiceCmd>,
+    url: &str,
+) -> Outcome {
     let me = c.user_id;
     let mut v = Voice {
         session: Session::new(c, davey::DAVE_PROTOCOL_VERSION),
@@ -109,19 +131,19 @@ async fn run_voice_at(
             .send(VoiceEvent::Status(VoiceStatus::Connecting))
             .await;
         let ws = tokio::select! {
-            r = timeout_at(deadline.min(Instant::now() + Duration::from_secs(10)), connect_async(url.as_str())) => match r {
+            r = timeout_at(deadline.min(Instant::now() + Duration::from_secs(10)), connect_async(url)) => match r {
                 Ok(Ok((ws, _))) => Some(ws),
                 Ok(Err(e)) => { tracing::warn!("voice connect failed: {e}"); None }
                 Err(_) => { tracing::warn!("voice connect timed out"); None }
             },
-            _ = stopped(&mut cmds, &v.events) => return,
+            o = stopped(cmds, &v.events) => return o,
         };
         let outcome = match ws {
-            Some(ws) => v.connection(ws, &mut cmds, deadline).await,
+            Some(ws) => v.connection(ws, cmds, deadline).await,
             None => Outcome::Reconnect,
         };
-        if outcome == Outcome::Done {
-            return;
+        if !matches!(outcome, Outcome::Reconnect) {
+            return outcome;
         }
         if std::mem::take(&mut v.healthy) {
             attempt = 0;
@@ -131,7 +153,7 @@ async fn run_voice_at(
         if Instant::now() >= deadline {
             tracing::warn!("voice reconnect gave up");
             let _ = v.events.send(VoiceEvent::Left(LeaveReason::Fatal(0))).await;
-            return;
+            return Outcome::Done;
         }
         attempt += 1;
         let _ = v
@@ -141,16 +163,25 @@ async fn run_voice_at(
         tokio::select! {
             // the session picks Resume vs Identify on reopen, so the delay ignores the resume flag
             _ = sleep_until(deadline.min(Instant::now() + reconnect_delay(attempt - 1, true, rand::random(), rand::random()))) => {}
-            _ = stopped(&mut cmds, &v.events) => return,
+            o = stopped(cmds, &v.events) => return o,
         }
     }
 }
 
-/// Resolves when the app asks to leave or stops listening; other commands are dropped meanwhile.
-async fn stopped(cmds: &mut mpsc::Receiver<VoiceCmd>, events: &mpsc::Sender<VoiceEvent>) {
+/// Resolves when the app asks to leave or stops listening (`Done`), or moves us to another server
+/// (`Restart`); other commands are dropped meanwhile.
+async fn stopped(cmds: &mut mpsc::Receiver<VoiceCmd>, events: &mpsc::Sender<VoiceEvent>) -> Outcome {
     tokio::select! {
-        _ = events.closed() => {}
-        _ = async { while !matches!(cmds.recv().await, None | Some(VoiceCmd::Leave)) {} } => {}
+        _ = events.closed() => Outcome::Done,
+        o = async {
+            loop {
+                match cmds.recv().await {
+                    None | Some(VoiceCmd::Leave) => return Outcome::Done,
+                    Some(VoiceCmd::Restart(c, ch)) => return Outcome::Restart(c, ch),
+                    Some(_) => {}
+                }
+            }
+        } => o,
     }
 }
 
@@ -173,10 +204,10 @@ async fn discover(ip: &str, port: u16, ssrc: u32) -> Option<(UdpSocket, String, 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-#[derive(PartialEq)]
 enum Outcome {
     Reconnect,
     Done,
+    Restart(Connect, u64),
 }
 
 enum In {
@@ -232,7 +263,8 @@ impl Voice {
         let mut next_hb: Option<Instant> = None;
         let mut period = Duration::from_secs(40);
         let mut buf = vec![0u8; 2048];
-        // shortcut: heartbeat ACKs (op 6) aren't tracked; a dead link is only noticed by a socket error.
+        // heartbeats sent without an op 6 since; a link that silently died is noticed by this
+        let mut unacked = 0u32;
         loop {
             while let Some(a) = queue.pop_front() {
                 match a {
@@ -248,9 +280,9 @@ impl Voice {
                     Action::Discover { ip, port, ssrc } => {
                         let found = tokio::select! {
                             r = timeout_at(deadline, discover(&ip, port, ssrc)) => r.ok().flatten(),
-                            _ = stopped(cmds, &self.events) => {
+                            o = stopped(cmds, &self.events) => {
                                 let _ = ws.close(None).await;
-                                return Outcome::Done;
+                                return o;
                             }
                         };
                         let Some((udp, my_ip, my_port)) = found else {
@@ -276,6 +308,7 @@ impl Voice {
                         self.connected().await;
                     }
                     Action::Resumed => self.connected().await,
+                    Action::HeartbeatAck => unacked = 0,
                     Action::Speaking { user_id, ssrc, on } => {
                         self.ssrcs.insert(ssrc, user_id);
                         let _ = self
@@ -339,6 +372,10 @@ impl Voice {
                     let _ = ws.close(None).await;
                     return Outcome::Done;
                 }
+                In::Cmd(VoiceCmd::Restart(c, ch)) => {
+                    let _ = ws.close(None).await;
+                    return Outcome::Restart(c, ch);
+                }
                 In::Cmd(VoiceCmd::Opus(f)) => {
                     if self.transport.is_none() {
                         continue; // not connected yet: drop
@@ -357,6 +394,12 @@ impl Voice {
                     queue.push_back(self.session.speaking(on));
                 }
                 In::Beat => {
+                    if unacked >= MISSED_ACKS {
+                        tracing::warn!("voice heartbeats not acknowledged: reconnecting");
+                        let _ = ws.close(None).await;
+                        return Outcome::Reconnect; // the session resumes if it got that far
+                    }
+                    unacked += 1;
                     next_hb = Some(Instant::now() + period);
                     let ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -512,13 +555,14 @@ mod tests {
     const KEY: [u8; 32] = [7; 32];
     const T: Duration = Duration::from_secs(5);
 
-    fn conn() -> Connect {
+    /// `endpoint`: host:port of a local fake (plain ws in tests).
+    fn conn(endpoint: &str) -> Connect {
         Connect {
             server_id: 1,
             user_id: 2,
             session_id: "sess".into(),
             token: "tok".into(),
-            endpoint: "unused".into(),
+            endpoint: endpoint.into(),
         }
     }
 
@@ -535,10 +579,10 @@ mod tests {
     /// Starts the driver against a local fake and accepts its socket (handshake not done yet).
     async fn start() -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap().to_string();
         let (etx, events) = mpsc::channel(64);
         let (cmds, crx) = mpsc::channel(64);
-        let task = tokio::spawn(run_voice_at(conn(), 3, etx, crx, Some(url)));
+        let task = tokio::spawn(run_voice_at(conn(&addr), 3, etx, crx, false));
         let ws = accept(&listener).await;
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = udp.local_addr().unwrap(); // replaced by discovery
@@ -829,13 +873,7 @@ mod tests {
     async fn leave_during_reconnect_backoff() {
         let (etx, mut events) = mpsc::channel(64);
         let (cmds, crx) = mpsc::channel(8);
-        let task = tokio::spawn(run_voice_at(
-            conn(),
-            3,
-            etx,
-            crx,
-            Some("ws://127.0.0.1:1".into()),
-        ));
+        let task = tokio::spawn(run_voice_at(conn("127.0.0.1:1"), 3, etx, crx, false));
         wait_event(&mut events, |e| {
             matches!(e, VoiceEvent::Status(VoiceStatus::Reconnecting { .. }))
         })
@@ -852,13 +890,7 @@ mod tests {
         let (etx, mut events) = mpsc::channel(64);
         let (_cmds, crx) = mpsc::channel(8);
         let t0 = Instant::now();
-        let task = tokio::spawn(run_voice_at(
-            conn(),
-            3,
-            etx,
-            crx,
-            Some("ws://127.0.0.1:1".into()),
-        ));
+        let task = tokio::spawn(run_voice_at(conn("127.0.0.1:1"), 3, etx, crx, false));
         let ev = timeout(Duration::from_secs(300), async {
             loop {
                 if let ev @ VoiceEvent::Left(_) = events.recv().await.unwrap() {
@@ -883,11 +915,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gives_up_when_handshake_stalls() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap().to_string();
         let (etx, mut events) = mpsc::channel(64);
         let (_cmds, crx) = mpsc::channel(8);
         let t0 = Instant::now();
-        let task = tokio::spawn(run_voice_at(conn(), 3, etx, crx, Some(url)));
+        let task = tokio::spawn(run_voice_at(conn(&addr), 3, etx, crx, false));
         // accepts and reads Identify, then never answers (sockets kept open)
         let (idents_tx, mut idents) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -956,6 +988,76 @@ mod tests {
                 .decrypt(&buf[..n])
                 .is_some()
         );
+    }
+
+    /// Heartbeats (op 3) the fake receives on `ws`, ACKing only the first; returns the count before the
+    /// driver drops the socket.
+    async fn beats_until_dropped(ws: &mut WebSocketStream<TcpStream>) -> usize {
+        let mut beats = 0;
+        loop {
+            match timeout(T, ws.next()).await.expect("driver must give up on the link") {
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["op"] == 3 {
+                        beats += 1;
+                        if beats == 1 {
+                            send_json(ws, json!({"op": 6, "d": {"t": v["d"]["t"]}})).await;
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return beats,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missed_heartbeat_acks_reconnect() {
+        let mut f = start().await;
+        let id = recv_json(&mut f.ws).await;
+        assert_eq!(id["op"], 0);
+        send_json(&mut f.ws, json!({"op": 8, "d": {"heartbeat_interval": 1000.0}})).await;
+        // one ACKed beat, then two unanswered ones: the link counts as dead at the next beat
+        assert_eq!(beats_until_dropped(&mut f.ws).await, 3);
+        let ws = accept(&f.listener).await;
+        drop(ws); // reconnected: a new socket was opened
+    }
+
+    #[tokio::test]
+    async fn voice_server_change_reconnects() {
+        let mut f = start().await;
+        handshake(&mut f).await;
+        // VOICE_SERVER_UPDATE with a new endpoint: the same driver (and its channels) moves over
+        let next = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut c = conn(&next.local_addr().unwrap().to_string());
+        c.token = "tok2".into();
+        f.cmds.send(VoiceCmd::Restart(c, 4)).await.unwrap();
+        assert!(
+            matches!(timeout(T, f.ws.next()).await.unwrap(), Some(Ok(Message::Close(_))) | Some(Err(_)) | None),
+            "old server's socket closed"
+        );
+        f.listener = next;
+        f.ws = accept(&f.listener).await;
+        f.udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let id = recv_json(&mut f.ws).await;
+        assert_eq!((id["op"].clone(), id["d"]["token"].clone()), (json!(0), json!("tok2")), "fresh Identify with the new token");
+        send_json(&mut f.ws, json!({"op": 8, "d": {"heartbeat_interval": 30000.0}})).await;
+        let port = f.udp.local_addr().unwrap().port();
+        send_json(&mut f.ws, json!({"op": 2, "d": {"ssrc": 5, "ip": "127.0.0.1", "port": port, "modes": ["aead_aes256_gcm_rtpsize"]}})).await;
+        let mut buf = [0u8; 128];
+        let (_, from) = timeout(T, f.udp.recv_from(&mut buf)).await.unwrap().unwrap();
+        let mut resp = [0u8; 74];
+        resp[..4].copy_from_slice(&[0, 2, 0, 70]);
+        resp[8..17].copy_from_slice(b"127.0.0.1");
+        resp[72..].copy_from_slice(&from.port().to_be_bytes());
+        f.udp.send_to(&resp, from).await.unwrap();
+        assert_eq!(recv_json(&mut f.ws).await["op"], 1);
+        send_json(&mut f.ws, json!({"op": 4, "d": {"mode": "aead_aes256_gcm_rtpsize", "secret_key": KEY, "dave_protocol_version": 0}})).await;
+        wait_event(&mut f.events, |e| matches!(e, VoiceEvent::Status(VoiceStatus::Connected))).await;
+        f.cmds.send(VoiceCmd::Opus(vec![1])).await.unwrap();
+        let n = timeout(T, f.udp.recv(&mut buf)).await.unwrap().unwrap();
+        let (h, _) = Transport::new(Mode::Aes256Gcm, KEY, 0).decrypt(&buf[..n]).expect("media to the new server");
+        assert_eq!(h.ssrc, 5);
     }
 
     #[test]
