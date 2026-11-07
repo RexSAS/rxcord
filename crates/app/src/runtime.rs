@@ -12,7 +12,7 @@ use rxcord_api::rest::{InviteContext, JoinedGuild};
 use rxcord_api::{ApiError, Rest};
 use rxcord_store::{Change, Pending, Store};
 use rxcord_voice::driver::{VoiceEvent, VoiceStatus};
-use rxcord_voice::audio::tone::RingOut;
+use rxcord_voice::audio::tone::Ringer;
 use rxcord_voice::session::LeaveReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -156,7 +156,7 @@ struct Runtime {
     /// The incoming call we're prompting for.
     calls: Incoming,
     /// The ring's own output, while ringing outside voice (in voice it's mixed into the call).
-    tone: Option<RingOut>,
+    tone: Option<Ringer>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -453,7 +453,11 @@ impl Runtime {
             Command::StartCall(ch) => {
                 let dm = self.store.channel(ch).is_some_and(|c| matches!(c.kind, 1 | 3));
                 if dm && self.gw_cmds.is_some() {
-                    let fx = self.voice.call(ch, Instant::now());
+                    let answering = self.calls.channel() == Some(ch);
+                    let fx = crate::voice::start_call(&mut self.voice, &mut self.calls, ch, Instant::now());
+                    if answering {
+                        self.push_call(); // the ring stops before the call's audio starts
+                    }
                     self.voice_effects(fx);
                 }
             }
@@ -743,8 +747,8 @@ impl Runtime {
         if !on {
             self.tone = None;
         } else if self.tone.is_none() {
-            // shortcut: opens the device on the runtime thread (a few ms, rarely more); move to spawn_blocking if it stalls
-            self.tone = RingOut::start(self.nav.settings.output_device.clone()).map_err(|e| tracing::warn!("ring output: {e}")).ok();
+            // opened and closed on its own thread; a failed open is logged and not retried while this call rings
+            self.tone = Some(Ringer::start(self.nav.settings.output_device.clone()));
         }
     }
 
@@ -763,7 +767,7 @@ impl Runtime {
                 }
                 Effect::Connect { connect, channel } => {
                     self.conn = None;
-                    self.tone = None; // its device closes before the call's opens
+                    self.tone = None; // the ring moves into the call's output
                     let mut cfg = AudioCfg::new(&self.nav.settings, self.voice.deafened());
                     cfg.ringing = self.calls.channel().is_some();
                     let k = Conn::start(connect, channel, cfg);

@@ -165,8 +165,9 @@ impl Controller {
                 }
             }
             // Disconnected by a moderator or another client of ours. While still joining it may be the
-            // echo of leaving the previous channel, so only a live connection counts.
-            Event::VoiceStateUpdate(v) if v.user_id == me && v.channel_id.is_none() && t.connected => {
+            // echo of leaving the previous channel, so only a live connection counts, and only for our
+            // guild (or call): leaving a server's voice for a DM call removes the server's state late.
+            Event::VoiceStateUpdate(v) if v.user_id == me && v.channel_id.is_none() && v.guild_id == t.guild && t.connected => {
                 self.target = None;
                 return vec![Effect::Disconnect, Effect::Notice("Disconnected from voice")];
             }
@@ -257,6 +258,15 @@ impl Incoming {
         self.answered.insert(c);
         Some(c)
     }
+}
+
+/// A DM tab's 📞: answers the call ringing us in `ch` (no re-ring), else starts one and rings the others.
+pub fn start_call(voice: &mut Controller, calls: &mut Incoming, ch: Id, now: Instant) -> Vec<Effect> {
+    if calls.channel() == Some(ch) {
+        calls.end();
+        return voice.join(None, ch, now);
+    }
+    voice.call(ch, now)
 }
 
 /// What the voice bar shows; text "" when not in voice.
@@ -777,6 +787,34 @@ mod tests {
         assert!(names(c.event(&server(Some("g")), ME)).is_empty(), "a guild's server update isn't ours");
         let dm_server = ev("VOICE_SERVER_UPDATE", json!({"token": "tok", "guild_id": null, "channel_id": "7", "endpoint": "d"}));
         assert_eq!(names(c.event(&dm_server, ME)), ["connect 7 7 1 sess tok d"], "server id = the DM channel");
+    }
+
+    #[test]
+    fn late_guild_leave_keeps_the_call() {
+        let (mut c, now) = (Controller::default(), Instant::now());
+        connected_to(&mut c, A, now);
+        c.join(None, DM, now);
+        let mine = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": "7", "session_id": "sess"}));
+        c.event(&mine, ME);
+        let dm_server = ev("VOICE_SERVER_UPDATE", json!({"token": "tok", "guild_id": null, "channel_id": "7", "endpoint": "d"}));
+        assert_eq!(names(c.event(&dm_server, ME)), ["connect 7 7 1 sess tok d"]);
+        assert!(names(c.event(&state(ME, None), ME)).is_empty(), "the server's removal of our old state, after the call connected");
+        assert_eq!((c.channel(), c.connected()), (Some((None, DM)), true));
+        let left_dm = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": null, "session_id": "sess"}));
+        assert_eq!(names(c.event(&left_dm, ME)), ["disconnect", "notice Disconnected from voice"], "dropped from the call itself");
+    }
+
+    #[test]
+    fn call_button_on_a_ringing_dm_answers() {
+        let (mut c, mut inc, now) = (Controller::default(), Incoming::default(), Instant::now());
+        inc.sync(&[DM], now);
+        assert_eq!(names(start_call(&mut c, &mut inc, DM, now)), ["op4 null 7"]);
+        assert_eq!(inc.channel(), None, "prompt and ring gone");
+        let mine = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": "7", "session_id": "sess"}));
+        assert!(names(c.event(&mine, ME)).is_empty(), "answered: nobody re-rung");
+        let (mut c, mut inc) = (Controller::default(), Incoming::default());
+        assert_eq!(names(start_call(&mut c, &mut inc, DM, now)), ["op4 null 7"]);
+        assert_eq!(names(c.event(&mine, ME)), ["ring 7"], "not ringing us: a new call rings the others");
     }
 
     #[test]
