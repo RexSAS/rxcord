@@ -1,0 +1,8 @@
+{"id":"400000000000000020","channel_id":"300000000000000001","guild_id":"200000000000000001",
+"author":{"id":"100000000000000002","username":"friend","global_name":"Friend","avatar":"av"},
+"content":"hello <@100000000000000001>","timestamp":"2026-11-07T10:00:00.000000+00:00","edited_timestamp":null,
+"attachments":[{"id":"500000000000000001","filename":"pic.png","url":"https://cdn.discordapp.com/attachments/1/2/pic.png","proxy_url":"https://media.discordapp.net/attachments/1/2/pic.png","width":640,"height":480,"content_type":"image/png","size":12345}],
+"mentions":[{"id":"100000000000000001","username":"rex"}],"mention_everyone":false,"type":19,
+"message_reference":{"message_id":"400000000000000019","channel_id":"300000000000000001"},
+"referenced_message":{"id":"400000000000000019","channel_id":"300000000000000001","author":{"id":"100000000000000001","username":"rex"},"content":"original","timestamp":"2026-11-07T09:59:00.000000+00:00"},
+"nonce":"1234567890123456789"}

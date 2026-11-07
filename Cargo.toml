@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+tracing = "0.1"
