@@ -2,6 +2,7 @@
 use crate::images::{THUMB_MAX, fit, thumb_url};
 use crate::markdown::{Block, Mention, parse};
 use crate::nav::DMS_NODE;
+use crate::settings::Settings;
 use chrono::{DateTime, FixedOffset, Local};
 use rxcord_api::id::Id;
 use rxcord_api::model::{Attachment, Channel, Message, User, VoiceState};
@@ -138,10 +139,13 @@ pub struct VoiceMember {
     pub speaking: bool,
     pub muted: bool,
     pub deafened: bool,
+    /// Our volume for them, 0.0..=2.0, and "mute for me".
+    pub volume: f32,
+    pub muted_for_me: bool,
 }
 
 /// Server nick, else display name; GUILD_CREATE states carry no member, so the store's user if known.
-fn voice_member(s: &Store, v: &VoiceState, speaking: &HashSet<Id>) -> VoiceMember {
+fn voice_member(s: &Store, v: &VoiceState, speaking: &HashSet<Id>, prefs: &Settings) -> VoiceMember {
     let m = v.member.as_ref();
     let name = m
         .and_then(|m| m.nick.clone())
@@ -153,12 +157,14 @@ fn voice_member(s: &Store, v: &VoiceState, speaking: &HashSet<Id>) -> VoiceMembe
         speaking: speaking.contains(&v.user_id),
         muted: v.self_mute || v.mute,
         deafened: v.self_deaf || v.deaf,
+        volume: prefs.volume(&v.user_id.to_string()),
+        muted_for_me: prefs.user_muted.contains(&v.user_id.to_string()),
     }
 }
 
 /// DMs first, then guilds in READY order; expanded nodes list their channels in Discord order, voice
-/// channels followed by who's in them. `speaking`: users highlighted as talking.
-pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>, speaking: &HashSet<Id>) -> Vec<TreeRow> {
+/// channels followed by who's in them. `speaking`: users highlighted as talking; `prefs`: our volumes for them.
+pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>, speaking: &HashSet<Id>, prefs: &Settings) -> Vec<TreeRow> {
     let node = |id: Id, name: String, unread: bool, mentions: u32, children: Vec<ChannelRow>| {
         let open = expanded.contains(&id);
         let row = ChannelRow { id, name, kind: 0, unread, mentions, enabled: true };
@@ -171,7 +177,7 @@ pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>, spe
                 let members = if matches!(c.kind, 2 | 13) { s.voice_members(c.id) } else { vec![] };
                 out.push(TreeRow { node: false, depth, expanded: false, row: c, member: None });
                 out.extend(members.into_iter().map(|v| {
-                    let m = voice_member(s, v, speaking);
+                    let m = voice_member(s, v, speaking, prefs);
                     let row = ChannelRow { id: m.user_id, name: m.name.clone(), kind: 0, unread: false, mentions: 0, enabled: false };
                     TreeRow { node: false, depth: depth + 1, expanded: false, row, member: Some(m) }
                 }));
@@ -412,17 +418,21 @@ mod tests {
             "member": {"nick": "Nick", "user": {"id": "1", "username": "me"}}});
         s.apply(&Event::VoiceStateUpdate(serde_json::from_value(vsu).unwrap()));
         let open: HashSet<Id> = [Id(10)].into();
-        let rows = tree_rows(&s, &open, &HashSet::new(), &[Id(9)].into());
+        let mut prefs = Settings::default();
+        prefs.set_volume("2".into(), 1.5);
+        prefs.user_muted.insert("2".into());
+        let rows = tree_rows(&s, &open, &HashSet::new(), &[Id(9)].into(), &prefs);
         let shape: Vec<_> = rows.iter().map(|r| (r.row.name.as_str(), r.depth, r.member.is_some())).collect();
         assert_eq!(shape, [
             ("Direct Messages", 0, false), ("G", 0, false), ("empty", 1, false), ("Cat", 1, false), ("text", 2, false),
             ("voice", 2, false), ("Nick", 3, true), ("Bob", 3, true), ("Unknown user", 3, true)]);
         let m = |i: usize| rows[i].member.clone().unwrap();
-        assert_eq!(m(6), VoiceMember { user_id: Id(1), name: "Nick".into(), speaking: false, muted: false, deafened: false });
+        assert_eq!(m(6), VoiceMember { user_id: Id(1), name: "Nick".into(), speaking: false, muted: false, deafened: false, volume: 1.0, muted_for_me: false });
+        assert_eq!((m(7).volume, m(7).muted_for_me), (1.5, true), "our volume for user 2");
         assert_eq!((m(7).muted, m(7).deafened, m(7).speaking), (true, false, false));
         assert_eq!((m(8).muted, m(8).deafened, m(8).speaking), (false, true, true));
         assert!(rows[5].row.enabled, "voice channels can be joined");
-        let collapsed = tree_rows(&s, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let collapsed = tree_rows(&s, &HashSet::new(), &HashSet::new(), &HashSet::new(), &Settings::default());
         assert!(collapsed.iter().all(|r| r.member.is_none()));
     }
 
@@ -453,19 +463,19 @@ mod tests {
         s.apply(&Event::Ready(Box::new(serde_json::from_value(ready).unwrap())));
         let none = HashSet::new();
         let shape = |rows: &[TreeRow]| rows.iter().map(|r| (r.row.name.clone(), r.depth, r.node)).collect::<Vec<_>>();
-        let rows = tree_rows(&s, &none, &none, &none);
+        let rows = tree_rows(&s, &none, &none, &none, &Settings::default());
         assert_eq!(shape(&rows), [("Direct Messages".into(), 0, true), ("G".into(), 0, true), ("H".into(), 0, true)]);
         assert!(rows[1].row.unread && rows[1].row.mentions == 2 && !rows[1].expanded, "collapsed guild totals");
         assert!(!rows[2].row.unread);
         let open: HashSet<Id> = [DMS_NODE, Id(10)].into();
-        let rows = tree_rows(&s, &open, &none, &none);
+        let rows = tree_rows(&s, &open, &none, &none, &Settings::default());
         assert_eq!(shape(&rows), [
             ("Direct Messages".into(), 0, true), ("bob".into(), 1, false),
             ("G".into(), 0, true), ("a".into(), 1, false), ("Cat".into(), 1, false), ("b".into(), 2, false),
             ("H".into(), 0, true)]);
         assert!(rows[2].expanded && rows[5].row.unread);
         let forbidden: HashSet<Id> = [Id(101)].into();
-        assert!(!tree_rows(&s, &none, &forbidden, &none)[1].row.unread, "403 channels don't light the node");
+        assert!(!tree_rows(&s, &none, &forbidden, &none, &Settings::default())[1].row.unread, "403 channels don't light the node");
         let tabs = tab_rows(&s, &[Id(200), Id(999), Id(100)]);
         assert_eq!(tabs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["bob", "a"]);
     }

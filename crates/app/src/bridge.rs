@@ -1,13 +1,15 @@
 //! How data reaches the UI: view rows -> Slint structs/models, pushed via `invoke_from_event_loop`.
 use crate::markdown::{Block, Span};
 use crate::nav::Nav;
+use crate::settings::Settings;
+use crate::voice::Bar;
 use crate::images::ThumbUpdate;
 use crate::view::{self, ChannelRow, MessageRow, Thumb, TreeRow};
 use crate::{AppWindow, FileItem, MessageItem, TabItem, ThumbItem, TreeItem};
 use rxcord_api::id::Id;
 use rxcord_api::remote_auth::QrStatus;
 use rxcord_store::Store;
-use slint::{ComponentHandle, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, StyledText, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, VecModel, Weak};
 
 pub fn with_ui(ui: &Weak<AppWindow>, f: impl FnOnce(AppWindow) + Send + 'static) {
     let ui = ui.clone();
@@ -122,7 +124,7 @@ pub fn row_note(ui: &Weak<AppWindow>, id: Id, msg: String, ok: bool, open: Optio
 
 /// Tree and tabs. Rows that didn't change aren't touched, so a busy server doesn't redraw the tree.
 pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
-    let rows = view::tree_rows(s, &nav.expanded, &nav.forbidden, &nav.speaking);
+    let rows = view::tree_rows(s, &nav.expanded, &nav.forbidden, &nav.speaking, &nav.settings);
     let tabs: Vec<TabItem> = view::tab_rows(s, nav.tabs.ids()).into_iter().map(tab_item).collect();
     let edits: Option<Vec<(usize, TreeRow)>> = (rows.len() == nav.tree.len())
         .then(|| rows.iter().enumerate().filter(|(i, r)| nav.tree[*i] != **r).map(|(i, r)| (i, r.clone())).collect());
@@ -141,9 +143,38 @@ pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
     });
 }
 
-/// The voice bar ("" hides it).
-pub fn voice_bar(ui: &Weak<AppWindow>, text: String) {
-    with_ui(ui, move |ui| ui.set_voice(text.into()));
+/// The voice bar (text "" hides it).
+pub fn voice_bar(ui: &Weak<AppWindow>, bar: Bar) {
+    with_ui(ui, move |ui| {
+        ui.set_voice(bar.text.into());
+        ui.set_voice_muted(bar.muted);
+        ui.set_voice_deafened(bar.deafened);
+        ui.set_voice_level(bar.level);
+    });
+}
+
+/// Fill the voice settings popup and show it. "System default" is entry 0; a saved device that isn't
+/// plugged in is still listed so the choice shows.
+pub fn voice_settings(ui: &Weak<AppWindow>, s: &Settings, inputs: Vec<String>, outputs: Vec<String>) {
+    let list = |mut devs: Vec<String>, saved: &Option<String>| {
+        if let Some(d) = saved.as_ref().filter(|d| !devs.contains(d)) {
+            devs.push(d.clone());
+        }
+        let at = saved.as_ref().and_then(|d| devs.iter().position(|x| x == d)).map_or(0, |i| i as i32 + 1);
+        let names: Vec<SharedString> = std::iter::once("System default".to_string()).chain(devs).map(Into::into).collect();
+        (names, at)
+    };
+    let ((ins, i), (outs, o)) = (list(inputs, &s.input_device), list(outputs, &s.output_device));
+    let (threshold, noise) = (s.vad_threshold, s.noise_suppression);
+    with_ui(ui, move |ui| {
+        ui.set_vs_inputs(model(ins));
+        ui.set_vs_input(i);
+        ui.set_vs_outputs(model(outs));
+        ui.set_vs_output(o);
+        ui.set_vs_threshold(threshold);
+        ui.set_vs_noise(noise);
+        ui.invoke_show_voice_settings();
+    });
 }
 
 /// A status bar notice for a few seconds (a newer one isn't cut short by an older timer).
@@ -168,6 +199,8 @@ fn tree_item(r: TreeRow) -> TreeItem {
         speaking: m.is_some_and(|m| m.speaking),
         muted: m.is_some_and(|m| m.muted),
         deafened: m.is_some_and(|m| m.deafened),
+        volume: m.map_or(1.0, |m| m.volume),
+        muted_for_me: m.is_some_and(|m| m.muted_for_me),
         id: r.row.id.to_string().into(),
         name: if r.row.kind == 4 && !r.node { r.row.name.to_uppercase() } else { r.row.name }.into(),
         node: r.node,

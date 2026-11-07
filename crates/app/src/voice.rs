@@ -6,8 +6,10 @@ use rxcord_api::gateway::GatewayCmd;
 use rxcord_api::id::Id;
 use rxcord_voice::audio::capture::{Capture, CaptureOut, SILENCE, SILENCE_FRAMES};
 use rxcord_voice::audio::playback::Playback;
+use crate::settings::Settings;
 use rxcord_voice::driver::{VoiceCmd, VoiceEvent, VoiceStatus, run_voice};
 use rxcord_voice::session::{Connect, LeaveReason};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -19,8 +21,8 @@ pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a lost or missing device is tried again.
 const REOPEN_EVERY: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(10);
-/// Until settings exist (Task 10).
-const NOISE_SUPPRESSION: bool = true;
+/// The level dot changes at most this often.
+const LEVEL_EVERY: Duration = Duration::from_millis(100);
 
 /// What the runtime must do after a controller call, in order.
 #[derive(Debug)]
@@ -50,13 +52,50 @@ struct Target {
 #[derive(Default)]
 pub struct Controller {
     target: Option<Target>,
-}
-
-fn op4(guild: Id, channel: Option<Id>) -> Effect {
-    Effect::Gateway(GatewayCmd::VoiceState { guild_id: Some(guild), channel_id: channel, self_mute: false, self_deaf: false })
+    /// Self mute/deafen (kept across joins); deafened implies muted.
+    mute: bool,
+    deaf: bool,
+    /// The mute from before deafening, restored on undeafen.
+    mute_before_deaf: bool,
 }
 
 impl Controller {
+    fn op4(&self, guild: Id, channel: Option<Id>) -> Effect {
+        Effect::Gateway(GatewayCmd::VoiceState { guild_id: Some(guild), channel_id: channel, self_mute: self.mute, self_deaf: self.deaf })
+    }
+
+    pub fn muted(&self) -> bool {
+        self.mute
+    }
+
+    pub fn deafened(&self) -> bool {
+        self.deaf
+    }
+
+    /// The 🎤 button. Unmuting while deafened undeafens too.
+    pub fn toggle_mute(&mut self) -> Vec<Effect> {
+        self.mute = !self.mute;
+        self.deaf &= self.mute;
+        self.resend()
+    }
+
+    /// The 🎧 button: deafen mutes; undeafen restores the mute from before.
+    pub fn toggle_deafen(&mut self) -> Vec<Effect> {
+        if self.deaf {
+            self.mute = self.mute_before_deaf;
+        } else {
+            self.mute_before_deaf = self.mute;
+            self.mute = true;
+        }
+        self.deaf = !self.deaf;
+        self.resend()
+    }
+
+    /// Op 4 with the new flags, same channel; nothing when not in voice.
+    fn resend(&self) -> Vec<Effect> {
+        self.target.iter().map(|t| self.op4(t.guild, Some(t.channel))).collect()
+    }
+
     /// (guild, channel) we're in or joining.
     pub fn channel(&self) -> Option<(Id, Id)> {
         self.target.as_ref().map(|t| (t.guild, t.channel))
@@ -81,7 +120,7 @@ impl Controller {
             fx.push(Effect::Disconnect);
         }
         self.target = Some(Target { guild, channel, session: None, server: None, connected: false, deadline: now + JOIN_TIMEOUT });
-        fx.push(op4(guild, Some(channel)));
+        fx.push(self.op4(guild, Some(channel)));
         fx
     }
 
@@ -92,7 +131,7 @@ impl Controller {
         if t.connected {
             fx.push(Effect::Disconnect);
         }
-        fx.push(op4(t.guild, None));
+        fx.push(self.op4(t.guild, None));
         fx
     }
 
@@ -157,6 +196,24 @@ impl Controller {
     }
 }
 
+/// What the voice bar shows; text "" when not in voice.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Bar {
+    pub text: String,
+    pub muted: bool,
+    pub deafened: bool,
+    /// The level dot: the mic hears speech and we're not muted.
+    pub level: bool,
+}
+
+/// `new` when it differs from what's shown (which then becomes `new`); `None` spares the UI a wakeup.
+pub fn changed<T: PartialEq + Clone>(shown: &mut T, new: T) -> Option<T> {
+    (*shown != new).then(|| {
+        shown.clone_from(&new);
+        new
+    })
+}
+
 /// From the audio thread to the runtime.
 #[derive(Debug, PartialEq)]
 pub enum AudioNote {
@@ -168,6 +225,45 @@ pub enum AudioNote {
     Level(bool),
     /// Users heard recently and whether they're talking now (only sent when it changes).
     Levels(Vec<(u64, bool)>),
+}
+
+/// From the runtime to the audio thread.
+#[derive(Debug)]
+pub enum ToAudio {
+    /// A received Opus frame: (user, seq, packet).
+    Media(u64, u16, Vec<u8>),
+    Gain(u64, f32),
+    Deafen(bool),
+    Threshold(f32),
+    /// Reopen the mic: (device, noise suppression).
+    Input(Option<String>, bool),
+    /// Reopen the speaker.
+    Output(Option<String>),
+}
+
+/// What the audio thread opens devices with and applies to them (again after a reopen).
+#[derive(Debug, Clone, Default)]
+pub struct AudioCfg {
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub noise_suppression: bool,
+    pub threshold: f32,
+    pub deafened: bool,
+    pub gains: HashMap<u64, f32>,
+}
+
+impl AudioCfg {
+    pub fn new(s: &Settings, deafened: bool) -> AudioCfg {
+        let users = s.user_volume.keys().chain(&s.user_muted);
+        AudioCfg {
+            input: s.input_device.clone(),
+            output: s.output_device.clone(),
+            noise_suppression: s.noise_suppression,
+            threshold: s.vad_threshold,
+            deafened,
+            gains: users.filter_map(|u| Some((u.parse().ok()?, s.gain(u)))).collect(),
+        }
+    }
 }
 
 pub enum ConnIn {
@@ -182,7 +278,7 @@ pub enum ConnIn {
 pub struct Conn {
     cmds: mpsc::Sender<VoiceCmd>,
     events: mpsc::Receiver<VoiceEvent>,
-    media: Option<std_mpsc::Sender<(u64, u16, Vec<u8>)>>,
+    media: Option<std_mpsc::Sender<ToAudio>>,
     notes: mpsc::UnboundedReceiver<AudioNote>,
     /// Read by the audio thread every tick.
     muted: Arc<AtomicBool>,
@@ -191,14 +287,17 @@ pub struct Conn {
     pub speaker: bool,
     /// A microphone is open.
     pub mic: bool,
-    /// The mic hears speech (the voice bar's level dot, Task 10).
-    #[allow(dead_code)]
+    /// The mic hears speech (the voice bar's level dot).
     pub level: bool,
+    /// Op 5: who said they're speaking.
+    pub op5: HashSet<u64>,
+    /// The decoded audio: users heard recently and whether they're talking now.
+    pub heard: Vec<(u64, bool)>,
 }
 
 impl Conn {
     /// Spawns the driver on the current tokio runtime and the audio thread.
-    pub fn start(connect: Connect, channel: Id) -> Conn {
+    pub fn start(connect: Connect, channel: Id, cfg: AudioCfg) -> Conn {
         let (ev_tx, events) = mpsc::channel(256);
         let (cmds, cmd_rx) = mpsc::channel(64);
         tokio::spawn(run_voice(connect, channel.0, ev_tx, cmd_rx));
@@ -208,15 +307,44 @@ impl Conn {
         let thread = Audio { cmds: cmds.clone(), notes: note_tx, muted: muted.clone(), reopen: REOPEN_EVERY };
         let spawned = std::thread::Builder::new().name("rxcord-voice-audio".into()).spawn(move || {
             thread.run(
-                || Playback::start(None).map_err(|e| tracing::warn!("audio output: {e}")).ok(),
-                || Capture::start(None, NOISE_SUPPRESSION).map_err(|e| tracing::warn!("audio input: {e}")).ok(),
+                cfg,
+                |c: &AudioCfg| Playback::start(c.output.clone()).map_err(|e| tracing::warn!("audio output: {e}")).ok(),
+                |c: &AudioCfg| Capture::start(c.input.clone(), c.noise_suppression).map_err(|e| tracing::warn!("audio input: {e}")).ok(),
                 media_rx,
             )
         });
-        if let Err(e) = spawned {
+        if let Err(e) = &spawned {
             tracing::warn!("audio thread: {e}");
         }
-        Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connecting, speaker: true, mic: true, level: false }
+        Conn::new(cmds, events, media, notes, muted, spawned.is_ok())
+    }
+
+    /// `audio`: the audio thread runs (otherwise there's no mic and no speaker, for good).
+    fn new(cmds: mpsc::Sender<VoiceCmd>, events: mpsc::Receiver<VoiceEvent>, media: std_mpsc::Sender<ToAudio>, notes: mpsc::UnboundedReceiver<AudioNote>, muted: Arc<AtomicBool>, audio: bool) -> Conn {
+        let (op5, heard) = (HashSet::new(), vec![]);
+        Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connecting, speaker: audio, mic: audio, level: false, op5, heard }
+    }
+
+    /// Who's talking: the decoded audio for people we hear, op 5 only for those we haven't heard yet.
+    pub fn speaking(&self) -> HashSet<Id> {
+        let heard = |u: &u64| self.heard.iter().any(|h| h.0 == *u);
+        let talking = self.heard.iter().filter(|h| h.1).map(|h| h.0);
+        talking.chain(self.op5.iter().copied().filter(|u| !heard(u))).map(Id).collect()
+    }
+
+    /// What's wrong, for the voice bar: all of it, in this order.
+    pub fn problems(&self) -> Vec<&'static str> {
+        let mut p = vec![];
+        if self.status != VoiceStatus::Connected {
+            p.push("Connecting…");
+        }
+        if !self.mic {
+            p.push("No microphone");
+        }
+        if !self.speaker {
+            p.push("No speaker");
+        }
+        p
     }
 
     pub async fn next(&mut self) -> ConnIn {
@@ -226,15 +354,14 @@ impl Conn {
         }
     }
 
-    /// A received Opus frame, for the audio thread (never blocks).
-    pub fn media(&self, user_id: u64, seq: u16, opus: Vec<u8>) {
-        if let Some(m) = &self.media {
-            let _ = m.send((user_id, seq, opus));
+    /// For the audio thread (never blocks).
+    pub fn audio(&self, m: ToAudio) {
+        if let Some(tx) = &self.media {
+            let _ = tx.send(m);
         }
     }
 
     /// Muted: nothing is sent (the mic stays open so unmuting is instant).
-    #[allow(dead_code)] // the mute button: Task 10
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
     }
@@ -260,6 +387,8 @@ trait Output {
     fn tick(&mut self);
     fn failed(&self) -> bool;
     fn levels(&self) -> Vec<(u64, bool)>;
+    fn set_gain(&mut self, user_id: u64, gain: f32);
+    fn set_deafened(&mut self, deafened: bool);
 }
 
 impl Output for Playback {
@@ -275,6 +404,12 @@ impl Output for Playback {
     fn levels(&self) -> Vec<(u64, bool)> {
         Playback::levels(self)
     }
+    fn set_gain(&mut self, user_id: u64, gain: f32) {
+        Playback::set_gain(self, user_id, gain)
+    }
+    fn set_deafened(&mut self, deafened: bool) {
+        Playback::set_deafened(self, deafened)
+    }
 }
 
 /// What the audio thread records from: `Capture`, or a fake in tests.
@@ -282,6 +417,7 @@ trait Input {
     fn tick(&mut self) -> Vec<CaptureOut>;
     fn failed(&self) -> bool;
     fn set_muted(&mut self, muted: bool);
+    fn set_threshold(&mut self, threshold: f32);
 }
 
 impl Input for Capture {
@@ -293,6 +429,9 @@ impl Input for Capture {
     }
     fn set_muted(&mut self, muted: bool) {
         Capture::set_muted(self, muted)
+    }
+    fn set_threshold(&mut self, threshold: f32) {
+        Capture::set_threshold(self, threshold)
     }
 }
 
@@ -322,6 +461,12 @@ impl<T> Slot<T> {
         let open = self.dev.is_some();
         (self.shown != Some(open)).then(|| *self.shown.insert(open))
     }
+
+    /// Close the device and open it again on the next `keep`.
+    fn reopen(&mut self) {
+        self.dev = None;
+        self.retry_at = std::time::Instant::now();
+    }
 }
 
 /// The audio thread's ends of the channels.
@@ -335,19 +480,42 @@ struct Audio {
 impl Audio {
     /// Feeds media to the output and the mic's packets to the driver, ticking both every 10 ms, and
     /// reports levels; lost or missing devices are reopened every `reopen` (the connection stays up
-    /// meanwhile). Returns when `media` closes.
-    fn run<O: Output, I: Input>(&self, mut open_out: impl FnMut() -> Option<O>, mut open_mic: impl FnMut() -> Option<I>, media: std_mpsc::Receiver<(u64, u16, Vec<u8>)>) {
+    /// meanwhile). Settings changes apply live. Returns when `media` closes.
+    fn run<O: Output, I: Input>(&self, mut cfg: AudioCfg, mut open_out: impl FnMut(&AudioCfg) -> Option<O>, mut open_mic: impl FnMut(&AudioCfg) -> Option<I>, media: std_mpsc::Receiver<ToAudio>) {
         let (mut out, mut mic, mut levels) = (Slot::<O>::new(), Slot::<I>::new(), vec![]);
         // the mic's last Speaking: its silence tail is ours to send if it dies mid-speech
         let mut speaking = false;
+        // the level dot: heard now, last reported, next report allowed
+        let (mut level, mut level_shown, mut level_at) = (false, false, std::time::Instant::now());
         let mut next_tick = std::time::Instant::now();
         loop {
             loop {
                 match media.recv_timeout(next_tick.saturating_duration_since(std::time::Instant::now())) {
-                    Ok((user, seq, opus)) => {
+                    Ok(ToAudio::Media(user, seq, opus)) => {
                         if let Some(o) = &mut out.dev {
                             o.push(user, seq, opus);
                         }
+                    }
+                    Ok(ToAudio::Gain(user, gain)) => {
+                        cfg.gains.insert(user, gain);
+                        out.dev.iter_mut().for_each(|o| o.set_gain(user, gain));
+                    }
+                    Ok(ToAudio::Deafen(on)) => {
+                        cfg.deafened = on;
+                        out.dev.iter_mut().for_each(|o| o.set_deafened(on));
+                    }
+                    Ok(ToAudio::Threshold(t)) => {
+                        cfg.threshold = t;
+                        mic.dev.iter_mut().for_each(|m| m.set_threshold(t));
+                    }
+                    Ok(ToAudio::Input(dev, ns)) => {
+                        (cfg.input, cfg.noise_suppression) = (dev, ns);
+                        self.end_speech(&mut speaking);
+                        mic.reopen();
+                    }
+                    Ok(ToAudio::Output(dev)) => {
+                        cfg.output = dev;
+                        out.reopen();
                     }
                     Err(std_mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
@@ -355,21 +523,30 @@ impl Audio {
             }
             let now = std::time::Instant::now();
             next_tick = (next_tick + TICK).max(now);
-            if let Some(open) = out.keep(now, self.reopen, O::failed, &mut open_out) {
+            let opened_out = || {
+                open_out(&cfg).map(|mut o| {
+                    o.set_deafened(cfg.deafened);
+                    cfg.gains.iter().for_each(|(u, g)| o.set_gain(*u, *g));
+                    o
+                })
+            };
+            if let Some(open) = out.keep(now, self.reopen, O::failed, opened_out) {
                 if !open {
                     tracing::warn!("no audio output");
                 }
                 let _ = self.notes.send(AudioNote::Speaker(open));
             }
-            if let Some(open) = mic.keep(now, self.reopen, I::failed, &mut open_mic) {
+            let opened_mic = || {
+                open_mic(&cfg).map(|mut m| {
+                    m.set_threshold(cfg.threshold);
+                    m
+                })
+            };
+            if let Some(open) = mic.keep(now, self.reopen, I::failed, opened_mic) {
                 if !open {
                     tracing::warn!("no audio input");
-                    if std::mem::take(&mut speaking) {
-                        for _ in 0..SILENCE_FRAMES {
-                            let _ = self.cmds.try_send(VoiceCmd::Opus(SILENCE.to_vec()));
-                        }
-                        let _ = self.cmds.try_send(VoiceCmd::Speaking(false));
-                    }
+                    self.end_speech(&mut speaking);
+                    level = false;
                 }
                 let _ = self.notes.send(AudioNote::Mic(open));
             }
@@ -386,15 +563,32 @@ impl Audio {
                 for o in m.tick() {
                     // never block the audio thread: a busy driver loses the packet
                     let _ = match o {
-                        CaptureOut::Opus(f) => self.cmds.try_send(VoiceCmd::Opus(f)).map_err(drop),
+                        CaptureOut::Opus(f) => self.cmds.try_send(VoiceCmd::Opus(f)),
                         CaptureOut::Speaking(on) => {
                             speaking = on;
-                            self.cmds.try_send(VoiceCmd::Speaking(on)).map_err(drop)
+                            self.cmds.try_send(VoiceCmd::Speaking(on))
                         }
-                        CaptureOut::Level(on) => self.notes.send(AudioNote::Level(on)).map_err(drop),
+                        CaptureOut::Level(on) => {
+                            level = on;
+                            Ok(())
+                        }
                     };
                 }
             }
+            if level != level_shown && now >= level_at {
+                (level_shown, level_at) = (level, now + LEVEL_EVERY);
+                let _ = self.notes.send(AudioNote::Level(level));
+            }
+        }
+    }
+
+    /// The mic stopped mid-speech: the silence tail and Speaking(false) it would have sent.
+    fn end_speech(&self, speaking: &mut bool) {
+        if std::mem::take(speaking) {
+            for _ in 0..SILENCE_FRAMES {
+                let _ = self.cmds.try_send(VoiceCmd::Opus(SILENCE.to_vec()));
+            }
+            let _ = self.cmds.try_send(VoiceCmd::Speaking(false));
         }
     }
 }
@@ -509,7 +703,7 @@ mod tests {
         let (media, media_rx) = std_mpsc::channel();
         let (_note_tx, notes) = mpsc::unbounded_channel();
         let muted = Arc::new(AtomicBool::new(false));
-        let conn = Conn { cmds, events, media: Some(media), notes, muted, status: VoiceStatus::Connected, speaker: true, mic: true, level: false };
+        let conn = Conn::new(cmds, events, media, notes, muted, true);
         conn.send(VoiceCmd::Speaking(true));
         conn.send(VoiceCmd::Speaking(false)); // full: dropped, never blocks
         drop(conn);
@@ -519,9 +713,12 @@ mod tests {
         assert!(media_rx.recv().is_err(), "audio thread's media closed: it exits");
     }
 
+    #[derive(Default)]
     struct Fake {
         failed: Arc<AtomicBool>,
         pushed: Arc<AtomicUsize>,
+        /// set_gain/set_deafened calls, as text
+        log: Arc<std::sync::Mutex<Vec<String>>>,
     }
     impl Output for Fake {
         fn push(&mut self, _: u64, _: u16, _: Vec<u8>) {
@@ -534,6 +731,12 @@ mod tests {
         fn levels(&self) -> Vec<(u64, bool)> {
             vec![(7, self.pushed.load(Ordering::Relaxed) > 0)]
         }
+        fn set_gain(&mut self, user_id: u64, gain: f32) {
+            self.log.lock().unwrap().push(format!("gain {user_id} {gain}"));
+        }
+        fn set_deafened(&mut self, deafened: bool) {
+            self.log.lock().unwrap().push(format!("deafened {deafened}"));
+        }
     }
 
     #[test]
@@ -544,14 +747,14 @@ mod tests {
         let open = move || {
             let i = n.fetch_add(1, Ordering::Relaxed);
             f.store(false, Ordering::Relaxed);
-            (i != 1).then(|| Fake { failed: f.clone(), pushed: p.clone() })
+            (i != 1).then(|| Fake { failed: f.clone(), pushed: p.clone(), ..Default::default() })
         };
-        let (media, mut notes, _cmds, _muted, thread) = spawn_audio(open, || None::<FakeMic>);
+        let (media, mut notes, _cmds, _muted, thread) = spawn_audio(move |_| open(), |_| None::<FakeMic>);
         let mut next = || notes.blocking_recv().unwrap();
         assert_eq!(next(), AudioNote::Speaker(true));
         assert_eq!(next(), AudioNote::Mic(false), "no microphone: the call goes on");
         assert_eq!(next(), AudioNote::Levels(vec![(7, false)]));
-        media.send((7, 0, vec![1])).unwrap();
+        media.send(ToAudio::Media(7, 0, vec![1])).unwrap();
         assert_eq!(next(), AudioNote::Levels(vec![(7, true)]));
         failed.store(true, Ordering::Relaxed); // unplugged
         assert_eq!(next(), AudioNote::Speaker(false), "\"No speaker\", the media channel stays open");
@@ -561,16 +764,16 @@ mod tests {
         thread.join().unwrap();
     }
 
-    type Spawned = (std_mpsc::Sender<(u64, u16, Vec<u8>)>, mpsc::UnboundedReceiver<AudioNote>, mpsc::Receiver<VoiceCmd>, Arc<AtomicBool>, std::thread::JoinHandle<()>);
+    type Spawned = (std_mpsc::Sender<ToAudio>, mpsc::UnboundedReceiver<AudioNote>, mpsc::Receiver<VoiceCmd>, Arc<AtomicBool>, std::thread::JoinHandle<()>);
 
     /// The audio thread with a 30 ms reopen interval.
-    fn spawn_audio<O: Output, I: Input>(open_out: impl FnMut() -> Option<O> + Send + 'static, open_mic: impl FnMut() -> Option<I> + Send + 'static) -> Spawned {
+    fn spawn_audio<O: Output, I: Input>(open_out: impl FnMut(&AudioCfg) -> Option<O> + Send + 'static, open_mic: impl FnMut(&AudioCfg) -> Option<I> + Send + 'static) -> Spawned {
         let (media, media_rx) = std_mpsc::channel();
         let (note_tx, notes) = mpsc::unbounded_channel();
         let (cmds, cmd_rx) = mpsc::channel(64);
         let muted = Arc::new(AtomicBool::new(false));
         let audio = Audio { cmds, notes: note_tx, muted: muted.clone(), reopen: Duration::from_millis(30) };
-        let thread = std::thread::spawn(move || audio.run(open_out, open_mic, media_rx));
+        let thread = std::thread::spawn(move || audio.run(AudioCfg::default(), open_out, open_mic, media_rx));
         (media, notes, cmd_rx, muted, thread)
     }
 
@@ -578,6 +781,7 @@ mod tests {
         failed: Arc<AtomicBool>,
         muted: Arc<AtomicBool>,
         out: Vec<CaptureOut>,
+        threshold: Arc<std::sync::Mutex<f32>>,
     }
     impl Input for FakeMic {
         fn tick(&mut self) -> Vec<CaptureOut> {
@@ -588,6 +792,9 @@ mod tests {
         }
         fn set_muted(&mut self, muted: bool) {
             self.muted.store(muted, Ordering::Relaxed);
+        }
+        fn set_threshold(&mut self, threshold: f32) {
+            *self.threshold.lock().unwrap() = threshold;
         }
     }
 
@@ -600,9 +807,9 @@ mod tests {
             f.store(false, Ordering::Relaxed);
             m.store(false, Ordering::Relaxed);
             let out = vec![CaptureOut::Level(true), CaptureOut::Speaking(true), CaptureOut::Opus(vec![1])];
-            Some(FakeMic { failed: f.clone(), muted: m.clone(), out })
+            Some(FakeMic { failed: f.clone(), muted: m.clone(), out, threshold: Default::default() })
         };
-        let (media, mut notes, mut cmds, muted, thread) = spawn_audio(|| None::<Fake>, open_mic);
+        let (media, mut notes, mut cmds, muted, thread) = spawn_audio(|_| None::<Fake>, move |_| open_mic());
         assert_eq!(notes.blocking_recv(), Some(AudioNote::Speaker(false)));
         assert_eq!(notes.blocking_recv(), Some(AudioNote::Mic(true)));
         assert_eq!(notes.blocking_recv(), Some(AudioNote::Level(true)), "level dot");
@@ -625,5 +832,152 @@ mod tests {
         drop(media);
         thread.join().unwrap();
         assert!(mic_muted.load(Ordering::Relaxed), "the reopened mic is muted too");
+    }
+
+    fn op4_flags(fx: Vec<Effect>) -> Vec<(Option<Id>, bool, bool)> {
+        fx.into_iter()
+            .filter_map(|e| match e {
+                Effect::Gateway(GatewayCmd::VoiceState { channel_id, self_mute, self_deaf, .. }) => Some((channel_id, self_mute, self_deaf)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unchanged_voice_bar_is_not_pushed() {
+        // VOICE_STATE_UPDATEs from any server while we're not in voice: the bar stays empty, no UI wakeup
+        let mut shown = Bar::default();
+        assert_eq!(changed(&mut shown, Bar::default()), None);
+        let bar = Bar { text: "🔊 G / v".into(), ..Default::default() };
+        assert_eq!(changed(&mut shown, bar.clone()), Some(bar.clone()));
+        assert_eq!(changed(&mut shown, bar.clone()), None, "same again");
+        assert!(changed(&mut shown, Bar { level: true, ..bar }).is_some(), "level dot changed");
+    }
+
+    #[test]
+    fn deafen_implies_mute_and_restores() {
+        let (mut c, now) = (Controller::default(), Instant::now());
+        assert!(c.toggle_deafen().is_empty(), "not in voice: nothing sent");
+        c.toggle_deafen();
+        connected_to(&mut c, A, now);
+        assert_eq!(op4_flags(c.toggle_mute()), [(Some(A), true, false)], "mute: op 4 same channel");
+        assert_eq!(op4_flags(c.toggle_deafen()), [(Some(A), true, true)], "deafen implies mute");
+        assert_eq!(op4_flags(c.toggle_deafen()), [(Some(A), true, false)], "undeafen: still muted from before");
+        c.toggle_mute();
+        assert_eq!(op4_flags(c.toggle_deafen()), [(Some(A), true, true)]);
+        assert_eq!(op4_flags(c.toggle_deafen()), [(Some(A), false, false)], "undeafen: unmuted as before");
+        c.toggle_deafen();
+        assert_eq!(op4_flags(c.toggle_mute()), [(Some(A), false, false)], "unmuting undeafens");
+        c.toggle_mute();
+        assert_eq!(op4_flags(c.join(G, B, now)), [(Some(B), true, false)], "flags kept across joins");
+        assert_eq!(op4_flags(c.hang_up()), [(None, true, false)]);
+        assert!((c.muted(), c.deafened()) == (true, false));
+    }
+
+    fn test_conn(audio: bool) -> Conn {
+        let (cmds, _) = mpsc::channel(1);
+        let (_, events) = mpsc::channel(1);
+        let (_, notes) = mpsc::unbounded_channel();
+        Conn::new(cmds, events, std_mpsc::channel().0, notes, Arc::new(AtomicBool::new(false)), audio)
+    }
+
+    #[test]
+    fn voice_bar_shows_every_problem() {
+        let mut k = test_conn(false);
+        assert_eq!(k.problems(), ["Connecting…", "No microphone", "No speaker"], "audio thread didn't spawn: no devices, handshake still shown");
+        k.status = VoiceStatus::Connected;
+        assert_eq!(k.problems(), ["No microphone", "No speaker"]);
+        (k.mic, k.speaker) = (true, true);
+        assert!(k.problems().is_empty());
+        assert_eq!(test_conn(true).problems(), ["Connecting…"]);
+    }
+
+    #[test]
+    fn speaking_from_levels_with_op5_fallback() {
+        let mut k = test_conn(true);
+        k.op5 = HashSet::from([1, 2, 3]);
+        k.heard = vec![(1, false), (2, true), (4, true)];
+        let mut s: Vec<u64> = k.speaking().into_iter().map(|i| i.0).collect();
+        s.sort();
+        assert_eq!(s, [2, 3, 4], "1: heard silent wins over op 5; 3: not heard yet, op 5 counts");
+    }
+
+    #[test]
+    fn device_loss_retry() {
+        // the mic's stream errors: "No microphone" (the call goes on), then retried every 5 s
+        assert_eq!(REOPEN_EVERY, Duration::from_secs(5));
+        let mut slot = Slot::<bool>::new();
+        let (t0, opens) = (std::time::Instant::now(), std::cell::Cell::new(0));
+        let open = |ok: bool| {
+            opens.set(opens.get() + 1);
+            ok.then_some(false)
+        };
+        assert_eq!(slot.keep(t0, REOPEN_EVERY, |f| *f, || open(true)), Some(true));
+        slot.dev = Some(true); // stream error callback fired
+        assert_eq!(slot.keep(t0, REOPEN_EVERY, |f| *f, || open(true)), Some(false), "dropped, not reopened at once");
+        assert_eq!(slot.keep(t0 + Duration::from_secs(4), REOPEN_EVERY, |f| *f, || open(false)), None, "waits");
+        assert_eq!(opens.get(), 1);
+        assert_eq!(slot.keep(t0 + REOPEN_EVERY, REOPEN_EVERY, |f| *f, || open(false)), None, "still missing");
+        assert_eq!(slot.keep(t0 + Duration::from_secs(9), REOPEN_EVERY, |f| *f, || open(true)), None);
+        assert_eq!(slot.keep(t0 + REOPEN_EVERY * 2, REOPEN_EVERY, |f| *f, || open(true)), Some(true), "back");
+        assert_eq!(opens.get(), 3);
+        let mut k = test_conn(true);
+        (k.status, k.mic) = (VoiceStatus::Connected, false);
+        assert_eq!(k.problems(), ["No microphone"]);
+    }
+
+    #[test]
+    fn settings_reach_devices_and_survive_reopen() {
+        let (log, failed, threshold) = (Arc::new(std::sync::Mutex::new(vec![])), Arc::new(AtomicBool::new(false)), Arc::new(std::sync::Mutex::new(0.0)));
+        let (l, f) = (log.clone(), failed.clone());
+        let open_out = move |c: &AudioCfg| {
+            l.lock().unwrap().push(format!("open {:?}", c.output));
+            f.store(false, Ordering::Relaxed);
+            Some(Fake { failed: f.clone(), log: l.clone(), ..Default::default() })
+        };
+        let (l, t) = (log.clone(), threshold.clone());
+        let open_mic = move |c: &AudioCfg| {
+            l.lock().unwrap().push(format!("mic {:?} {}", c.input, c.noise_suppression));
+            let (failed, muted) = Default::default();
+            Some(FakeMic { failed, muted, out: vec![CaptureOut::Speaking(true)], threshold: t.clone() })
+        };
+        let (media, mut notes, mut cmds, _muted, thread) = spawn_audio(open_out, open_mic);
+        let mut next = || loop {
+            match notes.blocking_recv() {
+                Some(AudioNote::Levels(_)) => continue,
+                n => break n,
+            }
+        };
+        assert_eq!(next(), Some(AudioNote::Speaker(true)));
+        assert_eq!(next(), Some(AudioNote::Mic(true)));
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(true))));
+        media.send(ToAudio::Gain(5, 0.0)).unwrap();
+        media.send(ToAudio::Deafen(true)).unwrap();
+        media.send(ToAudio::Threshold(0.3)).unwrap();
+        media.send(ToAudio::Input(Some("usb".into()), false)).unwrap();
+        for i in 0..5 {
+            assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Opus(f)) if f == SILENCE), "reopening mid-speech: silence {i}");
+        }
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(false))));
+        assert!(matches!(cmds.blocking_recv(), Some(VoiceCmd::Speaking(true))), "the reopened mic");
+        assert_eq!(*threshold.lock().unwrap(), 0.3, "threshold applied to the reopened mic");
+        failed.store(true, Ordering::Relaxed); // speaker unplugged
+        assert_eq!(next(), Some(AudioNote::Speaker(false)));
+        assert_eq!(next(), Some(AudioNote::Speaker(true)));
+        media.send(ToAudio::Output(Some("hdmi".into()))).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !log.lock().unwrap().iter().any(|l| l == "open Some(\"hdmi\")") {
+            assert!(std::time::Instant::now() < deadline, "output reopened on the chosen device");
+            std::thread::yield_now();
+        }
+        drop(media);
+        thread.join().unwrap();
+        let log = log.lock().unwrap().join(", ");
+        assert_eq!(
+            log,
+            "open None, deafened false, mic None false, gain 5 0, deafened true, mic Some(\"usb\") false, \
+             open None, deafened true, gain 5 0, open Some(\"hdmi\"), deafened true, gain 5 0",
+            "every reopened speaker gets deafen and gains"
+        );
     }
 }

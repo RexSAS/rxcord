@@ -1,4 +1,5 @@
 //! Per-session navigation state and the pure rules for history paging and read acks.
+use crate::settings::Settings;
 use crate::view::{MessageRow, TreeRow};
 use rxcord_api::ApiError;
 use rxcord_api::id::Id;
@@ -106,6 +107,8 @@ pub struct Nav {
     pub forbidden: HashSet<Id>,
     /// Voice members highlighted as talking (from the voice connection).
     pub speaking: HashSet<Id>,
+    /// Voice settings and per-person volumes (not per session: a logout keeps them).
+    pub settings: Settings,
 }
 
 impl Nav {

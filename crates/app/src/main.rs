@@ -99,6 +99,25 @@ fn main() -> Result<(), slint::PlatformError> {
     let t = tx.clone();
     ui.on_hang_up(move || drop(t.send(Command::LeaveVoice)));
     let t = tx.clone();
+    ui.on_toggle_mute(move || drop(t.send(Command::ToggleMute)));
+    let t = tx.clone();
+    ui.on_toggle_deafen(move || drop(t.send(Command::ToggleDeafen)));
+    let t = tx.clone();
+    ui.on_set_user_volume(move |u, v| drop(id(u).map(|u| t.send(Command::UserVolume(u, v)))));
+    let t = tx.clone();
+    ui.on_set_user_muted(move |u, m| drop(id(u).map(|u| t.send(Command::UserMuted(u, m)))));
+    let t = tx.clone();
+    ui.on_open_voice_settings(move || drop(t.send(Command::VoiceSettings)));
+    let device = |d: slint::SharedString| (!d.is_empty()).then(|| d.to_string());
+    let t = tx.clone();
+    ui.on_voice_input(move |d| drop(t.send(Command::SetInput(device(d)))));
+    let t = tx.clone();
+    ui.on_voice_output(move |d| drop(t.send(Command::SetOutput(device(d)))));
+    let t = tx.clone();
+    ui.on_voice_threshold(move |v| drop(t.send(Command::SetThreshold(v))));
+    let t = tx.clone();
+    ui.on_voice_noise(move |n| drop(t.send(Command::SetNoiseSuppression(n))));
+    let t = tx.clone();
     ui.on_close_tab(move |c| drop(id(c).map(|c| t.send(Command::CloseTab(c)))));
     let t = tx.clone();
     ui.on_select_channel(move |c| drop(id(c).map(|c| t.send(Command::OpenChannel(c)))));
@@ -175,13 +194,12 @@ fn save_settings(ui: &AppWindow, last_guild: &AtomicU64) {
     let size = win.size().to_logical(win.scale_factor());
     let pos = win.position();
     let g = last_guild.load(Ordering::Relaxed);
-    settings::save(&settings::Settings {
-        width: size.width,
-        height: size.height,
-        x: Some(pos.x),
-        y: Some(pos.y),
-        tree_height: ui.get_tree_height(),
-        last_guild: (g != 0).then_some(g),
+    let tree_height = ui.get_tree_height();
+    settings::update(|s| {
+        (s.width, s.height) = (size.width, size.height);
+        (s.x, s.y) = (Some(pos.x), Some(pos.y));
+        s.tree_height = tree_height;
+        s.last_guild = (g != 0).then_some(g);
     });
 }
 

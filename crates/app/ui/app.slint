@@ -5,6 +5,7 @@ import { Tabs, TabItem } from "tabs.slint";
 import { MessageList } from "messages.slint";
 import { Composer } from "composer.slint";
 import { MessageItem, ThumbItem, FileItem } from "message_row.slint";
+import { VoiceSettings } from "voice_settings.slint";
 
 export { TreeItem, TabItem, MessageItem, ThumbItem, FileItem }
 
@@ -44,6 +45,28 @@ export component AppWindow inherits Window {
     in property <string> notice;
     callback join-voice(string);
     callback hang-up();
+    // voice bar buttons and the mic's level dot (hears speech, not muted)
+    in property <bool> voice-muted;
+    in property <bool> voice-deafened;
+    in property <bool> voice-level;
+    callback toggle-mute();
+    callback toggle-deafen();
+    // a voice member's volume (0..2) and "mute for me"
+    callback set-user-volume(string, float);
+    callback set-user-muted(string, bool);
+    // voice settings popup (filled by Rust, then shown with show-voice-settings)
+    callback open-voice-settings();
+    in property <[string]> vs-inputs;
+    in property <[string]> vs-outputs;
+    in-out property <int> vs-input;
+    in-out property <int> vs-output;
+    in-out property <float> vs-threshold;
+    in-out property <bool> vs-noise;
+    callback voice-input(string);
+    callback voice-output(string);
+    callback voice-threshold(float);
+    callback voice-noise(bool);
+    public function show-voice-settings() { vs-popup.show(); }
     // height of the tree above the divider (saved in settings.json)
     in-out property <length> tree-height: 280px;
     // expand/collapse a tree node (guild id or "0" for DMs)
@@ -123,6 +146,8 @@ export component AppWindow inherits Window {
                 toggle(id) => { root.toggle-node(id); }
                 open(id) => { root.select-channel(id); }
                 join(id) => { root.join-voice(id); }
+                set-volume(id, v) => { root.set-user-volume(id, v); }
+                set-muted-for-me(id, m) => { root.set-user-muted(id, m); }
             }
             // divider: drag to resize the tree (5px to grab, drawn as a 2px line)
             Rectangle {
@@ -204,6 +229,45 @@ export component AppWindow inherits Window {
                         overflow: elide;
                         font-size: 12px;
                     }
+                    Text {
+                        text: "●";
+                        vertical-alignment: center;
+                        font-size: 9px;
+                        color: root.voice-level ? #3ba55c : Palette.foreground;
+                        opacity: root.voice-level ? 1.0 : 0.25;
+                    }
+                    mic := TouchArea {
+                        width: 22px;
+                        accessible-role: button;
+                        accessible-label: root.voice-muted ? "Unmute" : "Mute";
+                        accessible-action-default => { root.toggle-mute(); }
+                        clicked => { root.toggle-mute(); }
+                        Rectangle {
+                            border-radius: 3px;
+                            background: root.voice-muted ? #ed424570 : transparent;
+                            Text {
+                                text: "🎤";
+                                vertical-alignment: center;
+                                opacity: mic.has-hover || root.voice-muted ? 1.0 : 0.7;
+                            }
+                        }
+                    }
+                    deaf := TouchArea {
+                        width: 22px;
+                        accessible-role: button;
+                        accessible-label: root.voice-deafened ? "Undeafen" : "Deafen";
+                        accessible-action-default => { root.toggle-deafen(); }
+                        clicked => { root.toggle-deafen(); }
+                        Rectangle {
+                            border-radius: 3px;
+                            background: root.voice-deafened ? #ed424570 : transparent;
+                            Text {
+                                text: "🎧";
+                                vertical-alignment: center;
+                                opacity: deaf.has-hover || root.voice-deafened ? 1.0 : 0.7;
+                            }
+                        }
+                    }
                     hang := TouchArea {
                         width: 20px;
                         accessible-role: button;
@@ -271,19 +335,43 @@ export component AppWindow inherits Window {
                     }
                 }
                 menu := PopupWindow {
-                    x: parent.width - 110px;
-                    y: -34px;
-                    width: 100px;
+                    x: parent.width - 150px;
+                    y: -66px;
+                    width: 140px;
                     Rectangle {
                         background: Palette.background;
                         border-width: 1px;
                         border-color: Palette.border;
-                        Button {
-                            text: "Log out";
-                            clicked => { root.logout(); }
+                        VerticalLayout {
+                            Button {
+                                text: "Voice settings…";
+                                clicked => { root.open-voice-settings(); }
+                            }
+                            Button {
+                                text: "Log out";
+                                clicked => { root.logout(); }
+                            }
                         }
                     }
                 }
+            }
+        }
+        vs-popup := PopupWindow {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            close-policy: PopupClosePolicy.close-on-click-outside;
+            VoiceSettings {
+                inputs: root.vs-inputs;
+                outputs: root.vs-outputs;
+                input <=> root.vs-input;
+                output <=> root.vs-output;
+                threshold <=> root.vs-threshold;
+                noise <=> root.vs-noise;
+                input-changed(d) => { root.voice-input(d); }
+                output-changed(d) => { root.voice-output(d); }
+                threshold-changed(t) => { root.voice-threshold(t); }
+                noise-changed(n) => { root.voice-noise(n); }
             }
         }
         if !root.logged-in: LoginScreen {

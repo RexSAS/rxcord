@@ -20,6 +20,7 @@
 ## Voice (stage 2, need a real account and a second one talking)
 
 - [ ] Task 8: double-click a voice channel → you appear under it, the voice bar shows "🔊 Server / Channel", the second account's voice plays and its row turns green while it talks; double-click another voice channel → you move (one op 4); ✖ → you leave at once (the second account sees it); a moderator disconnecting you → "Disconnected from voice"; unplug the headset mid-call → "No speaker", plug back → audio resumes within ~5 s; kill the network for 5 s → "Reconnecting voice…" then back; restart the main gateway (network off ~60 s) while in voice → voice keeps playing, no duplicate rows (VERIFY LIVE: does a replayed op 4 bring a new VOICE_SERVER_UPDATE with the same endpoint?); idle with no voice → `scripts/idle-check` still < 0.5 %.
+- [ ] Task 10: 🎤 → the second account sees you muted and hears nothing; 🎧 → you hear nothing and show muted + deafened; 🎧 again → back to the mute state from before; the level dot lights while you talk (not while muted). Right-click the second account's row → volume 200 % is louder, 0 % / "Mute for me" is silent, and both survive a restart (settings.json). ⚙ → "Voice settings…": switching microphone/speaker mid-call moves the audio within a second; raising the sensitivity cuts quiet speech; noise suppression off lets a fan through.
 
 ## Follow-ups (known gaps, in priority order)
 

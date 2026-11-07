@@ -1,7 +1,7 @@
 //! Tokio runtime thread: owns the store, the gateway and REST, and pushes finished data to the UI.
 use crate::nav::{Ack, DMS_NODE, HISTORY_PAGE, Nav};
-use crate::voice::{AudioNote, Conn, ConnIn, Controller, Effect};
-use crate::{AppWindow, bridge, compose, images, notify, token};
+use crate::voice::{AudioCfg, AudioNote, Bar, Conn, ConnIn, Controller, Effect, ToAudio};
+use crate::{AppWindow, bridge, compose, images, notify, settings, token};
 use rxcord_api::event::Event;
 use rxcord_api::gateway::GatewayCmd;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
@@ -47,6 +47,19 @@ pub enum Command {
     JoinVoice(Id),
     /// The voice bar's hang-up.
     LeaveVoice,
+    /// The voice bar's 🎤 and 🎧.
+    ToggleMute,
+    ToggleDeafen,
+    /// Our volume for a user (0.0..=2.0) and "mute for me".
+    UserVolume(Id, f32),
+    UserMuted(Id, bool),
+    /// ⚙ → "Voice settings…": list the devices and show the popup.
+    VoiceSettings,
+    /// Device name; None = system default.
+    SetInput(Option<String>),
+    SetOutput(Option<String>),
+    SetThreshold(f32),
+    SetNoiseSuppression(bool),
     /// The window closed: leave voice, let the gateway send that, then stop (main.rs waits for it).
     Quit,
 }
@@ -74,6 +87,7 @@ enum Input {
     Thumb(images::Loaded),
     Voice(ConnIn),
     VoiceTimeout,
+    SaveSettings,
 }
 
 /// `focused` is true while the window has focus; written by the UI thread (main.rs), read here and by notifications.
@@ -88,14 +102,15 @@ pub fn spawn_runtime(
         .name("rxcord-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
-            let (store, tasks, nav, thumbs) = (Store::new(), JoinSet::new(), Nav::default(), images::Thumbs::new());
+            let (store, tasks, thumbs) = (Store::new(), JoinSet::new(), images::Thumbs::new());
+            let nav = Nav { settings: settings::load(), ..Default::default() };
             let (update_tx, update_rx) = mpsc::unbounded_channel();
             if crate::update::enabled() {
                 rt.spawn(crate::update::run(ui.clone(), update_rx));
             }
             let session_id = String::new();
-            let (voice, conn) = (Controller::default(), None);
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn }.run(rx));
+            let (voice, conn, bar, save_at) = (Controller::default(), None, Bar::default(), None);
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, gw_task: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx, voice, conn, bar, save_at }.run(rx));
             rt.shutdown_timeout(Duration::from_millis(200)); // don't wait out blocking tasks on exit
         })
         .expect("spawn runtime thread");
@@ -126,6 +141,10 @@ struct Runtime {
     voice: Controller,
     /// While connected to voice: the driver and the audio thread.
     conn: Option<Conn>,
+    /// What the voice bar shows now.
+    bar: Bar,
+    /// Voice settings changed: written to settings.json at this time (at most once per second).
+    save_at: Option<Instant>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -205,6 +224,7 @@ impl Runtime {
                 Some(Ok(l)) = self.thumbs.tasks.join_next() => Input::Thumb(l),
                 v = recv_conn(&mut self.conn) => Input::Voice(v),
                 _ = sleep_opt(self.voice.deadline()) => Input::VoiceTimeout,
+                _ = sleep_opt(self.save_at) => Input::SaveSettings,
             };
             match input {
                 Input::Cmd(c) => self.command(c).await,
@@ -219,6 +239,11 @@ impl Runtime {
                 Input::VoiceTimeout => {
                     let fx = self.voice.expire(Instant::now());
                     self.voice_effects(fx);
+                }
+                Input::SaveSettings => {
+                    if let Some(s) = self.unsaved_settings() {
+                        tokio::task::spawn_blocking(move || settings::update(|f| f.take_voice(&s)));
+                    }
                 }
             }
         }
@@ -250,6 +275,9 @@ impl Runtime {
     async fn quit(&mut self) {
         let fx = self.voice.hang_up();
         self.voice_effects(fx);
+        if let Some(s) = self.unsaved_settings() {
+            settings::update(|f| f.take_voice(&s));
+        }
         if let Some(wait) = self.close_gateway() {
             let _ = wait.await;
         }
@@ -268,7 +296,7 @@ impl Runtime {
         // Unsent text goes back into the drafts, never auto-sent: the next login may be another account.
         bridge::restore_drafts(&self.ui, compose::unsent_drafts(self.store.all_pending()));
         self.store = Store::new();
-        self.nav = Nav::default();
+        self.nav = Nav { settings: std::mem::take(&mut self.nav.settings), ..Default::default() };
         self.thumbs = images::Thumbs::new(); // drops the cache and aborts its fetches
         bridge::clear(&self.ui);
     }
@@ -406,6 +434,47 @@ impl Runtime {
             Command::LeaveVoice => {
                 let fx = self.voice.hang_up();
                 self.voice_effects(fx);
+            }
+            Command::ToggleMute => {
+                let fx = self.voice.toggle_mute();
+                self.self_state(fx);
+            }
+            Command::ToggleDeafen => {
+                let fx = self.voice.toggle_deafen();
+                self.self_state(fx);
+            }
+            Command::UserVolume(u, v) => {
+                self.nav.settings.set_volume(u.to_string(), v);
+                self.user_gain(u);
+            }
+            Command::UserMuted(u, on) => {
+                let (set, k) = (&mut self.nav.settings.user_muted, u.to_string());
+                if on { set.insert(k) } else { set.remove(&k) };
+                self.user_gain(u);
+            }
+            Command::VoiceSettings => {
+                let (ui, s) = (self.ui.clone(), self.nav.settings.clone());
+                // device enumeration can be slow (ALSA); only done when asked
+                tokio::task::spawn_blocking(move || {
+                    let (inputs, outputs) = (rxcord_voice::audio::devices::inputs(), rxcord_voice::audio::devices::outputs());
+                    bridge::voice_settings(&ui, &s, inputs, outputs);
+                });
+            }
+            Command::SetInput(d) => {
+                self.nav.settings.input_device = d;
+                self.reopen_input();
+            }
+            Command::SetNoiseSuppression(on) => {
+                self.nav.settings.noise_suppression = on;
+                self.reopen_input();
+            }
+            Command::SetOutput(d) => {
+                self.nav.settings.output_device = d.clone();
+                self.audio(ToAudio::Output(d));
+            }
+            Command::SetThreshold(t) => {
+                self.nav.settings.set_threshold(t);
+                self.audio(ToAudio::Threshold(self.nav.settings.vad_threshold));
             }
             Command::Quit => {} // handled in `run`
             Command::InstallUpdate => drop(self.update_tx.send(())),
@@ -560,6 +629,46 @@ impl Runtime {
         self.changed(changes);
     }
 
+    /// Mute/deafen: applied here at once, then op 4 and the bar.
+    fn self_state(&mut self, fx: Vec<Effect>) {
+        if let Some(k) = &self.conn {
+            k.set_muted(self.voice.muted());
+            k.audio(ToAudio::Deafen(self.voice.deafened()));
+        }
+        self.voice_effects(fx);
+    }
+
+    /// Per-person volume or "mute for me" changed: playback, the tree, settings.json.
+    fn user_gain(&mut self, u: Id) {
+        if let Some(k) = &self.conn {
+            k.audio(ToAudio::Gain(u.0, self.nav.settings.gain(&u.to_string())));
+        }
+        self.save_soon();
+        bridge::push_tree(&self.ui, &self.store, &mut self.nav);
+    }
+
+    fn reopen_input(&mut self) {
+        let s = &self.nav.settings;
+        self.audio(ToAudio::Input(s.input_device.clone(), s.noise_suppression));
+    }
+
+    /// A voice setting changed: to the audio thread when in voice, and saved soon.
+    fn audio(&mut self, m: ToAudio) {
+        if let Some(k) = &self.conn {
+            k.audio(m);
+        }
+        self.save_soon();
+    }
+
+    /// Coalesces slider drags: one write per second at most.
+    fn save_soon(&mut self) {
+        self.save_at.get_or_insert(Instant::now() + Duration::from_secs(1));
+    }
+
+    fn unsaved_settings(&mut self) -> Option<settings::Settings> {
+        self.save_at.take().map(|_| self.nav.settings.clone())
+    }
+
     /// Carries out what the voice controller decided. Old devices close before new ones open.
     fn voice_effects(&mut self, fx: Vec<Effect>) {
         for e in fx {
@@ -574,7 +683,9 @@ impl Runtime {
                 }
                 Effect::Connect { connect, channel } => {
                     self.conn = None;
-                    self.conn = Some(Conn::start(connect, channel));
+                    let k = Conn::start(connect, channel, AudioCfg::new(&self.nav.settings, self.voice.deafened()));
+                    k.set_muted(self.voice.muted());
+                    self.conn = Some(k);
                 }
                 Effect::Disconnect => self.conn = None,
                 Effect::Notice(n) => bridge::voice_notice(&self.ui, n.into()),
@@ -589,15 +700,12 @@ impl Runtime {
 
     fn voice_in(&mut self, v: ConnIn) {
         let Some(conn) = &mut self.conn else { return };
-        let speaking = match v {
-            ConnIn::Event(VoiceEvent::Media { user_id, seq, opus, .. }) => return conn.media(user_id, seq, opus),
+        match v {
+            ConnIn::Event(VoiceEvent::Media { user_id, seq, opus, .. }) => return conn.audio(ToAudio::Media(user_id, seq, opus)),
             ConnIn::Event(VoiceEvent::Speaking { user_id, on, .. }) => {
-                let mut s = self.nav.speaking.clone();
-                if on { s.insert(Id(user_id)) } else { s.remove(&Id(user_id)) };
-                s
+                if on { conn.op5.insert(user_id) } else { conn.op5.remove(&user_id) };
             }
-            // the decoded audio says who's talking right now
-            ConnIn::Audio(AudioNote::Levels(l)) => l.into_iter().filter(|u| u.1).map(|u| Id(u.0)).collect(),
+            ConnIn::Audio(AudioNote::Levels(l)) => conn.heard = l,
             ConnIn::Audio(AudioNote::Speaker(ok)) => {
                 conn.speaker = ok;
                 return self.push_voice();
@@ -609,7 +717,7 @@ impl Runtime {
             }
             ConnIn::Audio(AudioNote::Level(on)) => {
                 conn.level = on;
-                return;
+                return self.push_voice();
             }
             ConnIn::Event(VoiceEvent::Status(s)) => {
                 conn.status = s;
@@ -624,28 +732,33 @@ impl Runtime {
                 return self.voice_effects(fx);
             }
             ConnIn::Event(VoiceEvent::PrivacyCode(_)) => return,
-        };
+        }
+        let speaking = conn.speaking();
         if speaking != self.nav.speaking {
             self.nav.speaking = speaking;
             bridge::push_tree(&self.ui, &self.store, &mut self.nav);
         }
     }
 
-    /// The voice bar: "" when not in voice.
-    fn push_voice(&self) {
+    /// The voice bar; only pushed when it changed (voice states of every server come through here).
+    fn push_voice(&mut self) {
         let text = self.voice.channel().map(|(g, c)| {
             let g = self.store.guilds().iter().find(|x| x.id == g).map(|x| x.name.as_str()).unwrap_or_default();
             let c = self.store.channel(c).and_then(|c| c.name.as_deref()).unwrap_or_default();
-            let state = match &self.conn {
-                Some(k) if matches!(k.status, VoiceStatus::Reconnecting { .. }) => return "Reconnecting voice…".into(),
-                Some(k) if !k.speaker => " · No speaker",
-                Some(k) if !k.mic => " · No microphone",
-                Some(k) if k.status == VoiceStatus::Connected => "",
-                _ => " · Connecting…",
-            };
-            format!("🔊 {g} / {c}{state}")
+            match &self.conn {
+                Some(k) if matches!(k.status, VoiceStatus::Reconnecting { .. }) => "Reconnecting voice…".into(),
+                k => {
+                    let problems = k.as_ref().map_or(vec!["Connecting…"], |k| k.problems());
+                    std::iter::once(format!("🔊 {g} / {c}")).chain(problems.into_iter().map(String::from)).collect::<Vec<_>>().join(" · ")
+                }
+            }
         });
-        bridge::voice_bar(&self.ui, text.unwrap_or_default());
+        let muted = self.voice.muted();
+        let level = !muted && self.conn.as_ref().is_some_and(|k| k.level);
+        let bar = Bar { text: text.unwrap_or_default(), muted, deafened: self.voice.deafened(), level };
+        if let Some(bar) = crate::voice::changed(&mut self.bar, bar) {
+            bridge::voice_bar(&self.ui, bar);
+        }
     }
 
     async fn status(&mut self, s: ConnStatus) {

@@ -1,4 +1,4 @@
-import { ListView, Palette } from "std-widgets.slint";
+import { CheckBox, ListView, Palette, Slider } from "std-widgets.slint";
 import { Badge, Dot } from "widgets.slint";
 
 export struct TreeItem {
@@ -18,6 +18,9 @@ export struct TreeItem {
     speaking: bool,
     muted: bool,
     deafened: bool,
+    // members: our volume for them (0..2) and "mute for me"
+    volume: float,
+    muted-for-me: bool,
 }
 
 // DMs and guilds as collapsible nodes; channels under expanded nodes, voice channels followed by who's
@@ -30,6 +33,9 @@ export component Tree inherits Rectangle {
     callback toggle(string);
     callback open(string);
     callback join(string);
+    // a member's volume (0..2) or "mute for me" changed (user id)
+    callback set-volume(string, float);
+    callback set-muted-for-me(string, bool);
 
     background: Palette.alternate-background;
     ListView {
@@ -48,7 +54,7 @@ export component Tree inherits Rectangle {
             accessible-expandable: it.node;
             accessible-expanded: it.expanded;
             accessible-action-default => {
-                if voice { root.join(it.id); } else { ta.clicked(); }
+                if it.member { vol.show(); } else if voice { root.join(it.id); } else { ta.clicked(); }
             }
             HorizontalLayout {
                 padding-left: 6px + it.depth * 14px;
@@ -69,7 +75,7 @@ export component Tree inherits Rectangle {
                 }
                 if it.member: Text {
                     horizontal-stretch: 1;
-                    text: it.name + (it.muted ? " 🔇" : "") + (it.deafened ? " 🎧" : "");
+                    text: it.name + (it.muted ? " 🔇" : "") + (it.deafened ? " 🎧" : "") + (it.muted-for-me ? " 🔕" : "");
                     vertical-alignment: center;
                     overflow: elide;
                     font-size: 12px;
@@ -103,6 +109,42 @@ export component Tree inherits Rectangle {
                 }
                 double-clicked => {
                     if voice { root.join(it.id); }
+                }
+            }
+            // right-click a member: our volume for them
+            if it.member: TouchArea {
+                pointer-event(e) => {
+                    if e.button == PointerEventButton.right && e.kind == PointerEventKind.up { vol.show(); }
+                }
+            }
+            vol := PopupWindow {
+                x: 24px;
+                y: parent.height;
+                width: 190px;
+                close-policy: PopupClosePolicy.close-on-click-outside;
+                Rectangle {
+                    background: Palette.background;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 2px;
+                        Text {
+                            text: "Volume " + round(slider.value) + " %";
+                            font-size: 12px;
+                        }
+                        slider := Slider {
+                            minimum: 0;
+                            maximum: 200;
+                            value: it.volume * 100;
+                            changed(v) => { root.set-volume(it.id, v / 100); }
+                        }
+                        CheckBox {
+                            text: "Mute for me";
+                            checked: it.muted-for-me;
+                            toggled => { root.set-muted-for-me(it.id, self.checked); }
+                        }
+                    }
                 }
             }
         }
