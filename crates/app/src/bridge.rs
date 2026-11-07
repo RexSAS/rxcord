@@ -62,13 +62,24 @@ pub fn edit_done(ui: &Weak<AppWindow>, id: Id, ok: bool) {
         match (ok, editing) {
             (true, true) => {
                 ui.set_edit_id("".into());
-                ui.set_composer_text(ui.get_edit_stash());
+                let (now, sent) = (ui.get_composer_text(), ui.get_edit_submitted());
+                ui.set_composer_text(crate::compose::after_edit(&now, &sent, &ui.get_edit_stash()).into());
                 ui.set_edit_stash("".into());
                 ui.set_composer_error("".into());
             }
             (true, false) => {}
             (false, true) => ui.set_composer_error("Couldn't save the edit. Press Enter to try again.".into()),
             (false, false) => row_error(&ui, id, "Couldn't edit message"),
+        }
+    });
+}
+
+/// READY: show the app; drafts belong to user `me`.
+pub fn logged_in(ui: &Weak<AppWindow>, me: Option<Id>) {
+    with_ui(ui, move |ui| {
+        ui.set_logged_in(true);
+        if let Some(me) = me {
+            ui.invoke_session_user(me.to_string().into());
         }
     });
 }

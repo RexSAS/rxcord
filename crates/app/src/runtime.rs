@@ -329,7 +329,7 @@ impl Runtime {
         let changes = self.store.apply(&ev);
         if ready {
             tracing::info!(guilds = self.store.guilds().len(), "READY");
-            self.with_ui(|ui| ui.set_logged_in(true));
+            bridge::logged_in(&self.ui, self.store.me().map(|u| u.id));
             // READY drops stored messages; refetch the open channel. Older pages still in flight are stale.
             self.nav.reset_history();
             if let Some(id) = self.nav.selected

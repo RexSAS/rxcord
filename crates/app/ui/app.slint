@@ -45,6 +45,8 @@ export component AppWindow inherits Window {
     in-out property <string> reply-author;
     in-out property <string> edit-id;
     in-out property <string> edit-stash;
+    // composer text when the edit was submitted (Rust only)
+    in-out property <string> edit-submitted;
     in-out property <string> composer-error;
     in-out property <string> row-error-id;
     in property <string> row-error;
@@ -57,6 +59,8 @@ export component AppWindow inherits Window {
     callback switch-draft(string /*text*/, string /*to*/) -> string;
     // unsent text of an ended session, added to that channel's draft
     callback restore-draft(string /*channel*/, string /*text*/);
+    // READY for user id: drafts of another account are dropped
+    callback session-user(string);
 
     changed selected-channel => {
         composer.cancel();

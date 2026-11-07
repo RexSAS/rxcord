@@ -73,6 +73,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let drafts = Rc::new(RefCell::new(compose::Drafts::default()));
     let d = drafts.clone();
     ui.on_switch_draft(move |text, to| d.borrow_mut().switch(text.into(), id(to)).into());
+    let d = drafts.clone();
+    ui.on_session_user(move |me| {
+        if let Some(me) = id(me) {
+            d.borrow_mut().set_user(me);
+        }
+    });
     let w = ui.as_weak();
     ui.on_restore_draft(move |ch, text| {
         let (Some(ui), Some(ch)) = (w.upgrade(), id(ch)) else { return };
@@ -105,6 +111,7 @@ fn send(ui: &AppWindow, tx: &tokio::sync::mpsc::UnboundedSender<Command>, text: 
     };
     ui.set_composer_error("".into());
     if let Some(message) = id(ui.get_edit_id()) {
+        ui.set_edit_submitted(text.into()); // see `compose::after_edit`
         let _ = tx.send(Command::Edit { channel, message, content });
         return;
     }

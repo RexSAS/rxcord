@@ -65,11 +65,26 @@ fn join(a: &str, b: &str) -> String {
 /// Per-channel composer drafts (UI thread). `current` is the channel whose draft the composer shows.
 #[derive(Default)]
 pub struct Drafts {
+    /// The user the saved drafts belong to.
+    owner: Option<Id>,
     current: Option<Id>,
     saved: HashMap<Id, String>,
 }
 
+/// Composer text after a successful edit: the draft stashed when the edit began, unless the user typed
+/// after submitting; then nothing is overwritten (the stash goes in front of what they typed).
+pub fn after_edit(composer: &str, submitted: &str, stash: &str) -> String {
+    if composer == submitted { stash.to_string() } else { join(stash, composer) }
+}
+
 impl Drafts {
+    /// A session for user `me` started: another account's drafts are dropped, the same user's kept.
+    pub fn set_user(&mut self, me: Id) {
+        if self.owner.replace(me) != Some(me) {
+            self.saved.clear();
+        }
+    }
+
     /// The composer moves to channel `to`: `text` is kept as the old channel's draft; returns `to`'s draft.
     pub fn switch(&mut self, text: String, to: Option<Id>) -> String {
         if to == self.current {
@@ -109,6 +124,27 @@ mod tests {
         let pending = [p("1", 7, "a", true), p("2", 8, "b", false), p("3", 7, "c\nd", false)];
         assert_eq!(unsent_drafts(&pending), vec![(Id(7), "a\n\nc\nd".to_string()), (Id(8), "b".to_string())]);
         assert_eq!(unsent_drafts(&[]), vec![]);
+    }
+
+    #[test]
+    fn edit_success_keeps_typed_text() {
+        assert_eq!(after_edit("fixed", "fixed", "my draft"), "my draft");
+        assert_eq!(after_edit("fixed", "fixed", ""), "");
+        assert_eq!(after_edit("fixed more", "fixed", ""), "fixed more", "typed during the PATCH");
+        assert_eq!(after_edit("fixed more", "fixed", "my draft"), "my draft\n\nfixed more");
+    }
+
+    #[test]
+    fn drafts_scoped_to_user() {
+        let mut d = Drafts::default();
+        d.set_user(Id(1));
+        d.switch(String::new(), Some(Id(7)));
+        d.switch("mine".into(), None); // logout
+        d.set_user(Id(1)); // same user again: kept
+        assert_eq!(d.switch(String::new(), Some(Id(7))), "mine");
+        d.switch("mine".into(), None);
+        d.set_user(Id(2)); // another account: dropped
+        assert_eq!(d.switch(String::new(), Some(Id(7))), "");
     }
 
     #[test]
