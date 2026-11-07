@@ -3,6 +3,7 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::fmt;
+use std::time::Duration;
 
 const BASE: &str = "https://discord.com/api/v9";
 const MAX_RETRIES: u32 = 3;
@@ -41,7 +42,7 @@ impl Rest {
     }
 
     pub fn with_base(token: String, base: String) -> Self {
-        Self { http: reqwest::Client::new(), base, token, limiter: RateLimiter::default() }
+        Self { http: client_builder().build().expect("http client"), base, token, limiter: RateLimiter::default() }
     }
 
     pub async fn messages(&self, channel: Id, before: Option<Id>, limit: u8) -> Result<Vec<Message>, ApiError> {
@@ -126,6 +127,11 @@ impl Rest {
             }
         }
     }
+}
+
+/// Shared timeouts so a dead network never hangs a request forever.
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30))
 }
 
 fn encode(q: &[(&str, String)]) -> String {

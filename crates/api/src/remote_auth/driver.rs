@@ -101,7 +101,7 @@ async fn exchange_ticket(proto: &RaProtocol, ticket: &str) -> Result<String, Api
         headers.insert(HeaderName::from_bytes(k.as_bytes()).map_err(fail)?, HeaderValue::from_str(&v).map_err(fail)?);
     }
     // No Authorization header: the user is not logged in yet.
-    let resp = reqwest::Client::builder()
+    let resp = crate::rest::client_builder()
         .default_headers(headers)
         .build()?
         .post(LOGIN_URL)
