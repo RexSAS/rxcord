@@ -5,12 +5,23 @@ use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
 use std::{fmt, time::Duration};
 
-#[derive(Debug)]
 pub enum Action {
     Send(String),
     Dispatch(Event),
     Reconnect { resume: bool },
     AuthFailed,
+}
+
+// Send carries Identify/Resume (with the token), so its payload is never printed.
+impl fmt::Debug for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Action::Send(s) => write!(f, "Send(<{} bytes redacted>)", s.len()),
+            Action::Dispatch(e) => f.debug_tuple("Dispatch").field(e).finish(),
+            Action::Reconnect { resume } => f.debug_struct("Reconnect").field("resume", resume).finish(),
+            Action::AuthFailed => f.write_str("AuthFailed"),
+        }
+    }
 }
 
 pub struct Session {
@@ -155,6 +166,19 @@ impl Session {
             tracing::warn!("dispatch {name} without data");
             return vec![];
         };
+        // seq must track every dispatch, even ones we cannot parse.
+        if seq.is_some() {
+            self.seq = seq;
+        }
+        if name == "READY" {
+            match serde_json::from_str::<ReadyInfo>(d.get()) {
+                Ok(r) => {
+                    self.session_id = Some(r.session_id);
+                    self.resume_url = Some(r.resume_gateway_url);
+                }
+                Err(e) => tracing::warn!("READY without session info: {e}"),
+            }
+        }
         let event = match parse_dispatch(name, d) {
             Ok(e) => e,
             Err(e) => {
@@ -162,15 +186,6 @@ impl Session {
                 return vec![];
             }
         };
-        if seq.is_some() {
-            self.seq = seq;
-        }
-        if name == "READY"
-            && let Ok(r) = serde_json::from_str::<ReadyInfo>(d.get())
-        {
-            self.session_id = Some(r.session_id);
-            self.resume_url = Some(r.resume_gateway_url);
-        }
         vec![Action::Dispatch(event)]
     }
 }
@@ -272,6 +287,32 @@ mod tests {
         assert!(matches!(s.on_close(None), Action::Reconnect { resume: true }));
         assert!(matches!(s.on_close(Some(4007)), Action::Reconnect { resume: false }));
         assert_eq!(s.resume_url(), None);
+    }
+
+    #[test]
+    fn action_debug_redacts_token() {
+        let mut s = Session::new(TOKEN.into());
+        let a = s.on_text(&hello());
+        assert!(!format!("{a:?}").contains(TOKEN));
+    }
+
+    #[test]
+    fn malformed_dispatch_still_advances_seq() {
+        let mut s = ready_session();
+        let bad = json!({"op":0,"t":"MESSAGE_CREATE","s":9,"d":"bad"});
+        assert!(s.on_text(&bad.to_string()).is_empty());
+        let a = s.on_text(&hello());
+        assert_eq!(sent(&a, 0)["d"]["seq"], 9);
+    }
+
+    #[test]
+    fn ready_session_info_survives_bad_ready_body() {
+        let mut s = Session::new(TOKEN.into());
+        let r = json!({"op":0,"t":"READY","s":3,"d":{"user":"bad","session_id":"sess","resume_gateway_url":"wss://r"}});
+        assert!(s.on_text(&r.to_string()).is_empty());
+        assert_eq!(s.resume_url(), Some("wss://r"));
+        let v = sent(&s.on_text(&hello()), 0);
+        assert_eq!((v["op"].as_u64(), v["d"]["seq"].as_u64()), (Some(6), Some(3)));
     }
 
     #[test]

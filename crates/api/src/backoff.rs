@@ -2,6 +2,7 @@ use std::time::Duration;
 
 /// `min(2^attempt, 60)` seconds scaled by `0.5 + 0.5 * jitter` (jitter in [0,1)).
 pub fn backoff(attempt: u32, jitter: f64) -> Duration {
+    let jitter = if jitter.is_nan() { 0.0 } else { jitter.clamp(0.0, 1.0) };
     let secs = 2u64.saturating_pow(attempt).min(60) as f64;
     Duration::from_secs_f64(secs * (0.5 + 0.5 * jitter))
 }
