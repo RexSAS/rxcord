@@ -17,6 +17,9 @@ pub enum ApiError {
     Network(#[from] reqwest::Error),
     #[error("decode: {0}")]
     Decode(#[from] serde_json::Error),
+    /// QR login failed outside HTTP: protocol error, cancel, timeout, or socket closed.
+    #[error("remote auth: {0}")]
+    RemoteAuth(String),
 }
 
 pub struct Rest {

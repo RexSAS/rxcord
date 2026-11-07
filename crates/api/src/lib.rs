@@ -12,3 +12,4 @@ pub mod nonce;
 pub mod ratelimit;
 pub mod rest;
 pub use rest::{ApiError, Rest};
+pub mod remote_auth;
