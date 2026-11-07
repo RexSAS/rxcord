@@ -2,7 +2,7 @@
 use crate::markdown::{Block, Span};
 use crate::nav::Nav;
 use crate::settings::Settings;
-use crate::voice::Bar;
+use crate::voice::{Bar, changed};
 use crate::images::ThumbUpdate;
 use crate::view::{self, ChannelRow, MessageRow, Thumb, TreeRow};
 use crate::{AppWindow, FileItem, MessageItem, TabItem, ThumbItem, TreeItem};
@@ -122,25 +122,37 @@ pub fn row_note(ui: &Weak<AppWindow>, id: Id, msg: String, ok: bool, open: Optio
     });
 }
 
-/// Tree and tabs. Rows that didn't change aren't touched, so a busy server doesn't redraw the tree.
+/// Tree and tabs. Rows that didn't change aren't touched, so a busy server doesn't redraw the tree;
+/// when nothing changed the UI thread isn't woken at all.
 pub fn push_tree(ui: &Weak<AppWindow>, s: &Store, nav: &mut Nav) {
     let rows = view::tree_rows(s, &nav.expanded, &nav.forbidden, &nav.speaking, &nav.settings);
-    let tabs: Vec<TabItem> = view::tab_rows(s, nav.tabs.ids()).into_iter().map(tab_item).collect();
-    let edits: Option<Vec<(usize, TreeRow)>> = (rows.len() == nav.tree.len())
-        .then(|| rows.iter().enumerate().filter(|(i, r)| nav.tree[*i] != **r).map(|(i, r)| (i, r.clone())).collect());
-    let full = edits.is_none().then(|| rows.clone());
-    nav.tree = rows;
+    let tabs = view::tab_rows(s, nav.tabs.ids());
+    let Some((full, edits, tabs)) = tree_changes(nav, rows, tabs) else { return };
     with_ui(ui, move |ui| {
         let m = ui.get_tree();
         match (full, m.as_any().downcast_ref::<VecModel<TreeItem>>()) {
-            (None, Some(vm)) => edits.into_iter().flatten().for_each(|(i, r)| vm.set_row_data(i, tree_item(r))),
+            (None, Some(vm)) => edits.into_iter().for_each(|(i, r)| vm.set_row_data(i, tree_item(r))),
             (Some(rows), Some(vm)) => vm.set_vec(rows.into_iter().map(tree_item).collect::<Vec<_>>()),
             _ => {}
         }
-        if ui.get_tabs().iter().ne(tabs.iter().cloned()) {
-            ui.set_tabs(model(tabs));
+        if let Some(tabs) = tabs {
+            ui.set_tabs(model(tabs.into_iter().map(tab_item).collect()));
         }
     });
+}
+
+/// Against what the UI holds (which then becomes `rows`/`tabs`): (the whole tree when its length
+/// changed, else the changed rows; the tabs if they changed). None: nothing to push.
+#[allow(clippy::type_complexity)]
+fn tree_changes(nav: &mut Nav, rows: Vec<TreeRow>, tabs: Vec<ChannelRow>) -> Option<(Option<Vec<TreeRow>>, Vec<(usize, TreeRow)>, Option<Vec<ChannelRow>>)> {
+    let full = (rows.len() != nav.tree.len()).then(|| rows.clone());
+    let edits: Vec<(usize, TreeRow)> = match full {
+        Some(_) => vec![],
+        None => rows.iter().enumerate().filter(|(i, r)| nav.tree[*i] != **r).map(|(i, r)| (i, r.clone())).collect(),
+    };
+    nav.tree = rows;
+    let tabs = changed(&mut nav.tab_rows, tabs);
+    (full.is_some() || !edits.is_empty() || tabs.is_some()).then_some((full, edits, tabs))
 }
 
 /// The voice bar (text "" hides it).
@@ -507,6 +519,21 @@ fn qr_pixels(url: &str) -> SharedPixelBuffer<Rgba8Pixel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_tree_and_tabs_are_not_pushed() {
+        let ch = |id: u64, unread: bool| ChannelRow { id: Id(id), name: "c".into(), kind: 0, unread, mentions: 0, enabled: true };
+        let row = |id: u64, unread: bool| TreeRow { node: false, depth: 1, expanded: false, row: ch(id, unread), member: None };
+        let mut nav = Nav::default();
+        assert!(tree_changes(&mut nav, vec![], vec![]).is_none(), "empty UI, nothing to show");
+        let (full, edits, tabs) = tree_changes(&mut nav, vec![row(1, false), row(2, false)], vec![ch(1, false)]).unwrap();
+        assert_eq!((full.map(|f| f.len()), edits.len(), tabs.map(|t| t.len())), (Some(2), 0, Some(1)), "first push: everything");
+        assert!(tree_changes(&mut nav, vec![row(1, false), row(2, false)], vec![ch(1, false)]).is_none(), "same again: no wakeup");
+        let (full, edits, tabs) = tree_changes(&mut nav, vec![row(1, false), row(2, true)], vec![ch(1, false)]).unwrap();
+        assert_eq!((full, edits.iter().map(|e| e.0).collect::<Vec<_>>(), tabs), (None, vec![1], None), "one row edited");
+        let (full, edits, tabs) = tree_changes(&mut nav, vec![row(1, false), row(2, true)], vec![ch(1, true)]).unwrap();
+        assert_eq!((full, edits.len(), tabs.map(|t| t[0].unread)), (None, 0, Some(true)), "only the tabs");
+    }
 
     #[test]
     fn body_has_header_code_lines_and_edited_mark() {

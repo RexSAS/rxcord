@@ -866,6 +866,9 @@ impl Runtime {
                 return self.push_voice();
             }
             ConnIn::Event(VoiceEvent::Status(s)) => {
+                if s == VoiceStatus::Connected {
+                    self.voice.voice_up();
+                }
                 conn.status = s;
                 return self.push_voice();
             }

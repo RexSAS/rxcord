@@ -1,6 +1,6 @@
 //! Per-session navigation state and the pure rules for history paging and read acks.
 use crate::settings::Settings;
-use crate::view::{MessageRow, TreeRow};
+use crate::view::{ChannelRow, MessageRow, TreeRow};
 use rxcord_api::ApiError;
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
@@ -95,6 +95,7 @@ pub struct Nav {
     pub selected: Option<Id>,
     pub at_bottom: bool,
     pub tree: Vec<TreeRow>, // what the UI's tree model holds
+    pub tab_rows: Vec<ChannelRow>, // what the UI's tabs model holds
     pub shown: Vec<MessageRow>, // what the UI's message model holds
     pub shown_channel: Option<Id>,
     /// Bumped on READY: history responses from an older generation are ignored entirely.

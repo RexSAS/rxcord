@@ -390,6 +390,9 @@ impl Voice {
                     self.send_opus(&f);
                 }
                 In::Cmd(VoiceCmd::Speaking(on)) => {
+                    if self.transport.is_none() {
+                        continue; // no ssrc yet: Ready resets `speaking` and the first frame sends op 5
+                    }
                     self.speaking = on;
                     queue.push_back(self.session.speaking(on));
                 }
@@ -628,12 +631,21 @@ mod tests {
 
     /// Identify → Hello → Ready → IP discovery → Select Protocol → Session Description → Connected.
     async fn handshake(f: &mut Fake) {
+        handshake_dave(f, 0).await;
+    }
+
+    async fn handshake_dave(f: &mut Fake, dave: u16) {
         let id = recv_json(&mut f.ws).await;
         assert_eq!(id["op"], 0);
         assert_eq!(
             id["d"]["max_dave_protocol_version"],
             davey::DAVE_PROTOCOL_VERSION
         );
+        after_identify(f, dave).await;
+    }
+
+    /// The handshake from Hello on.
+    async fn after_identify(f: &mut Fake, dave: u16) {
         send_json(
             &mut f.ws,
             json!({"op": 8, "d": {"heartbeat_interval": 30000.0}}),
@@ -665,7 +677,7 @@ mod tests {
         send_json(
             &mut f.ws,
             json!({"op": 4, "d": {"mode": "aead_aes256_gcm_rtpsize", "secret_key": KEY,
-            "dave_protocol_version": 0}}),
+            "dave_protocol_version": dave}}),
         )
         .await;
         wait_event(&mut f.events, |e| {
@@ -760,6 +772,36 @@ mod tests {
         assert_eq!(
             (sp["op"].clone(), sp["d"]["speaking"].clone()),
             (json!(5), json!(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn speaking_before_ready_is_dropped() {
+        let mut f = start().await;
+        assert_eq!(recv_json(&mut f.ws).await["op"], 0);
+        f.cmds.send(VoiceCmd::Speaking(true)).await.unwrap(); // no ssrc yet
+        tokio::time::sleep(Duration::from_millis(100)).await; // the idle driver takes it now
+        after_identify(&mut f, 0).await; // asserts Select Protocol is the next text after Identify
+        f.cmds.send(VoiceCmd::Opus(vec![1])).await.unwrap();
+        let sp = recv_json(&mut f.ws).await;
+        assert_eq!((sp["op"].clone(), sp["d"]["ssrc"].clone()), (json!(5), json!(1)), "op 5 only once connected, with our ssrc");
+    }
+
+    #[tokio::test]
+    async fn dave_key_package_after_session_description() {
+        let mut f = start().await;
+        handshake_dave(&mut f, 1).await;
+        let kp = loop {
+            if let Message::Binary(b) = timeout(T, f.ws.next()).await.unwrap().unwrap().unwrap() {
+                break b;
+            }
+        };
+        assert!(kp.len() > 1 && kp[0] == 26, "binary op 26 with our key package");
+        f.cmds.send(VoiceCmd::Opus(vec![1, 2, 3])).await.unwrap();
+        let mut buf = [0u8; 256];
+        assert!(
+            timeout(Duration::from_millis(300), f.udp.recv(&mut buf)).await.is_err(),
+            "no media before the DAVE group is ready"
         );
     }
 

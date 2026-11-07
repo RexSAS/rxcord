@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// After a close 4014 the main gateway may still bring a move or a new server; we wait this long.
+const FOLLOW_WINDOW: Duration = Duration::from_secs(5);
 /// An unanswered incoming call stops ringing here.
 pub const RING_TIMEOUT: Duration = Duration::from_secs(45);
 /// How often a lost or missing device is tried again.
@@ -54,8 +56,10 @@ struct Target {
     connected: bool,
     /// Join gives up at this time unless connected.
     deadline: Instant,
-    /// The voice session went invalid and we already asked Discord again (Ruling R3: once).
+    /// The voice session went invalid and we already asked Discord again (Ruling R3: once until it works).
     rejoined: bool,
+    /// The voice server closed with 4014: waiting `FOLLOW_WINDOW` for a move or a new server.
+    dropped: bool,
 }
 
 #[derive(Default)]
@@ -128,7 +132,7 @@ impl Controller {
         if self.connected() {
             fx.push(Effect::Disconnect);
         }
-        self.target = Some(Target { guild, channel, ring: false, session: None, server: None, connected: false, deadline: now + JOIN_TIMEOUT, rejoined: false });
+        self.target = Some(Target { guild, channel, ring: false, session: None, server: None, connected: false, deadline: now + JOIN_TIMEOUT, rejoined: false, dropped: false });
         fx.push(self.op4(guild, Some(channel)));
         fx
     }
@@ -161,46 +165,62 @@ impl Controller {
         let mut fx = vec![];
         match ev {
             Event::VoiceStateUpdate(v) if v.user_id == me && v.channel_id == Some(t.channel) => {
-                t.session = Some(v.session_id.clone());
                 if std::mem::take(&mut t.ring) {
                     fx.push(Effect::Ring(t.channel));
                 }
                 // replayed after a main-gateway reconnect (READY/RESUMED): the connection keeps going
-                if t.connected {
+                if t.connected && t.session.as_ref() == Some(&v.session_id) {
                     return fx;
                 }
+                // a re-identify gave us a new session: the next server update restarts the driver with it
+                if t.connected {
+                    (t.server, t.rejoined) = (None, false);
+                }
+                t.session = Some(v.session_id.clone());
             }
             // Moved by a moderator (or another client of ours) within the guild: follow. Discord sends a
             // VOICE_SERVER_UPDATE with the move; forgetting the server makes it restart the driver for the new
             // channel even on the same endpoint. // VERIFY LIVE
-            Event::VoiceStateUpdate(v) if v.user_id == me && t.connected && t.guild.is_some() && v.guild_id == t.guild && v.channel_id.is_some_and(|c| c != t.channel) => {
-                (t.channel, t.session, t.server) = (v.channel_id.unwrap_or(t.channel), Some(v.session_id.clone()), None);
-                return fx;
+            // After a 4014 the driver is gone already: any server update starts it.
+            Event::VoiceStateUpdate(v) if v.user_id == me && (t.connected || t.dropped) && t.guild.is_some() && v.guild_id == t.guild && v.channel_id.is_some_and(|c| c != t.channel) => {
+                (t.channel, t.session) = (v.channel_id.unwrap_or(t.channel), Some(v.session_id.clone()));
+                if t.connected {
+                    t.server = None;
+                    return fx;
+                }
             }
             // Disconnected by a moderator or another client of ours. While still joining it may be the
             // echo of leaving the previous channel, so only a live connection counts, and only for our
             // guild (or call): leaving a server's voice for a DM call removes the server's state late.
-            Event::VoiceStateUpdate(v) if v.user_id == me && v.channel_id.is_none() && v.guild_id == t.guild && t.connected => {
+            Event::VoiceStateUpdate(v) if v.user_id == me && v.channel_id.is_none() && v.guild_id == t.guild && (t.connected || t.dropped) => {
                 self.target = None;
                 return vec![Effect::Disconnect, Effect::Notice("Disconnected from voice")];
             }
             // endpoint null: the server is still being allocated, another update follows
             Event::VoiceServerUpdate(s) if s.guild_id.or(s.channel_id) == Some(server_id) && s.endpoint.is_some() => {
                 let endpoint = s.endpoint.clone().unwrap_or_default();
-                // Same endpoint while connected: a main-gateway reconnect replaying op 4; the voice
+                // Same server while connected: a main-gateway reconnect replaying op 4; the voice
                 // connection keeps going. // VERIFY LIVE
-                if t.connected && t.server.as_ref().is_some_and(|(_, e)| *e == endpoint) {
+                let server = (s.token.clone(), endpoint);
+                if t.connected && t.server.as_ref() == Some(&server) {
                     return fx;
                 }
-                t.server = Some((s.token.clone(), endpoint));
+                t.server = Some(server);
             }
             _ => return fx,
         }
         let (Some(session), Some((token, endpoint))) = (&t.session, &t.server) else { return fx };
         let connect = Connect { server_id: server_id.0, user_id: me.0, session_id: session.clone(), token: token.clone(), endpoint: endpoint.clone() };
-        t.connected = true;
+        (t.connected, t.dropped) = (true, false);
         fx.push(Effect::Connect { connect, channel: t.channel });
         fx
+    }
+
+    /// The driver reached Ready (or resumed): a later invalid session may rejoin again.
+    pub fn voice_up(&mut self) {
+        if let Some(t) = &mut self.target {
+            t.rejoined = false;
+        }
     }
 
     /// The pending join timed out (no answer from Discord): give up.
@@ -208,8 +228,9 @@ impl Controller {
         if self.deadline().is_none_or(|d| now < d) {
             return vec![];
         }
+        let dropped = self.target.as_ref().is_some_and(|t| t.dropped);
         let mut fx = self.hang_up();
-        fx.push(Effect::Notice("Couldn't join voice: Discord didn't answer"));
+        fx.push(Effect::Notice(if dropped { "Disconnected from voice" } else { "Couldn't join voice: Discord didn't answer" }));
         fx
     }
 
@@ -224,6 +245,14 @@ impl Controller {
             (t.rejoined, t.session, t.server, t.connected, t.deadline) = (true, None, None, false, now + JOIN_TIMEOUT);
             let (guild, channel) = (t.guild, t.channel);
             return vec![Effect::Disconnect, self.op4(guild, Some(channel))];
+        }
+        // 4014 is also how a moderator move or a voice server change closes the old socket, and the main
+        // gateway's updates for it may come after: no op 4 null yet, `expire` hangs up if nothing comes.
+        if let (LeaveReason::Kicked, Some(t)) = (reason, self.target.as_mut())
+            && t.connected
+        {
+            (t.connected, t.dropped, t.server, t.deadline) = (false, true, None, now + FOLLOW_WINDOW);
+            return vec![Effect::Disconnect];
         }
         let mut fx = self.hang_up();
         if fx.is_empty() {
@@ -1009,10 +1038,64 @@ mod tests {
     }
 
     #[test]
+    fn closed_4014_then_moved_follows() {
+        let (mut c, t0) = (Controller::default(), Instant::now());
+        connected_to(&mut c, A, t0);
+        assert_eq!(names(c.left(&LeaveReason::Kicked, t0)), ["disconnect"], "no op 4 null: the move's updates may still come");
+        assert_eq!((c.channel(), c.connected(), c.deadline()), (Some((Some(G), A)), false, Some(t0 + FOLLOW_WINDOW)));
+        let moved = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": B.to_string(), "guild_id": G.to_string(), "session_id": "sess2"}));
+        assert!(names(c.event(&moved, ME)).is_empty(), "waits for the new server");
+        assert_eq!(c.channel(), Some((Some(G), B)));
+        assert_eq!(names(c.event(&server(Some("v.discord.media")), ME)), ["connect 101 10 1 sess2 tok v.discord.media"]);
+        assert!(c.connected() && c.deadline().is_none());
+        // a voice server change: only the server update follows the 4014
+        assert_eq!(names(c.left(&LeaveReason::Kicked, t0)), ["disconnect"]);
+        assert_eq!(names(c.event(&server(Some("other")), ME)), ["connect 101 10 1 sess2 tok other"]);
+        // a real kick: our state goes null within the window
+        assert_eq!(names(c.left(&LeaveReason::Kicked, t0)), ["disconnect"]);
+        assert_eq!(names(c.event(&state(ME, None), ME)), ["disconnect", "notice Disconnected from voice"]);
+        assert_eq!(c.channel(), None);
+    }
+
+    #[test]
+    fn closed_4014_alone_hangs_up_after_the_window() {
+        let (mut c, t0) = (Controller::default(), Instant::now());
+        connected_to(&mut c, A, t0);
+        assert_eq!(names(c.left(&LeaveReason::Kicked, t0)), ["disconnect"]);
+        assert!(names(c.expire(t0 + Duration::from_secs(4))).is_empty());
+        assert_eq!(names(c.expire(t0 + FOLLOW_WINDOW)), ["op4 10 null", "notice Disconnected from voice"]);
+        assert_eq!(c.channel(), None);
+    }
+
+    #[test]
+    fn main_gateway_reidentify_restarts_the_driver() {
+        let (mut c, now) = (Controller::default(), Instant::now());
+        connected_to(&mut c, A, now);
+        let fresh = ev("VOICE_STATE_UPDATE", json!({"user_id": "1", "channel_id": A.to_string(), "guild_id": G.to_string(), "session_id": "sess2"}));
+        assert!(names(c.event(&fresh, ME)).is_empty(), "new session: waits for its server update");
+        let srv = ev("VOICE_SERVER_UPDATE", json!({"token": "tok2", "guild_id": G.to_string(), "endpoint": "v.discord.media"}));
+        assert_eq!(names(c.event(&srv, ME)), ["connect 100 10 1 sess2 tok2 v.discord.media"], "same endpoint, new token: restart");
+        assert!(names(c.event(&fresh, ME)).is_empty() && names(c.event(&srv, ME)).is_empty(), "replays kept");
+        assert!(c.connected());
+    }
+
+    #[test]
+    fn session_invalid_twice_in_a_call_recovers_both_times() {
+        let (mut c, t0) = (Controller::default(), Instant::now());
+        connected_to(&mut c, A, t0);
+        for _ in 0..2 {
+            assert_eq!(names(c.left(&LeaveReason::SessionInvalid, t0)), ["disconnect", "op4 10 100"]);
+            c.event(&state(ME, Some(A)), ME);
+            assert_eq!(names(c.event(&server(Some("v.discord.media")), ME)), ["connect 100 10 1 sess tok v.discord.media"]);
+            c.voice_up();
+        }
+    }
+
+    #[test]
     fn kicked_or_lost_leaves_once() {
         let (mut c, now) = (Controller::default(), Instant::now());
         connected_to(&mut c, A, now);
-        assert_eq!(names(c.left(&LeaveReason::Kicked, now)), ["disconnect", "op4 10 null", "notice Disconnected from voice"]);
+        assert_eq!(names(c.left(&LeaveReason::Fatal(0), now)), ["disconnect", "op4 10 null", "notice Voice connection lost"]);
         connected_to(&mut c, A, now);
         assert_eq!(names(c.event(&state(ME, None), ME)), ["disconnect", "notice Disconnected from voice"]);
         assert_eq!(c.channel(), None);
