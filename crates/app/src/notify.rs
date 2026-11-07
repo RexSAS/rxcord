@@ -23,10 +23,10 @@ pub fn notification_text(msg: &Message, store: &Store) -> (String, String) {
     (title, body)
 }
 
-/// "📞 Name is calling": the DM's name (the other person, or the group).
+/// "☎ Name is calling": the DM's name (the other person, or the group).
 pub fn call_title(store: &Store, channel: Id) -> String {
     let name = store.channel(channel).map(|c| crate::view::channel_row(store, c).name).unwrap_or_default();
-    format!("📞 {name} is calling")
+    format!("☎ {name} is calling")
 }
 
 /// Fire-and-forget: notify-rust does D-Bus I/O on Linux, so keep it off the runtime. Errors (no daemon) are only logged.
@@ -127,14 +127,14 @@ mod tests {
     #[test]
     fn call_title_names_the_dm() {
         let mut s = store(true);
-        assert_eq!(call_title(&s, CH), "📞 general is calling");
+        assert_eq!(call_title(&s, CH), "☎ general is calling");
         let r: Ready = serde_json::from_value(serde_json::json!({
             "user": {"id": "1", "username": "me"}, "users": [{"id": "2", "username": "bob", "global_name": "Bob"}],
             "private_channels": [{"id": "100", "type": 1, "recipient_ids": ["2"]}], "guilds": [],
         }))
         .unwrap();
         s.apply(&Event::Ready(Box::new(r)));
-        assert_eq!(call_title(&s, CH), "📞 Bob is calling");
+        assert_eq!(call_title(&s, CH), "☎ Bob is calling");
     }
 
     #[test]

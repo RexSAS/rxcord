@@ -247,7 +247,7 @@ export component AppWindow inherits Window {
                         opacity: root.voice-level ? 1.0 : 0.25;
                     }
                     mic := TouchArea {
-                        width: 22px;
+                        width: 34px;
                         accessible-role: button;
                         accessible-label: root.voice-muted ? "Unmute" : "Mute";
                         accessible-action-default => { root.toggle-mute(); }
@@ -256,14 +256,16 @@ export component AppWindow inherits Window {
                             border-radius: 3px;
                             background: root.voice-muted ? #ed424570 : transparent;
                             Text {
-                                text: "🎤";
+                                text: "Mic"; // the software renderer has no color emoji
+                                horizontal-alignment: center;
+                                font-size: 11px;
                                 vertical-alignment: center;
                                 opacity: mic.has-hover || root.voice-muted ? 1.0 : 0.7;
                             }
                         }
                     }
                     deaf := TouchArea {
-                        width: 22px;
+                        width: 40px;
                         accessible-role: button;
                         accessible-label: root.voice-deafened ? "Undeafen" : "Deafen";
                         accessible-action-default => { root.toggle-deafen(); }
@@ -272,7 +274,9 @@ export component AppWindow inherits Window {
                             border-radius: 3px;
                             background: root.voice-deafened ? #ed424570 : transparent;
                             Text {
-                                text: "🎧";
+                                text: "Audio";
+                                horizontal-alignment: center;
+                                font-size: 11px;
                                 vertical-alignment: center;
                                 opacity: deaf.has-hover || root.voice-deafened ? 1.0 : 0.7;
                             }

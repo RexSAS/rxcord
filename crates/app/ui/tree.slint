@@ -75,7 +75,7 @@ export component Tree inherits Rectangle {
                 }
                 if it.member: Text {
                     horizontal-stretch: 1;
-                    text: it.name + (it.muted ? " 🔇" : "") + (it.deafened ? " 🎧" : "") + (it.muted-for-me ? " 🔕" : "");
+                    text: it.name + (it.muted ? " · muted" : "") + (it.deafened ? " · deaf" : "") + (it.muted-for-me ? " · muted for you" : "");
                     vertical-alignment: center;
                     overflow: elide;
                     font-size: 12px;

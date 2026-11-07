@@ -99,7 +99,7 @@ export component MessageRow inherits VerticalLayout {
             for f in root.msg.files: HorizontalLayout {
                 alignment: start;
                 Action {
-                    text: "📎 " + f.name;
+                    text: "↓ " + f.name;
                     clicked => { root.open-url(f.url); }
                 }
             }

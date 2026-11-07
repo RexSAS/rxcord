@@ -908,8 +908,8 @@ impl Runtime {
                 k => {
                     let problems = k.as_ref().map_or(vec!["Connecting…"], |k| k.problems());
                     // DAVE's privacy code, to compare with the others' clients
-                    let code = k.as_ref().and_then(|k| k.privacy.as_ref()).map(|c| format!("🔒 {c}"));
-                    std::iter::once(format!("🔊 {place}")).chain(problems.into_iter().map(String::from)).chain(code).collect::<Vec<_>>().join(" · ")
+                    let code = k.as_ref().and_then(|k| k.privacy.as_ref()).map(|c| format!("E2EE {c}"));
+                    std::iter::once(format!("♪ {place}")).chain(problems.into_iter().map(String::from)).chain(code).collect::<Vec<_>>().join(" · ")
                 }
             }
         });
