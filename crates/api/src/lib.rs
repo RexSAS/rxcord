@@ -13,3 +13,4 @@ pub mod ratelimit;
 pub mod rest;
 pub use rest::{ApiError, Rest};
 pub mod remote_auth;
+pub mod update;

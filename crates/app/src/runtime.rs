@@ -35,6 +35,8 @@ pub enum Command {
     Edit { channel: Id, message: Id, content: String },
     Delete { channel: Id, message: Id },
     ThumbVisible(String /*url*/),
+    /// The status bar's "Update" was clicked.
+    InstallUpdate,
     /// Join button of a server invite in message `message` of the active channel.
     JoinInvite { message: Id, code: String },
 }
@@ -72,7 +74,12 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
             let (store, tasks, nav, thumbs) = (Store::new(), JoinSet::new(), Nav::default(), images::Thumbs::new());
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id: String::new() }.run(rx));
+            let (update_tx, update_rx) = mpsc::unbounded_channel();
+            if crate::update::enabled() {
+                rt.spawn(crate::update::run(ui.clone(), update_rx));
+            }
+            let session_id = String::new();
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -92,6 +99,8 @@ struct Runtime {
     last_guild: Arc<AtomicU64>,
     /// Gateway session (from READY); joining an invite sends it.
     session_id: String,
+    /// Asks the updater (update.rs) to install the release it found.
+    update_tx: UnboundedSender<()>,
 }
 
 async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -299,6 +308,7 @@ impl Runtime {
                     Done::Joined { message, code, ctx, captcha: false, result }
                 });
             }
+            Command::InstallUpdate => drop(self.update_tx.send(())),
             Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
         }
     }

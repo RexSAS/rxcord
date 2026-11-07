@@ -12,6 +12,7 @@ mod notify;
 mod runtime;
 mod settings;
 mod token;
+mod update;
 mod view;
 
 use compose::OutgoingError;
@@ -48,25 +49,32 @@ fn main() -> Result<(), slint::PlatformError> {
     let (w, lg) = (ui.as_weak(), last_guild.clone());
     ui.window().on_close_requested(move || {
         if let Some(ui) = w.upgrade() {
-            let win = ui.window();
-            let size = win.size().to_logical(win.scale_factor());
-            let pos = win.position();
-            let g = lg.load(Ordering::Relaxed);
-            settings::save(&settings::Settings {
-                width: size.width,
-                height: size.height,
-                x: Some(pos.x),
-                y: Some(pos.y),
-                tree_height: ui.get_tree_height(),
-                last_guild: (g != 0).then_some(g),
-            });
+            save_settings(&ui, &lg);
         }
         slint::CloseRequestResponse::HideWindow
     });
+    update::cleanup();
     // Window focus, shared with the runtime (acks now, notifications in Task 13). Starts false: winit
     // reports Focused(true) when the window gets focus.
     let focused = Arc::new(AtomicBool::new(false));
-    let tx = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild);
+    let tx = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild.clone());
+    let (t, w) = (tx.clone(), ui.as_weak());
+    ui.on_update_clicked(move |action| match update::parse_click(&action) {
+        Some(update::Click::Install) => drop(t.send(Command::InstallUpdate)),
+        Some(update::Click::Restart) => {
+            if let Some(ui) = w.upgrade() {
+                save_settings(&ui, &last_guild);
+                ui.hide().ok();
+            }
+            update::restart();
+            let _ = slint::quit_event_loop();
+        }
+        None => {
+            if let (Some(ui), Some(url)) = (w.upgrade(), action.strip_prefix("open:")) {
+                ui.invoke_open_url(url.into());
+            }
+        }
+    });
     let t = tx.clone();
     ui.window().on_winit_window_event(move |_, ev| {
         if let WindowEvent::Focused(f) = ev {
@@ -149,6 +157,22 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
     ui.run()
+}
+
+/// Window size/position, divider and last server, for the next start.
+fn save_settings(ui: &AppWindow, last_guild: &AtomicU64) {
+    let win = ui.window();
+    let size = win.size().to_logical(win.scale_factor());
+    let pos = win.position();
+    let g = last_guild.load(Ordering::Relaxed);
+    settings::save(&settings::Settings {
+        width: size.width,
+        height: size.height,
+        x: Some(pos.x),
+        y: Some(pos.y),
+        tree_height: ui.get_tree_height(),
+        last_guild: (g != 0).then_some(g),
+    });
 }
 
 /// Composer submit: a new message leaves the composer at once (it shows as a pending row); an edit keeps

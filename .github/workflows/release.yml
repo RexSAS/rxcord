@@ -1,0 +1,56 @@
+# Push a tag like v0.2.0 (matching crates/app/Cargo.toml's version) to build and publish a release.
+# Each platform's rxcord checks for its own file here (crates/app/src/update.rs: ASSET).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the crate version
+        run: |
+          v=$(grep -m1 '^version' crates/app/Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != crate version v$v"; exit 1; }
+      - name: Create the release
+        run: gh release create "$GITHUB_REF_NAME" --title "rxcord $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: create
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04 # older glibc: the binary runs on more distros
+            asset: rxcord-linux-x86_64
+            bin: target/release/rxcord
+          - os: windows-latest
+            asset: rxcord-windows-x86_64.exe
+            bin: target/release/rxcord.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
+      - name: Rust
+        run: rustup update stable && rustup default stable
+      - name: Test
+        run: cargo test --workspace
+      - name: Build
+        run: cargo build --release -p rxcord
+      - name: Upload
+        shell: bash
+        run: |
+          cp "${{ matrix.bin }}" "${{ matrix.asset }}"
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256"
+        env:
+          GH_TOKEN: ${{ github.token }}

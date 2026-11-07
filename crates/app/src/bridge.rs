@@ -170,6 +170,15 @@ pub fn push_selection(ui: &Weak<AppWindow>, selected: Option<Id>, carry: bool) {
     });
 }
 
+/// The status bar's update entry: `label` ("" hides it) and what clicking does (see `update::parse_click`).
+pub fn update_state(ui: &Weak<AppWindow>, label: String, action: &str) {
+    let action = action.to_string();
+    with_ui(ui, move |ui| {
+        ui.set_update_label(label.into());
+        ui.set_update_action(action.into());
+    });
+}
+
 /// Status bar name.
 pub fn push_me(ui: &Weak<AppWindow>, s: &Store) {
     let name = s.me().map(|u| u.display_name().to_string()).unwrap_or_default();

@@ -154,22 +154,12 @@ impl Rest {
 
     /// CDN fetch: no Authorization, only a User-Agent. A body over `max` bytes is an error.
     pub async fn get_bytes(&self, url: &str, max: usize) -> Result<Vec<u8>, ApiError> {
-        let mut resp = self.http.get(url).header("User-Agent", crate::client_props::user_agent()).send().await?;
+        let resp = self.http.get(url).header("User-Agent", crate::client_props::user_agent()).send().await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(ApiError::Http { status: status.as_u16(), body: String::new() }); // untrusted body: not read
         }
-        if resp.content_length().is_some_and(|n| n > max as u64) {
-            return Err(ApiError::TooLarge(max));
-        }
-        let mut out = vec![];
-        while let Some(chunk) = resp.chunk().await? {
-            if out.len() + chunk.len() > max {
-                return Err(ApiError::TooLarge(max));
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
+        read_capped(resp, max).await
     }
 
     async fn json<T: DeserializeOwned>(&self, m: Method, route: String, path: String, body: Option<Value>) -> Result<T, ApiError> {
@@ -225,6 +215,21 @@ impl Rest {
             }
         }
     }
+}
+
+/// A response body, refusing more than `max` bytes (checked before and while reading).
+pub(crate) async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ApiError> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return Err(ApiError::TooLarge(max));
+    }
+    let mut out = vec![];
+    while let Some(chunk) = resp.chunk().await? {
+        if out.len() + chunk.len() > max {
+            return Err(ApiError::TooLarge(max));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Shared timeouts so a dead network never hangs a request forever.

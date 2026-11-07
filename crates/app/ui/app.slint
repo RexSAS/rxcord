@@ -35,6 +35,10 @@ export component AppWindow inherits Window {
     in property <string> selected-channel;
     // your display name, for the status bar
     in property <string> me-name;
+    // status bar update entry ("" = hidden) and what clicking it does ("install", "restart", "open:<url>", "")
+    in property <string> update-label;
+    in property <string> update-action;
+    callback update-clicked(string);
     // height of the tree above the divider (saved in settings.json)
     in-out property <length> tree-height: 280px;
     // expand/collapse a tree node (guild id or "0" for DMs)
@@ -201,6 +205,21 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         overflow: elide;
                         font-size: 12px;
+                    }
+                    if root.update-label != "": upd := TouchArea {
+                        width: upd-text.preferred-width;
+                        enabled: root.update-action != "";
+                        mouse-cursor: self.enabled ? pointer : default;
+                        accessible-role: button;
+                        accessible-label: root.update-label;
+                        accessible-action-default => { root.update-clicked(root.update-action); }
+                        clicked => { root.update-clicked(root.update-action); }
+                        upd-text := Text {
+                            text: root.update-label;
+                            color: #3ba55c;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
                     }
                     gear := TouchArea {
                         width: 20px;
