@@ -206,7 +206,14 @@ impl Store {
                 self.mark_read(*channel_id, *message_id);
                 vec![Change::Unread(*channel_id)]
             }
-            Event::Resumed | Event::Unknown(_) => vec![],
+            // Voice and call events: handled in Task 6.
+            Event::Resumed
+            | Event::Unknown(_)
+            | Event::VoiceStateUpdate(_)
+            | Event::VoiceServerUpdate(_)
+            | Event::CallCreate(_)
+            | Event::CallUpdate(_)
+            | Event::CallDelete { .. } => vec![],
         }
     }
 

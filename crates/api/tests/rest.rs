@@ -131,3 +131,15 @@ async fn join_invite_sends_captcha_answer() {
     let a = CaptchaAnswer { key: "solved".into(), rqtoken: Some("rq".into()), session_id: None };
     assert!(r.join_invite("abc", "sess", ctx, Some(&a)).await.is_ok());
 }
+
+#[tokio::test]
+async fn ring_bodies() {
+    let s = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/channels/4/call/ring")).and(body_json(json!({"recipients": null})))
+        .respond_with(ResponseTemplate::new(204)).expect(1).mount(&s).await;
+    Mock::given(method("POST")).and(path("/channels/4/call/stop-ringing")).and(body_json(json!({"recipients": ["8"]})))
+        .respond_with(ResponseTemplate::new(204)).expect(1).mount(&s).await;
+    let r = Rest::with_base("tok".into(), s.uri());
+    r.ring(Id(4)).await.unwrap();
+    r.stop_ringing(Id(4), Id(8)).await.unwrap();
+}

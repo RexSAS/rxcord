@@ -1,5 +1,5 @@
 use crate::id::Id;
-use crate::model::{Channel, Guild, Message, MessageUpdate, Ready};
+use crate::model::{Call, Channel, Guild, Message, MessageUpdate, Ready, VoiceServer, VoiceState};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -17,6 +17,11 @@ pub enum Event {
     MessageUpdate(MessageUpdate),
     MessageDelete { id: Id, channel_id: Id },
     MessageAck { channel_id: Id, message_id: Id },
+    VoiceStateUpdate(VoiceState),
+    VoiceServerUpdate(VoiceServer),
+    CallCreate(Call),
+    CallUpdate(Call),
+    CallDelete { channel_id: Id },
     Unknown(String),
 }
 
@@ -61,6 +66,17 @@ pub fn parse_dispatch(name: &str, data: &RawValue) -> Result<Event, serde_json::
         "MESSAGE_ACK" => {
             let x: Ack = serde_json::from_str(d)?;
             Event::MessageAck { channel_id: x.channel_id, message_id: x.message_id }
+        }
+        "VOICE_STATE_UPDATE" => Event::VoiceStateUpdate(serde_json::from_str(d)?),
+        "VOICE_SERVER_UPDATE" => Event::VoiceServerUpdate(serde_json::from_str(d)?),
+        "CALL_CREATE" => Event::CallCreate(serde_json::from_str(d)?),
+        "CALL_UPDATE" => Event::CallUpdate(serde_json::from_str(d)?),
+        "CALL_DELETE" => {
+            #[derive(Deserialize)]
+            struct Gone {
+                channel_id: Id,
+            }
+            Event::CallDelete { channel_id: serde_json::from_str::<Gone>(d)?.channel_id }
         }
         other => Event::Unknown(other.to_string()),
     })

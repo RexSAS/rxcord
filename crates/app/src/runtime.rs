@@ -2,6 +2,7 @@
 use crate::nav::{Ack, DMS_NODE, HISTORY_PAGE, Nav};
 use crate::{AppWindow, bridge, compose, images, notify, token};
 use rxcord_api::event::Event;
+use rxcord_api::gateway::GatewayCmd;
 use rxcord_api::gateway::driver::{ConnStatus, GatewayEvent, run_gateway};
 use rxcord_api::id::Id;
 use rxcord_api::model::Message;
@@ -79,7 +80,7 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>, last_
                 rt.spawn(crate::update::run(ui.clone(), update_rx));
             }
             let session_id = String::new();
-            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx }.run(rx));
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, gw_cmds: None, qr: None, tasks, nav, focused, thumbs, last_guild, session_id, update_tx }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -90,6 +91,8 @@ struct Runtime {
     store: Store,
     rest: Option<Arc<Rest>>,
     gw: Option<mpsc::Receiver<GatewayEvent>>,
+    /// Main-gateway commands (voice state); Task 8 sends on it.
+    gw_cmds: Option<mpsc::Sender<GatewayCmd>>,
     qr: Option<mpsc::Receiver<QrStatus>>,
     /// Session tasks; replacing the set aborts them all (logout, new login).
     tasks: JoinSet<Done>,
@@ -164,9 +167,11 @@ impl Runtime {
         let (tx, rx) = mpsc::channel(256);
         self.rest = Some(Arc::new(Rest::new(token.clone())));
         self.gw = Some(rx);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        self.gw_cmds = Some(cmd_tx);
         self.with_ui(|ui| ui.set_connecting(true)); // until READY shows the app
         self.tasks.spawn(async move {
-            run_gateway(token, tx).await;
+            run_gateway(token, tx, cmd_rx).await;
             Done::Nothing
         });
     }
@@ -175,6 +180,7 @@ impl Runtime {
     fn end_session(&mut self) {
         self.tasks = JoinSet::new();
         self.gw = None;
+        self.gw_cmds = None;
         self.qr = None;
         self.rest = None;
         // Unsent text goes back into the drafts, never auto-sent: the next login may be another account.

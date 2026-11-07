@@ -1,11 +1,11 @@
 //! Async websocket driver around the sans-IO `Session`. Never logs the token or Send payloads.
-use super::session::{Action, Session};
+use super::session::{Action, GatewayCmd, Session};
 use crate::{backoff::reconnect_delay, client_props, event::Event, inflate::Inflater};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::time::Duration;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_tungstenite::{
     connect_async,
@@ -44,8 +44,8 @@ enum Outcome {
 }
 
 /// Typed gateway loop; runs until `AuthFailed`, `Fatal` or `tx` is closed.
-pub async fn run_gateway(token: String, tx: Sender<GatewayEvent>) {
-    run(token, tx, |_| {}, DEFAULT_URL).await;
+pub async fn run_gateway(token: String, tx: Sender<GatewayEvent>, cmds: Receiver<GatewayCmd>) {
+    run(token, tx, cmds, |_| {}, DEFAULT_URL).await;
 }
 
 /// Like `run_gateway` but forwards every raw op-0 frame as (event name, `d`) before typed parsing.
@@ -59,6 +59,7 @@ pub async fn run_gateway_raw(token: String, tx: Sender<(String, Box<RawValue>)>)
     }
     let (etx, mut erx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move { while erx.recv().await.is_some() {} });
+    let (_cmd_tx, cmds) = tokio::sync::mpsc::channel(1); // never used; kept open so the loop idles
     let raw_tx = tx.clone();
     let hook = move |text: &str| {
         if let Ok(Frame { op: 0, t: Some(t), d: Some(d) }) = serde_json::from_str(text) {
@@ -66,7 +67,7 @@ pub async fn run_gateway_raw(token: String, tx: Sender<(String, Box<RawValue>)>)
         }
     };
     tokio::select! {
-        _ = run(token, etx, hook, DEFAULT_URL) => {}
+        _ = run(token, etx, cmds, hook, DEFAULT_URL) => {}
         _ = tx.closed() => {}
     }
 }
@@ -75,7 +76,7 @@ async fn emit(tx: &Sender<GatewayEvent>, ev: GatewayEvent) -> bool {
     tx.send(ev).await.is_ok()
 }
 
-async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&str), url: &str) {
+async fn run(token: String, tx: Sender<GatewayEvent>, mut cmds: Receiver<GatewayCmd>, mut on_raw: impl FnMut(&str), url: &str) {
     let mut session = Session::new(token);
     let mut attempt = 0u32;
     loop {
@@ -88,7 +89,7 @@ async fn run(token: String, tx: Sender<GatewayEvent>, mut on_raw: impl FnMut(&st
                 if !emit(&tx, GatewayEvent::Status(ConnStatus::Connected)).await {
                     return;
                 }
-                connection(ws, &mut session, &tx, &mut on_raw, &mut got_dispatch).await
+                connection(ws, &mut session, &tx, &mut cmds, &mut on_raw, &mut got_dispatch).await
             }
             None => Outcome::Reconnect { resume: true },
         };
@@ -145,11 +146,13 @@ async fn connection(
     mut ws: Ws,
     session: &mut Session,
     tx: &Sender<GatewayEvent>,
+    cmds: &mut Receiver<GatewayCmd>,
     on_raw: &mut impl FnMut(&str),
     got_dispatch: &mut bool,
 ) -> Outcome {
     let mut inflater = Inflater::new(); // fresh zlib context per connection
     let mut next_hb: Option<Instant> = None;
+    let mut cmds_open = true;
     loop {
         let actions = tokio::select! {
             _ = tx.closed() => return Outcome::Closed,
@@ -158,6 +161,13 @@ async fn connection(
                 next_hb = Some(next_hb.unwrap() + interval);
                 session.on_heartbeat_due()
             }
+            c = cmds.recv(), if cmds_open => match c {
+                Some(c) => session.command(c).into_iter().collect(),
+                None => {
+                    cmds_open = false;
+                    continue;
+                }
+            },
             msg = ws.next() => {
                 let text = match msg {
                     Some(Ok(Message::Text(t))) => Ok(t.to_string()),
@@ -232,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn stops_during_backoff_when_receiver_dropped() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let h = tokio::spawn(run("t".into(), tx, |_| {}, "ws://127.0.0.1:1"));
+        let h = tokio::spawn(run("t".into(), tx, tokio::sync::mpsc::channel(1).1, |_| {}, "ws://127.0.0.1:1"));
         while !matches!(rx.recv().await, Some(GatewayEvent::Status(ConnStatus::Reconnecting { .. }))) {}
         drop(rx); // backoff sleep is >= 0.5s; it must end promptly
         tokio::time::timeout(Duration::from_millis(300), h).await.unwrap().unwrap();
