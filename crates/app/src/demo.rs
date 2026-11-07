@@ -1,5 +1,6 @@
 //! Debug-only `RXCORD_DEMO=1`: fixture-like data instead of a Discord session (screenshots, layout work).
 use rxcord_api::event::{Event, parse_dispatch};
+use rxcord_api::id::Id;
 use serde_json::{json, value::to_raw_value};
 
 pub const GUILD: u64 = 10;
@@ -39,4 +40,10 @@ pub fn events() -> (Event, Vec<Event>) {
         })
         .collect();
     (ready, msgs)
+}
+
+/// A send with no session: shows the failed row with its retry action (replying to message 538).
+pub fn failed_send() -> crate::runtime::Command {
+    let (channel, content) = (Id(CHANNEL), "this send fails (demo has no session)".into());
+    crate::runtime::Command::Send { channel, content, reply_to: Some(Id(538)) }
 }

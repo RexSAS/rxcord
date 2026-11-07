@@ -61,7 +61,8 @@ pub fn spawn_runtime(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>) -> Un
         .name("rxcord-runtime".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
-            rt.block_on(Runtime::new(ui, focused).run(rx));
+            let (store, tasks, nav) = (Store::new(), JoinSet::new(), Nav::default());
+            rt.block_on(Runtime { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused }.run(rx));
         })
         .expect("spawn runtime thread");
     tx
@@ -87,11 +88,6 @@ async fn recv_opt<T>(r: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
 }
 
 impl Runtime {
-    fn new(ui: slint::Weak<AppWindow>, focused: Arc<AtomicBool>) -> Self {
-        let (store, tasks, nav) = (Store::new(), JoinSet::new(), Nav::default());
-        Self { ui, store, rest: None, gw: None, qr: None, tasks, nav, focused }
-    }
-
     async fn run(mut self, mut cmds: UnboundedReceiver<Command>) {
         if cfg!(debug_assertions) && std::env::var_os("RXCORD_DEMO").is_some() {
             #[cfg(debug_assertions)]
@@ -101,9 +97,7 @@ impl Runtime {
                 self.command(Command::SelectGuild(Some(Id(crate::demo::GUILD)))).await;
                 self.command(Command::OpenChannel(Id(crate::demo::CHANNEL))).await;
                 msgs.into_iter().for_each(|m| self.event(m));
-                // No session: shows the failed-send row with its retry action.
-                let (channel, content) = (Id(crate::demo::CHANNEL), "this send fails (demo has no session)".into());
-                self.command(Command::Send { channel, content, reply_to: Some(Id(538)) }).await;
+                self.command(crate::demo::failed_send()).await;
             }
         } else {
             match tokio::task::spawn_blocking(token::load).await.ok().flatten() {
@@ -154,6 +148,8 @@ impl Runtime {
         self.gw = None;
         self.qr = None;
         self.rest = None;
+        // Unsent text goes back into the drafts, never auto-sent: the next login may be another account.
+        bridge::restore_drafts(&self.ui, compose::unsent_drafts(self.store.all_pending()));
         self.store = Store::new();
         self.nav = Nav::default();
         bridge::clear(&self.ui);
@@ -207,11 +203,7 @@ impl Runtime {
                     }
                     return;
                 }
-                if let Some(prev) = self.nav.selected.replace(id) {
-                    self.store.close_channel(prev);
-                }
-                self.nav.at_bottom = true; // the UI scrolls a newly shown channel to the bottom
-                if self.store.open_channel(id) {
+                if self.nav.open(&mut self.store, id) {
                     self.fetch(id, None);
                 }
                 bridge::push_selection(&self.ui, &self.store, self.nav.guild, self.nav.selected);

@@ -55,7 +55,8 @@ impl Rest {
     }
 
     pub async fn send_message(&self, channel: Id, content: &str, nonce: &str, reply_to: Option<Id>) -> Result<Message, ApiError> {
-        let mut body = json!({"content": content, "nonce": nonce});
+        // enforce_nonce: a retry with the same nonce returns the already-created message instead of a duplicate
+        let mut body = json!({"content": content, "nonce": nonce, "enforce_nonce": true});
         if let Some(r) = reply_to {
             body["message_reference"] = json!({"message_id": r.to_string()});
         }

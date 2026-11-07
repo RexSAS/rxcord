@@ -35,9 +35,7 @@ pub fn clear(ui: &Weak<AppWindow>) {
         ui.set_guild_title("".into());
         ui.set_channel_title("".into());
         ui.set_messages_error("".into());
-        ui.set_composer_text("".into());
-        ui.set_reply_id("".into());
-        ui.set_edit_id("".into());
+        // Composer text and reply/edit mode are left alone: the selected-channel change saves the draft.
         ui.set_composer_error("".into());
         ui.set_row_error_id("".into());
     });
@@ -46,6 +44,9 @@ pub fn clear(ui: &Weak<AppWindow>) {
 /// Puts own message `id` into the composer in edit mode.
 pub fn start_edit(ui: &Weak<AppWindow>, id: Id, text: String) {
     with_ui(ui, move |ui| {
+        if ui.get_edit_id().is_empty() {
+            ui.set_edit_stash(ui.get_composer_text()); // the draft comes back after the edit
+        }
         ui.set_reply_id("".into());
         ui.set_edit_id(id.to_string().into());
         ui.set_composer_text(text.into());
@@ -61,7 +62,8 @@ pub fn edit_done(ui: &Weak<AppWindow>, id: Id, ok: bool) {
         match (ok, editing) {
             (true, true) => {
                 ui.set_edit_id("".into());
-                ui.set_composer_text("".into());
+                ui.set_composer_text(ui.get_edit_stash());
+                ui.set_edit_stash("".into());
                 ui.set_composer_error("".into());
             }
             (true, false) => {}
@@ -69,6 +71,17 @@ pub fn edit_done(ui: &Weak<AppWindow>, id: Id, ok: bool) {
             (false, false) => row_error(&ui, id, "Couldn't edit message"),
         }
     });
+}
+
+/// Text of an ended session's unsent messages, per channel; main.rs adds it to that channel's draft.
+pub fn restore_drafts(ui: &Weak<AppWindow>, drafts: Vec<(Id, String)>) {
+    if !drafts.is_empty() {
+        with_ui(ui, move |ui| {
+            for (c, t) in drafts {
+                ui.invoke_restore_draft(c.to_string().into(), t.into());
+            }
+        });
+    }
 }
 
 pub fn delete_failed(ui: &Weak<AppWindow>, id: Id) {

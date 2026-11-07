@@ -22,7 +22,7 @@ async fn send_message_body() {
     Mock::given(method("POST"))
         .and(path("/channels/1/messages"))
         .and(header("Authorization", "tok"))
-        .and(body_json(json!({"content":"hi","nonce":"n1","message_reference":{"message_id":"9"}})))
+        .and(body_json(json!({"content":"hi","nonce":"n1","enforce_nonce":true,"message_reference":{"message_id":"9"}})))
         .respond_with(msg())
         .expect(1)
         .mount(&s)

@@ -12,6 +12,8 @@ use compose::OutgoingError;
 use rxcord_api::id::Id;
 use runtime::Command;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::EnvFilter;
@@ -68,6 +70,21 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     let t = tx.clone();
     ui.on_retry_send(move |n| drop(t.send(Command::Retry(n.into()))));
+    let drafts = Rc::new(RefCell::new(compose::Drafts::default()));
+    let d = drafts.clone();
+    ui.on_switch_draft(move |text, to| d.borrow_mut().switch(text.into(), id(to)).into());
+    let w = ui.as_weak();
+    ui.on_restore_draft(move |ch, text| {
+        let (Some(ui), Some(ch)) = (w.upgrade(), id(ch)) else { return };
+        // While editing, the draft is in the stash.
+        let editing = !ui.get_edit_id().is_empty();
+        let draft = if editing { ui.get_edit_stash() } else { ui.get_composer_text() };
+        match drafts.borrow_mut().restore(ch, &text, &draft) {
+            Some(t) if editing => ui.set_edit_stash(t.into()),
+            Some(t) => ui.set_composer_text(t.into()),
+            None => {}
+        }
+    });
     let t = tx.clone();
     ui.on_bottom_visible(move |b| drop(t.send(Command::BottomVisible(b))));
     ui.on_thumb_visible(move |u| drop(tx.send(Command::ThumbVisible(u.into()))));

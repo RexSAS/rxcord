@@ -4,6 +4,7 @@ use rxcord_api::id::Id;
 use rxcord_api::model::{Message, MessageUpdate};
 use rxcord_api::nonce::make_nonce;
 use rxcord_store::{Pending, Store};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Discord's content limit, in chars.
@@ -44,9 +45,90 @@ pub fn edit_event(m: Message) -> Event {
     Event::MessageUpdate(MessageUpdate { id, channel_id, content: Some(m.content), edited_timestamp, attachments: None })
 }
 
+/// Unsent text of `pending` per channel (first-seen order), messages in send order joined by blank lines.
+pub fn unsent_drafts(pending: &[Pending]) -> Vec<(Id, String)> {
+    let mut out: Vec<(Id, String)> = vec![];
+    for p in pending {
+        match out.iter_mut().find(|(c, _)| *c == p.channel) {
+            Some((_, t)) => *t = join(t, &p.content),
+            None => out.push((p.channel, p.content.clone())),
+        }
+    }
+    out
+}
+
+/// `a`, a blank line, then `b`; just `b` when `a` is blank.
+fn join(a: &str, b: &str) -> String {
+    if a.trim().is_empty() { b.to_string() } else { format!("{a}\n\n{b}") }
+}
+
+/// Per-channel composer drafts (UI thread). `current` is the channel whose draft the composer shows.
+#[derive(Default)]
+pub struct Drafts {
+    current: Option<Id>,
+    saved: HashMap<Id, String>,
+}
+
+impl Drafts {
+    /// The composer moves to channel `to`: `text` is kept as the old channel's draft; returns `to`'s draft.
+    pub fn switch(&mut self, text: String, to: Option<Id>) -> String {
+        if to == self.current {
+            return text;
+        }
+        if let Some(c) = self.current {
+            self.saved.insert(c, text);
+        }
+        self.current = to;
+        to.and_then(|c| self.saved.remove(&c)).unwrap_or_default()
+    }
+
+    /// Appends restored text to `ch`'s draft; returns the new composer text when `ch` is the one shown.
+    pub fn restore(&mut self, ch: Id, text: &str, composer: &str) -> Option<String> {
+        if self.current == Some(ch) {
+            return Some(join(composer, text));
+        }
+        let d = self.saved.entry(ch).or_default();
+        *d = join(d, text);
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsent_grouped_per_channel() {
+        let p = |n: &str, ch: u64, content: &str, failed| Pending {
+            nonce: n.into(),
+            channel: Id(ch),
+            content: content.into(),
+            reply_to: None,
+            failed,
+        };
+        let pending = [p("1", 7, "a", true), p("2", 8, "b", false), p("3", 7, "c\nd", false)];
+        assert_eq!(unsent_drafts(&pending), vec![(Id(7), "a\n\nc\nd".to_string()), (Id(8), "b".to_string())]);
+        assert_eq!(unsent_drafts(&[]), vec![]);
+    }
+
+    #[test]
+    fn drafts_follow_channel() {
+        let mut d = Drafts::default();
+        assert_eq!(d.switch(String::new(), Some(Id(1))), "");
+        assert_eq!(d.switch("for one".into(), Some(Id(2))), "", "new channel starts empty");
+        assert_eq!(d.switch("for two".into(), Some(Id(1))), "for one");
+        assert_eq!(d.switch("for one!".into(), Some(Id(1))), "for one!", "same channel: unchanged");
+        assert_eq!(d.switch("kept".into(), None), "", "logged out: nothing shown");
+        assert_eq!(d.switch(String::new(), Some(Id(1))), "kept", "draft survives a session change");
+        // restore: shown channel gets it in the composer, others in their saved draft
+        assert_eq!(d.restore(Id(1), "lost", "kept"), Some("kept\n\nlost".into()));
+        assert_eq!(d.restore(Id(1), "lost", " \n"), Some("lost".into()));
+        assert_eq!(d.restore(Id(2), "lost", "x"), None);
+        assert_eq!(d.switch(String::new(), Some(Id(2))), "for two\n\nlost");
+        assert_eq!(d.restore(Id(3), "only", ""), None);
+        assert_eq!(d.switch(String::new(), Some(Id(3))), "only");
+    }
+
     use serde_json::json;
 
     #[test]

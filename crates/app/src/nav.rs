@@ -73,6 +73,15 @@ impl Nav {
         (guilds, chans, msgs)
     }
 
+    /// Selects another channel `id` (the previous one is trimmed); true when its history must be fetched.
+    pub fn open(&mut self, s: &mut Store, id: Id) -> bool {
+        if let Some(prev) = self.selected.replace(id) {
+            s.close_channel(prev);
+        }
+        self.at_bottom = true; // the UI scrolls a newly shown channel to the bottom
+        s.open_channel(id)
+    }
+
     /// `before` id for the next older page of `ch`, if one should be requested now.
     pub fn older_before(&self, s: &Store, ch: Id) -> Option<Id> {
         let front = s.messages(ch).front().map(|m| m.id);

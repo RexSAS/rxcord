@@ -67,6 +67,10 @@ impl Store {
     pub fn messages(&self, channel: Id) -> &VecDeque<Message> {
         self.msgs.get(&channel).unwrap_or(&EMPTY)
     }
+    /// Every unsent message, in send order.
+    pub fn all_pending(&self) -> &[Pending] {
+        &self.pending
+    }
     pub fn pending(&self, channel: Id) -> Vec<&Pending> {
         self.pending.iter().filter(|p| p.channel == channel).collect()
     }

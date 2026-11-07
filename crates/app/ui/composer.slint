@@ -8,7 +8,9 @@ export component Composer inherits VerticalLayout {
     in-out property <string> reply-id;
     in property <string> reply-author;
     in-out property <string> edit-id;
-    in property <string> error;
+    // the draft put aside while editing
+    in-out property <string> stash;
+    in-out property <string> error;
     callback send(string);
     callback edit-last();
 
@@ -17,9 +19,13 @@ export component Composer inherits VerticalLayout {
     public function focus-input() { input.focus(); }
 
     public function cancel() {
-        if root.edit-id != "" { root.text = ""; }
+        if root.edit-id != "" {
+            root.text = root.stash;
+            root.stash = "";
+        }
         root.edit-id = "";
         root.reply-id = "";
+        root.error = "";
     }
 
     padding: 8px;
@@ -64,7 +70,7 @@ export component Composer inherits VerticalLayout {
                     root.send(self.text);
                     return accept;
                 }
-                if e.text == Key.Escape && (root.reply-id != "" || root.edit-id != "") {
+                if e.text == Key.Escape && (root.reply-id != "" || root.edit-id != "" || root.error != "") {
                     root.cancel();
                     return accept;
                 }
