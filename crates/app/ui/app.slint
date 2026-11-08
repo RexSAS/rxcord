@@ -32,7 +32,11 @@ export component AppWindow inherits Window {
     callback start-qr();
     callback logout();
 
+    // source model for the panes below (Rust keeps it as a VecModel)
     in property <[TreeItem]> tree;
+    // filtered views of `tree`: DMs (left) and servers (right)
+    in property <[TreeItem]> friends;
+    in property <[TreeItem]> servers;
     in property <[TabItem]> tabs;
     in property <[MessageItem]> messages;
     // the active tab
@@ -149,15 +153,29 @@ export component AppWindow inherits Window {
             width: parent.width;
             height: parent.height;
             visible: root.logged-in;
-            Tree {
+            HorizontalLayout {
                 height: root.tree-height;
-                items: root.tree;
-                active: root.selected-channel;
-                toggle(id) => { root.toggle-node(id); }
-                open(id) => { root.select-channel(id); }
-                join(id) => { root.join-voice(id); }
-                set-volume(id, v) => { root.set-user-volume(id, v); }
-                set-muted-for-me(id, m) => { root.set-user-muted(id, m); }
+                Tree {
+                    horizontal-stretch: 1;
+                    items: root.friends;
+                    active: root.selected-channel;
+                    toggle(id) => { root.toggle-node(id); }
+                    open(id) => { root.select-channel(id); }
+                    join(id) => { root.join-voice(id); }
+                    set-volume(id, v) => { root.set-user-volume(id, v); }
+                    set-muted-for-me(id, m) => { root.set-user-muted(id, m); }
+                }
+                Rectangle { width: 1px; background: root.line; }
+                Tree {
+                    horizontal-stretch: 1;
+                    items: root.servers;
+                    active: root.selected-channel;
+                    toggle(id) => { root.toggle-node(id); }
+                    open(id) => { root.select-channel(id); }
+                    join(id) => { root.join-voice(id); }
+                    set-volume(id, v) => { root.set-user-volume(id, v); }
+                    set-muted-for-me(id, m) => { root.set-user-muted(id, m); }
+                }
             }
             // divider: drag to resize the tree (5px to grab, drawn as a 2px line)
             Rectangle {

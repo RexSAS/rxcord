@@ -123,6 +123,8 @@ pub fn dm_rows(s: &Store) -> Vec<ChannelRow> {
 /// One line of the tree: a node (DMs or a guild, `depth` 0) or a channel/category under an expanded node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeRow {
+    /// Under the DMs node (left pane) rather than a guild (right pane).
+    pub dm: bool,
     pub node: bool,
     pub depth: u8,
     pub expanded: bool,
@@ -168,7 +170,8 @@ pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>, spe
     let node = |id: Id, name: String, unread: bool, mentions: u32, children: Vec<ChannelRow>| {
         let open = expanded.contains(&id);
         let row = ChannelRow { id, name, kind: 0, unread, mentions, enabled: true };
-        let mut out = vec![TreeRow { node: true, depth: 0, expanded: open, row, member: None }];
+        let dm = id == DMS_NODE;
+        let mut out = vec![TreeRow { dm, node: true, depth: 0, expanded: open, row, member: None }];
         if open {
             let mut in_category = false;
             for c in children {
@@ -176,11 +179,11 @@ pub fn tree_rows(s: &Store, expanded: &HashSet<Id>, forbidden: &HashSet<Id>, spe
                 let depth = if in_category && c.kind != 4 { 2 } else { 1 };
                 // voice and stage channels, and DMs with a call
                 let members = if matches!(c.kind, 2 | 13 | 1 | 3) { s.voice_members(c.id) } else { vec![] };
-                out.push(TreeRow { node: false, depth, expanded: false, row: c, member: None });
+                out.push(TreeRow { dm, node: false, depth, expanded: false, row: c, member: None });
                 out.extend(members.into_iter().map(|v| {
                     let m = voice_member(s, v, speaking, prefs);
                     let row = ChannelRow { id: m.user_id, name: m.name.clone(), kind: 0, unread: false, mentions: 0, enabled: false };
-                    TreeRow { node: false, depth: depth + 1, expanded: false, row, member: Some(m) }
+                    TreeRow { dm, node: false, depth: depth + 1, expanded: false, row, member: Some(m) }
                 }));
             }
         }

@@ -9,6 +9,7 @@ use crate::{AppWindow, FileItem, MessageItem, TabItem, ThumbItem, TreeItem};
 use rxcord_api::id::Id;
 use rxcord_api::remote_auth::QrStatus;
 use rxcord_store::Store;
+use std::rc::Rc;
 use slint::{ComponentHandle, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, StyledText, VecModel, Weak};
 
 pub fn with_ui(ui: &Weak<AppWindow>, f: impl FnOnce(AppWindow) + Send + 'static) {
@@ -27,7 +28,11 @@ fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
 /// Empties every navigation model (new session).
 pub fn clear(ui: &Weak<AppWindow>) {
     with_ui(ui, |ui| {
-        ui.set_tree(model(vec![])); // must stay a VecModel, see `set_tree`
+        // `tree` must stay a VecModel (see `set_tree`); the two panes are live filters over it
+        let tree = Rc::new(VecModel::<TreeItem>::default());
+        ui.set_friends(ModelRc::new(slint::FilterModel::new(tree.clone(), |t: &TreeItem| t.dm)));
+        ui.set_servers(ModelRc::new(slint::FilterModel::new(tree.clone(), |t: &TreeItem| !t.dm)));
+        ui.set_tree(ModelRc::from(tree));
         ui.set_tabs(ModelRc::default());
         ui.set_messages(model(vec![])); // must stay a VecModel, see `set_messages`
         ui.set_selected_channel("".into());
@@ -213,6 +218,7 @@ pub fn voice_notice(ui: &Weak<AppWindow>, text: String) {
 fn tree_item(r: TreeRow) -> TreeItem {
     let m = r.member.as_ref();
     TreeItem {
+        dm: r.dm,
         member: m.is_some(),
         speaking: m.is_some_and(|m| m.speaking),
         muted: m.is_some_and(|m| m.muted),
@@ -523,7 +529,7 @@ mod tests {
     #[test]
     fn unchanged_tree_and_tabs_are_not_pushed() {
         let ch = |id: u64, unread: bool| ChannelRow { id: Id(id), name: "c".into(), kind: 0, unread, mentions: 0, enabled: true };
-        let row = |id: u64, unread: bool| TreeRow { node: false, depth: 1, expanded: false, row: ch(id, unread), member: None };
+        let row = |id: u64, unread: bool| TreeRow { dm: false, node: false, depth: 1, expanded: false, row: ch(id, unread), member: None };
         let mut nav = Nav::default();
         assert!(tree_changes(&mut nav, vec![], vec![]).is_none(), "empty UI, nothing to show");
         let (full, edits, tabs) = tree_changes(&mut nav, vec![row(1, false), row(2, false)], vec![ch(1, false)]).unwrap();

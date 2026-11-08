@@ -4,6 +4,8 @@ import { Badge, Dot } from "widgets.slint";
 
 export struct TreeItem {
     id: string,
+    // DMs side (left pane) vs servers (right pane)
+    dm: bool,
     name: string,
     // DMs node and guilds
     node: bool,
