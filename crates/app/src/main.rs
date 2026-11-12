@@ -29,9 +29,25 @@ use tracing_subscriber::EnvFilter;
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
-        .init();
+    let fmt = tracing_subscriber::fmt().with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()));
+    // a Windows release has no console: stderr goes nowhere, so log to %APPDATA%\rxcord\rxcord.log
+    match settings::log_file().filter(|_| cfg!(all(windows, not(debug_assertions)))) {
+        Some(f) => fmt.with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
+        None => fmt.init(),
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |p| {
+        tracing::error!("{p}\n{}", std::backtrace::Backtrace::force_capture());
+        prev(p);
+    }));
+    let r = run();
+    if let Err(e) = &r {
+        tracing::error!("startup failed: {e}");
+    }
+    r
+}
+
+fn run() -> Result<(), slint::PlatformError> {
     // Software by default; SLINT_BACKEND set by the user wins. Keep winit: the focus hook needs it.
     if std::env::var_os("SLINT_BACKEND").is_none() {
         let renderer = if std::env::var("RXCORD_RENDERER").is_ok_and(|v| v == "gpu") { "femtovg" } else { "software" };

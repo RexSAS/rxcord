@@ -94,6 +94,13 @@ fn path() -> Option<PathBuf> {
     Some(base?.join("rxcord").join("settings.json"))
 }
 
+/// `rxcord.log` next to settings.json, created fresh each start (dir included).
+pub fn log_file() -> Option<std::fs::File> {
+    let p = path()?.with_file_name("rxcord.log");
+    std::fs::create_dir_all(p.parent()?).ok()?;
+    std::fs::File::create(p).ok()
+}
+
 /// Defaults when the file is missing or unreadable.
 pub fn load() -> Settings {
     path().map(|p| load_from(&p)).unwrap_or_default()
