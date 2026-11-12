@@ -61,33 +61,34 @@ impl Capture {
             found
         });
         let device = named.or_else(|| host.default_input_device()).ok_or(AudioError::NoDevice)?;
-        let config = device
+        // 48 kHz in any sample format (f32 first, then fewest channels), else the device default:
+        // many USB mics only offer integer formats
+        let supported = device
             .supported_input_configs()?
-            .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
             .filter_map(|c| c.try_with_sample_rate(RATE))
-            .min_by_key(|c| c.channels());
-        // shortcut: the fallback assumes the host accepts f32 at its default config (true for WASAPI shared, ALSA plug, Pulse/PipeWire)
-        let config = match config {
-            Some(c) => c.config(),
-            None => device.default_input_config()?.config(),
+            .min_by_key(|c| (c.sample_format() != cpal::SampleFormat::F32, c.channels()));
+        let supported = match supported {
+            Some(c) => c,
+            None => device.default_input_config()?,
         };
+        let (format, config) = (supported.sample_format(), supported.config());
         let channels = config.channels as usize;
-        let (mut producer, ring) = rtrb::RingBuffer::new(config.sample_rate as usize * channels * 2 / 5); // 400 ms
+        let (producer, ring) = rtrb::RingBuffer::new(config.sample_rate as usize * channels * 2 / 5); // 400 ms
         let failed = Arc::new(AtomicBool::new(false));
         let flag = failed.clone();
-        let stream = device.build_input_stream(
-            config,
-            // real-time: no locks, no allocation; a full ring drops samples
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                for &s in data {
-                    let _ = producer.push(s);
-                }
-            },
-            move |_| flag.store(true, Ordering::Relaxed),
-            None,
-        )?;
+        use cpal::SampleFormat as F;
+        let stream = match format {
+            F::I8 => input_stream::<i8>(&device, config, producer, flag),
+            F::I16 => input_stream::<i16>(&device, config, producer, flag),
+            F::I24 => input_stream::<cpal::I24>(&device, config, producer, flag),
+            F::I32 => input_stream::<i32>(&device, config, producer, flag),
+            F::U8 => input_stream::<u8>(&device, config, producer, flag),
+            F::U16 => input_stream::<u16>(&device, config, producer, flag),
+            F::F64 => input_stream::<f64>(&device, config, producer, flag),
+            _ => input_stream::<f32>(&device, config, producer, flag), // cpal errors on a format it can't do
+        }?;
         stream.play()?;
-        tracing::debug!(rate = config.sample_rate, channels, noise_suppression, "audio input open");
+        tracing::debug!(rate = config.sample_rate, channels, ?format, noise_suppression, "audio input open");
         Ok(Capture {
             engine,
             resampler: (config.sample_rate != RATE).then(|| Resampler::new(config.sample_rate, RATE)),
@@ -133,6 +134,29 @@ impl Capture {
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
+}
+
+/// An input stream of `T` samples, pushed into `producer` as f32.
+fn input_stream<T: cpal::SizedSample>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    mut producer: rtrb::Producer<f32>,
+    failed: Arc<AtomicBool>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    f32: cpal::FromSample<T>,
+{
+    device.build_input_stream(
+        config,
+        // real-time: no locks, no allocation; a full ring drops samples
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            for &s in data {
+                let _ = producer.push(cpal::Sample::to_sample::<f32>(s));
+            }
+        },
+        move |_| failed.store(true, Ordering::Relaxed),
+        None,
+    )
 }
 
 /// Everything `tick` does except talking to the device.
