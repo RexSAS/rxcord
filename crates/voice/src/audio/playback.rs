@@ -63,7 +63,7 @@ impl Playback {
                     *s = consumer.pop().unwrap_or(0.0);
                 }
             },
-            move |_| flag.store(true, Ordering::Relaxed),
+            super::on_error(flag),
             None,
         )?;
         stream.play()?;

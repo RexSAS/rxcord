@@ -154,7 +154,7 @@ where
                 let _ = producer.push(cpal::Sample::to_sample::<f32>(s));
             }
         },
-        move |_| failed.store(true, Ordering::Relaxed),
+        super::on_error(failed),
         None,
     )
 }
