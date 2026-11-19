@@ -6,7 +6,19 @@ A lightweight native Discord client for Linux and Windows (Rust + Slint), built 
 
 ## Install
 
-Download the file for your platform from [Releases](https://github.com/RexSAS/rxcord/releases/latest) and run it. rxcord checks for new releases and offers a one-click update in its status bar (set `RXCORD_NO_UPDATE=1` to turn that off).
+**Windows:** download and run [`rxcord-setup-windows-x86_64.exe`](https://github.com/RexSAS/rxcord/releases/latest/download/rxcord-setup-windows-x86_64.exe). It installs for your user only (no admin needed) and adds a Start menu entry, an optional desktop shortcut and an uninstaller.
+
+**Linux (x86_64):**
+
+```
+curl -fsSL https://raw.githubusercontent.com/RexSAS/rxcord/master/installer/install.sh | sh
+```
+
+This puts `rxcord` in `~/.local/bin` and adds it to your app menu. Run it again to reinstall.
+
+You can also download the bare binary for your platform from [Releases](https://github.com/RexSAS/rxcord/releases/latest).
+
+**Updates:** when a new release is out, rxcord shows a small window offering to download it. It then shows a progress bar and an Install button that restarts into the new version. Set `RXCORD_NO_UPDATE=1` to turn this off.
 
 ## Build from source
 

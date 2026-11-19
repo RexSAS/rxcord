@@ -21,39 +21,59 @@ pub fn enabled() -> bool {
     !cfg!(debug_assertions) && std::env::var_os("RXCORD_NO_UPDATE").is_none()
 }
 
-/// What the status bar's update entry does when clicked.
-pub enum Click {
+/// The update card's buttons.
+#[derive(Debug)]
+pub enum Step {
+    Download,
     Install,
-    Restart,
 }
 
-/// Checks now and then; installs the found release when the UI asks (`install` channel).
-pub async fn run(ui: slint::Weak<AppWindow>, mut install: mpsc::UnboundedReceiver<()>) {
+/// Checks now and then; on a newer release the card offers it, then downloads and installs it as the
+/// user clicks through (`steps`).
+pub async fn run(ui: slint::Weak<AppWindow>, mut steps: mpsc::UnboundedReceiver<Step>) {
     let mut found: Option<Release> = None;
+    // the verified new binary, waiting for Install
+    let mut ready: Option<Vec<u8>> = None;
     let mut next = tokio::time::Instant::now() + FIRST_CHECK;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(next) => {
                 next += EVERY;
                 match update::latest(ASSET).await {
-                    Ok(Some(r)) if r.version > current() => {
-                        bridge::update_state(&ui, format!("⬆ Update {}", r.tag), "install");
+                    // the same release again: leave the card as it is
+                    Ok(Some(r)) if r.version > current() && found.as_ref().is_none_or(|f| f.tag != r.tag) => {
+                        bridge::update_state(&ui, "available", &r, 0.0);
+                        ready = None;
                         found = Some(r);
                     }
                     Ok(_) => {}
                     Err(e) => tracing::info!("update check failed: {e}"),
                 }
             }
-            req = install.recv() => {
-                let Some(()) = req else { return };
-                let Some(r) = found.clone() else { continue };
-                bridge::update_state(&ui, "Updating…".into(), "");
-                match install_release(&r).await {
-                    Ok(()) => bridge::update_state(&ui, format!("Restart for {}", r.tag), "restart"),
-                    Err(e) => {
-                        tracing::warn!("update failed: {e}");
-                        // The release page lets the user download it by hand.
-                        bridge::update_state(&ui, "Update failed: open release page".into(), &format!("open:{}", r.page));
+            step = steps.recv() => {
+                let Some(step) = step else { return };
+                let Some(r) = &found else { continue };
+                match step {
+                    Step::Download => {
+                        bridge::update_state(&ui, "downloading", r, -1.0);
+                        match fetch(&ui, r).await {
+                            Ok(bytes) => {
+                                ready = Some(bytes);
+                                bridge::update_state(&ui, "ready", r, 1.0);
+                            }
+                            Err(e) => fail(&ui, r, e),
+                        }
+                    }
+                    Step::Install => {
+                        let Some(bytes) = ready.take() else { continue };
+                        let installed = match std::env::current_exe() {
+                            Ok(exe) => tokio::task::spawn_blocking(move || replace_exe(&exe, &bytes)).await.unwrap_or_else(|e| Err(e.to_string())),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        match installed {
+                            Ok(()) => bridge::with_ui(&ui, |ui| ui.invoke_update_restart()),
+                            Err(e) => fail(&ui, r, e),
+                        }
                     }
                 }
             }
@@ -61,13 +81,29 @@ pub async fn run(ui: slint::Weak<AppWindow>, mut install: mpsc::UnboundedReceive
     }
 }
 
-async fn install_release(r: &Release) -> Result<(), String> {
+fn fail(ui: &slint::Weak<AppWindow>, r: &Release, e: String) {
+    tracing::warn!("update failed: {e}");
+    bridge::update_state(ui, "failed", r, 0.0);
+}
+
+/// Downloads the release file with its checksum, moving the card's progress bar.
+async fn fetch(ui: &slint::Weak<AppWindow>, r: &Release) -> Result<Vec<u8>, String> {
     let sum_url = r.sha256_url.as_deref().ok_or("the release has no checksum file")?;
     let sum = update::download(sum_url, 1024).await.map_err(|e| e.to_string())?;
-    let bytes = update::download(&r.asset_url, MAX_SIZE).await.map_err(|e| e.to_string())?;
+    let mut shown = -1;
+    let bytes = update::download_with(&r.asset_url, MAX_SIZE, |done, total| {
+        let Some(total) = total.filter(|t| *t > 0) else { return };
+        let pct = (done * 100 / total) as i32;
+        if pct != shown {
+            // one UI update per percent, not per chunk
+            shown = pct;
+            bridge::update_state(ui, "downloading", r, pct as f32 / 100.0);
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     verify(&bytes, &String::from_utf8_lossy(&sum))?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    tokio::task::spawn_blocking(move || replace_exe(&exe, &bytes)).await.map_err(|e| e.to_string())?
+    Ok(bytes)
 }
 
 /// `sum_file`: "<hex>  <name>" as written by sha256sum.
@@ -112,14 +148,6 @@ pub fn restart() {
         && let Err(e) = std::process::Command::new(exe).spawn()
     {
         tracing::warn!("restart failed: {e}");
-    }
-}
-
-pub fn parse_click(action: &str) -> Option<Click> {
-    match action {
-        "install" => Some(Click::Install),
-        "restart" => Some(Click::Restart),
-        _ => None,
     }
 }
 

@@ -40,8 +40,8 @@ pub enum Command {
     Edit { channel: Id, message: Id, content: String },
     Delete { channel: Id, message: Id },
     ThumbVisible(String /*url*/),
-    /// The status bar's "Update" was clicked.
-    InstallUpdate,
+    /// The update card's Download / Install.
+    Update(crate::update::Step),
     /// Join button of a server invite in message `message` of the active channel.
     JoinInvite { message: Id, code: String },
     /// Join this guild voice channel (moving out of any other).
@@ -145,8 +145,8 @@ struct Runtime {
     last_guild: Arc<AtomicU64>,
     /// Gateway session (from READY); joining an invite sends it.
     session_id: String,
-    /// Asks the updater (update.rs) to install the release it found.
-    update_tx: UnboundedSender<()>,
+    /// The update card's clicks, for the updater (update.rs).
+    update_tx: UnboundedSender<crate::update::Step>,
     /// The voice channel we're in or joining.
     voice: Controller,
     /// While connected to voice: the driver and the audio thread.
@@ -573,7 +573,7 @@ impl Runtime {
                 self.audio(ToAudio::Threshold(self.nav.settings.vad_threshold));
             }
             Command::Quit => {} // handled in `run`
-            Command::InstallUpdate => drop(self.update_tx.send(())),
+            Command::Update(step) => drop(self.update_tx.send(step)),
             Command::ThumbVisible(url) => bridge::push_thumb(&self.ui, self.thumbs.request(url, &self.nav.shown)),
         }
     }

@@ -54,3 +54,16 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256"
         env:
           GH_TOKEN: ${{ github.token }}
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install innosetup -y --no-progress
+          v="${GITHUB_REF_NAME#v}"
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "//DVersion=$v" installer/rxcord.iss
+          a=rxcord-setup-windows-x86_64.exe
+          mv "installer/$a" .
+          sha256sum "$a" > "$a.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$a" "$a.sha256"
+        env:
+          GH_TOKEN: ${{ github.token }}

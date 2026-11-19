@@ -76,22 +76,18 @@ fn run() -> Result<(), slint::PlatformError> {
     let focused = Arc::new(AtomicBool::new(false));
     let (tx, runtime) = runtime::spawn_runtime(ui.as_weak(), focused.clone(), last_guild.clone());
     let quit = tx.clone();
-    let (t, w) = (tx.clone(), ui.as_weak());
-    ui.on_update_clicked(move |action| match update::parse_click(&action) {
-        Some(update::Click::Install) => drop(t.send(Command::InstallUpdate)),
-        Some(update::Click::Restart) => {
-            if let Some(ui) = w.upgrade() {
-                save_settings(&ui, &last_guild);
-                ui.hide().ok();
-            }
-            update::restart();
-            let _ = slint::quit_event_loop();
+    let u = tx.clone();
+    ui.on_update_download(move || drop(u.send(Command::Update(update::Step::Download))));
+    let u = tx.clone();
+    ui.on_update_install(move || drop(u.send(Command::Update(update::Step::Install))));
+    let w = ui.as_weak();
+    ui.on_update_restart(move || {
+        if let Some(ui) = w.upgrade() {
+            save_settings(&ui, &last_guild);
+            ui.hide().ok();
         }
-        None => {
-            if let (Some(ui), Some(url)) = (w.upgrade(), action.strip_prefix("open:")) {
-                ui.invoke_open_url(url.into());
-            }
-        }
+        update::restart();
+        let _ = slint::quit_event_loop();
     });
     let t = tx.clone();
     ui.window().on_winit_window_event(move |_, ev| {

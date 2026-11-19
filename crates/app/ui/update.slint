@@ -1,0 +1,68 @@
+import { Theme } from "theme.slint";
+import { Button, ProgressIndicator } from "std-widgets.slint";
+
+// Floating update card: available → downloading (progress) → ready to install; failed links the release page.
+export component UpdateCard inherits Rectangle {
+    in property <string> stage; // "available", "downloading", "ready", "failed"
+    in property <string> tag;
+    in property <float> progress; // 0..1, < 0 = size unknown
+    callback download();
+    callback install();
+    callback open-page();
+    callback dismiss();
+
+    width: 300px;
+    height: col.preferred-height;
+    background: Theme.card;
+    border-color: Theme.accent;
+    border-width: 1px;
+    border-radius: Theme.radius;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #000000a0;
+    // swallow clicks so they don't reach the UI underneath
+    TouchArea { }
+    col := VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                horizontal-stretch: 1;
+                text: root.stage == "failed" ? "Update failed" : root.stage == "ready" ? "rxcord " + root.tag + " is ready" : "rxcord " + root.tag + " is available";
+                color: root.stage == "failed" ? Theme.danger : Theme.text;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+            if root.stage != "downloading": close := TouchArea {
+                width: 16px;
+                accessible-role: button;
+                accessible-label: "Later";
+                accessible-action-default => { root.dismiss(); }
+                clicked => { root.dismiss(); }
+                mouse-cursor: pointer;
+                Text { text: "✕"; color: close.has-hover ? Theme.text : Theme.dim; }
+            }
+        }
+        Text {
+            text: root.stage == "available" ? "Download the new version now?"
+                : root.stage == "downloading" ? (root.progress < 0 ? "Downloading…" : "Downloading… " + round(root.progress * 100) + "%")
+                : root.stage == "ready" ? "Downloaded and verified. Installing restarts rxcord."
+                : "Download it from the release page instead.";
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        if root.stage == "downloading": ProgressIndicator {
+            height: 6px;
+            progress: max(root.progress, 0);
+            indeterminate: root.progress < 0;
+        }
+        if root.stage != "downloading": HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            if root.stage == "available": Button { text: "Download"; primary: true; clicked => { root.download(); } }
+            if root.stage == "ready": Button { text: "Install"; primary: true; clicked => { root.install(); } }
+            if root.stage == "failed": Button { text: "Open release page"; clicked => { root.open-page(); } }
+        }
+    }
+}

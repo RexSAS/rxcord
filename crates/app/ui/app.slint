@@ -8,6 +8,7 @@ import { MessageList } from "messages.slint";
 import { Composer } from "composer.slint";
 import { MessageItem, ThumbItem, FileItem } from "message_row.slint";
 import { VoiceSettings } from "voice_settings.slint";
+import { UpdateCard } from "update.slint";
 
 export { TreeItem, TabItem, MessageItem, ThumbItem, FileItem }
 
@@ -43,10 +44,18 @@ export component AppWindow inherits Window {
     in property <string> selected-channel;
     // your display name, for the status bar
     in property <string> me-name;
-    // status bar update entry ("" = hidden) and what clicking it does ("install", "restart", "open:<url>", "")
-    in property <string> update-label;
-    in property <string> update-action;
-    callback update-clicked(string);
+    // self-update (update.rs): stage "" (none), "available", "downloading", "ready", "failed"
+    in property <string> update-stage;
+    in property <string> update-tag;
+    in property <float> update-progress;
+    in property <string> update-page;
+    callback update-download();
+    callback update-install();
+    // invoked by Rust once the new version is in place: save, quit, start it
+    callback update-restart();
+    // the card was closed with ✕ ("Later"); the status bar entry brings it back
+    property <bool> update-hidden;
+    changed update-stage => { self.update-hidden = false; }
     // voice bar text ("" = not in voice) and a short-lived status bar notice
     in property <string> voice;
     in property <string> notice;
@@ -393,16 +402,15 @@ export component AppWindow inherits Window {
                         overflow: elide;
                         font-size: 12px;
                     }
-                    if root.update-label != "": upd := TouchArea {
+                    if root.update-stage != "" && root.update-hidden: upd := TouchArea {
                         width: upd-text.preferred-width;
-                        enabled: root.update-action != "";
-                        mouse-cursor: self.enabled ? pointer : default;
+                        mouse-cursor: pointer;
                         accessible-role: button;
-                        accessible-label: root.update-label;
-                        accessible-action-default => { root.update-clicked(root.update-action); }
-                        clicked => { root.update-clicked(root.update-action); }
+                        accessible-label: upd-text.text;
+                        accessible-action-default => { root.update-hidden = false; }
+                        clicked => { root.update-hidden = false; }
                         upd-text := Text {
-                            text: root.update-label;
+                            text: "⬆ Update " + root.update-tag;
                             color: Theme.ok;
                             font-size: 12px;
                             vertical-alignment: center;
@@ -477,6 +485,17 @@ export component AppWindow inherits Window {
             login-token(t) => { root.login-token(t); }
             start-qr => { root.start-qr(); }
             logout => { root.logout(); }
+        }
+        if root.update-stage != "" && !root.update-hidden: UpdateCard {
+            x: parent.width - self.width - 12px;
+            y: parent.height - self.height - 36px;
+            stage: root.update-stage;
+            tag: root.update-tag;
+            progress: root.update-progress;
+            download => { root.update-download(); }
+            install => { root.update-install(); }
+            open-page => { root.open-url(root.update-page); }
+            dismiss => { root.update-hidden = true; }
         }
         }
     }

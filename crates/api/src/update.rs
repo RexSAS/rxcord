@@ -59,11 +59,29 @@ pub async fn latest(asset: &str) -> Result<Option<Release>, ApiError> {
 
 /// Downloads a release file, refusing more than `max` bytes.
 pub async fn download(url: &str, max: usize) -> Result<Vec<u8>, ApiError> {
-    let resp = client().get(url).send().await?;
+    download_with(url, max, |_, _| {}).await
+}
+
+/// `download`, calling `progress(bytes so far, total if known)` after each chunk.
+pub async fn download_with(url: &str, max: usize, mut progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, ApiError> {
+    // the client's 30 s cap is for API calls; a release binary on a slow line takes longer
+    let mut resp = client().get(url).timeout(std::time::Duration::from_secs(15 * 60)).send().await?;
     if !resp.status().is_success() {
         return Err(ApiError::Http { status: resp.status().as_u16(), body: String::new() });
     }
-    read_capped(resp, max).await
+    let total = resp.content_length();
+    if total.is_some_and(|n| n > max as u64) {
+        return Err(ApiError::TooLarge(max));
+    }
+    let mut out = vec![];
+    while let Some(chunk) = resp.chunk().await? {
+        if out.len() + chunk.len() > max {
+            return Err(ApiError::TooLarge(max));
+        }
+        out.extend_from_slice(&chunk);
+        progress(out.len() as u64, total);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

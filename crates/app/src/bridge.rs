@@ -252,12 +252,14 @@ pub fn push_selection(ui: &Weak<AppWindow>, selected: Option<Id>, carry: bool) {
     });
 }
 
-/// The status bar's update entry: `label` ("" hides it) and what clicking does (see `update::parse_click`).
-pub fn update_state(ui: &Weak<AppWindow>, label: String, action: &str) {
-    let action = action.to_string();
+/// The update card (ui/update.slint): `stage` for release `r`, `progress` 0..1 (< 0: unknown).
+pub fn update_state(ui: &Weak<AppWindow>, stage: &'static str, r: &rxcord_api::update::Release, progress: f32) {
+    let (tag, page) = (r.tag.clone(), r.page.clone());
     with_ui(ui, move |ui| {
-        ui.set_update_label(label.into());
-        ui.set_update_action(action.into());
+        ui.set_update_tag(tag.into());
+        ui.set_update_page(page.into());
+        ui.set_update_progress(progress);
+        ui.set_update_stage(stage.into());
     });
 }
 
